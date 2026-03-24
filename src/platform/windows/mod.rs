@@ -20,7 +20,7 @@ pub(super) fn execute(
     util::ensure_non_interactive_pager(&mut env_map);
 
     if !policy.network_access {
-        env::apply_no_network_hardening(&mut env_map)?;
+        env::apply_no_network_hardening(&mut env_map, None)?;
     }
 
     appcontainer::execute(request, policy, workspace_root, &env_map)

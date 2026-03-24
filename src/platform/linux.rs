@@ -45,25 +45,10 @@ pub(super) fn execute(
         .envs(request.env.clone());
     configure_piped_stdio(&mut command);
 
-    let full_disk_read_access = !matches!(policy.global_access, crate::SandboxAccess::NoAccess);
-    let full_disk_write_access = matches!(policy.global_access, crate::SandboxAccess::ReadWrite);
-    let readable_roots = policy
-        .path_permissions
-        .iter()
-        .filter(|permission| {
-            matches!(
-                permission.access,
-                crate::SandboxAccess::ReadOnly | crate::SandboxAccess::ReadWrite
-            )
-        })
-        .map(|permission| permission.path.clone())
-        .collect::<Vec<_>>();
-    let writable_roots = policy
-        .path_permissions
-        .iter()
-        .filter(|permission| matches!(permission.access, crate::SandboxAccess::ReadWrite))
-        .map(|permission| permission.path.clone())
-        .collect::<Vec<_>>();
+    let full_disk_read_access = policy.full_disk_read_access();
+    let full_disk_write_access = policy.full_disk_write_access();
+    let readable_roots = policy.readable_paths();
+    let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
 
     unsafe {

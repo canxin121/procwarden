@@ -38,9 +38,7 @@ pub(super) fn ensure_non_interactive_pager(env_map: &mut HashMap<String, String>
     env_map
         .entry("PAGER".to_string())
         .or_insert_with(|| "more.com".to_string());
-    env_map
-        .entry("LESS".to_string())
-        .or_insert_with(String::new);
+    env_map.entry("LESS".to_string()).or_default();
 }
 
 pub(super) fn ensure_safe_allow_path(

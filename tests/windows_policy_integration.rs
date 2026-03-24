@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procwarden::{
@@ -18,10 +18,10 @@ fn temp_workspace(prefix: &str) -> PathBuf {
     dir
 }
 
-fn base_request(cwd: &PathBuf) -> SandboxCommandRequest {
+fn base_request(cwd: &Path) -> SandboxCommandRequest {
     SandboxCommandRequest {
         command: vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()],
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         env: HashMap::new(),
         timeout_ms: Some(10_000),
     }

@@ -10,12 +10,6 @@ const DENY_BIN_DIR_NAME: &str = "agena-sandbox-denybin";
 
 pub(super) fn apply_no_network_hardening(
     env_map: &mut HashMap<String, String>,
-) -> Result<(), SandboxError> {
-    apply_no_network_hardening_with_denybin_dir(env_map, None)
-}
-
-fn apply_no_network_hardening_with_denybin_dir(
-    env_map: &mut HashMap<String, String>,
     denybin_dir: Option<&Path>,
 ) -> Result<(), SandboxError> {
     const PROXY_BLACKHOLE: &str = "http://127.0.0.1:9";
@@ -169,9 +163,7 @@ fn set_case_insensitive_pair(
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{
-        apply_no_network_hardening_with_denybin_dir, prepend_path, reorder_pathext_for_stubs,
-    };
+    use super::{apply_no_network_hardening, prepend_path, reorder_pathext_for_stubs};
 
     #[test]
     fn hardening_overwrites_mixed_case_proxy_and_git_guards() {
@@ -189,7 +181,7 @@ mod tests {
             .as_nanos();
         let denybin_dir = std::env::temp_dir().join(format!("agena-sandbox-denybin-test-{nonce}"));
 
-        apply_no_network_hardening_with_denybin_dir(&mut env, Some(&denybin_dir))
+        apply_no_network_hardening(&mut env, Some(&denybin_dir))
             .expect("network hardening should succeed");
 
         assert_eq!(
@@ -251,5 +243,36 @@ mod tests {
 
         assert_eq!(env.get("PATHEXT"), Some(&".BAT;.CMD;.EXE;.COM".to_string()));
         assert!(!env.contains_key("PathExt"));
+    }
+
+    #[test]
+    fn hardening_is_idempotent_for_denybin_path_prefix() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("PATH".to_string(), r"C:\\Windows\\System32".to_string());
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let denybin_dir =
+            std::env::temp_dir().join(format!("agena-sandbox-denybin-idempotent-{nonce}"));
+
+        apply_no_network_hardening(&mut env, Some(&denybin_dir))
+            .expect("first hardening pass should succeed");
+        let first = env
+            .get("PATH")
+            .cloned()
+            .expect("PATH should exist after first pass");
+
+        apply_no_network_hardening(&mut env, Some(&denybin_dir))
+            .expect("second hardening pass should succeed");
+        let second = env
+            .get("PATH")
+            .cloned()
+            .expect("PATH should exist after second pass");
+
+        assert_eq!(first, second, "PATH should not duplicate denybin prefix");
+
+        let _ = std::fs::remove_dir_all(&denybin_dir);
     }
 }

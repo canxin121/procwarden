@@ -214,53 +214,8 @@ pub(super) fn run_process_in_appcontainer(
 
         close_many(&[in_r, in_w, out_w, err_w]);
 
-        let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
-        let out_r_raw = out_r as usize;
-        let stdout_thread = std::thread::spawn(move || {
-            let out_r = out_r_raw as HANDLE;
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = ReadFile(
-                    out_r,
-                    chunk.as_mut_ptr(),
-                    chunk.len() as u32,
-                    &mut read_bytes,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read_bytes as usize]);
-            }
-            CloseHandle(out_r);
-            let _ = tx_out.send(buffer);
-        });
-
-        let err_r_raw = err_r as usize;
-        let stderr_thread = std::thread::spawn(move || {
-            let err_r = err_r_raw as HANDLE;
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = ReadFile(
-                    err_r,
-                    chunk.as_mut_ptr(),
-                    chunk.len() as u32,
-                    &mut read_bytes,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read_bytes as usize]);
-            }
-            CloseHandle(err_r);
-            let _ = tx_err.send(buffer);
-        });
+        let stdout_thread = spawn_pipe_reader_thread(out_r);
+        let stderr_thread = spawn_pipe_reader_thread(err_r);
 
         let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
         let wait_result = WaitForSingleObject(process_info.hProcess, timeout);
@@ -276,10 +231,8 @@ pub(super) fn run_process_in_appcontainer(
 
         close_many(&[process_info.hThread, process_info.hProcess, job_handle]);
 
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-        let stdout = rx_out.recv().unwrap_or_default();
-        let stderr = rx_err.recv().unwrap_or_default();
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let stderr = stderr_thread.join().unwrap_or_default();
 
         Ok(CaptureResult {
             exit_code: if timed_out { 124 } else { exit_code_raw as i32 },
@@ -288,6 +241,32 @@ pub(super) fn run_process_in_appcontainer(
             timed_out,
         })
     }
+}
+
+fn spawn_pipe_reader_thread(handle: HANDLE) -> std::thread::JoinHandle<Vec<u8>> {
+    let raw = handle as usize;
+    std::thread::spawn(move || unsafe { read_pipe_to_end(raw as HANDLE) })
+}
+
+unsafe fn read_pipe_to_end(handle: HANDLE) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let mut read_bytes: u32 = 0;
+        let ok = ReadFile(
+            handle,
+            chunk.as_mut_ptr(),
+            chunk.len() as u32,
+            &mut read_bytes,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 || read_bytes == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read_bytes as usize]);
+    }
+    CloseHandle(handle);
+    buffer
 }
 
 unsafe fn prepare_appcontainer_child_job_attributes(
@@ -493,7 +472,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::resolve_executable;
+    use super::{quote_windows_arg, resolve_executable};
 
     #[test]
     fn resolve_executable_honors_custom_path_and_pathext() {
@@ -534,5 +513,21 @@ mod tests {
 
         let resolved = resolve_executable(r".\missing-command", &cwd, &env);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn quote_windows_arg_handles_spaces_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg("two words"), r#""two words""#);
+        assert_eq!(
+            quote_windows_arg(r#"a\"b"#),
+            r#""a\\\"b""#,
+            "embedded quote should be escaped with preceding backslashes"
+        );
+        assert_eq!(
+            quote_windows_arg(r"path with tail\\"),
+            r#""path with tail\\\\""#,
+            "trailing backslashes must be doubled inside quoted arg"
+        );
     }
 }

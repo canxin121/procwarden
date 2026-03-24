@@ -5,22 +5,27 @@ use std::path::{Path, PathBuf};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathKeyMode {
+    #[cfg(test)]
     Exact,
     AsciiCaseInsensitive,
 }
 
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PathPolicy {
     key_mode: PathKeyMode,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl PathPolicy {
     pub(crate) const fn new(key_mode: PathKeyMode) -> Self {
         Self { key_mode }
     }
 
+    #[cfg(test)]
     pub(crate) const fn exact() -> Self {
         Self::new(PathKeyMode::Exact)
     }
@@ -46,15 +51,18 @@ impl PathPolicy {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn canonicalize_path(path: &Path) -> io::Result<PathBuf> {
     let absolute = absolute_path(path)?;
     canonicalize_absolute(&absolute)
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn canonicalize_or_original(path: &Path) -> PathBuf {
     canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn dedupe_canonical_paths(
     paths: impl IntoIterator<Item = PathBuf>,
     mode: PathKeyMode,
@@ -66,6 +74,7 @@ pub(crate) fn dedupe_canonical_paths(
     dedupe_paths(canonicalized, mode)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>, mode: PathKeyMode) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -113,6 +122,7 @@ pub(crate) fn is_dir(path: &Path) -> bool {
     Dir::open_ambient_dir(&absolute, ambient_authority()).is_ok()
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn is_file(path: &Path) -> bool {
     let Ok(absolute) = absolute_path(path) else {
         return false;
@@ -131,6 +141,7 @@ pub(crate) fn is_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn is_symlink(path: &Path) -> io::Result<bool> {
     let absolute = absolute_path(path)?;
 
@@ -143,6 +154,7 @@ pub(crate) fn is_symlink(path: &Path) -> io::Result<bool> {
     Ok(metadata.file_type().is_symlink())
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn child_directories(path: &Path, limit: usize) -> io::Result<Vec<PathBuf>> {
     let absolute = absolute_path(path)?;
     let dir = Dir::open_ambient_dir(&absolute, ambient_authority())?;
@@ -160,6 +172,7 @@ pub(crate) fn child_directories(path: &Path, limit: usize) -> io::Result<Vec<Pat
     Ok(out)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn canonicalize_absolute(absolute: &Path) -> io::Result<PathBuf> {
     if let Some((parent, leaf)) = parent_and_leaf(absolute) {
         let dir = Dir::open_ambient_dir(parent, ambient_authority())?;
@@ -182,8 +195,10 @@ fn parent_and_leaf(path: &Path) -> Option<(&Path, &OsStr)> {
     Some((path.parent()?, path.file_name()?))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn path_key(path: &Path, mode: PathKeyMode) -> String {
     match mode {
+        #[cfg(test)]
         PathKeyMode::Exact => path.to_string_lossy().to_string(),
         PathKeyMode::AsciiCaseInsensitive => path.to_string_lossy().to_ascii_lowercase(),
     }
@@ -311,6 +326,17 @@ mod tests {
             .validate_and_dedupe(paths, |path| Ok::<_, ()>(path.to_path_buf()))
             .expect("validation should succeed");
         assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
+    fn path_policy_exact_keeps_case_distinct_inputs() {
+        let policy = PathPolicy::exact();
+        let normalized = policy.normalize_paths(vec![
+            std::path::PathBuf::from("CaseSensitive"),
+            std::path::PathBuf::from("casesensitive"),
+        ]);
+
+        assert_eq!(normalized.len(), 2);
     }
 
     fn unique_temp_path(prefix: &str) -> std::path::PathBuf {

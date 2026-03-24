@@ -37,6 +37,15 @@ impl SandboxCommandRequest {
         }
         Ok(())
     }
+
+    pub(crate) fn sanitized_for_execution(&self) -> Self {
+        Self {
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            env: sanitize_env_vars(&self.env),
+            timeout_ms: self.timeout_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,18 +63,8 @@ impl SandboxManager {
         workspace_root: &Path,
     ) -> Result<SandboxExecOutput, SandboxError> {
         request.validate()?;
-        let sanitized = sanitize_request_env(request);
+        let sanitized = request.sanitized_for_execution();
         platform::execute(&sanitized, policy, workspace_root)
-    }
-}
-
-fn sanitize_request_env(request: &SandboxCommandRequest) -> SandboxCommandRequest {
-    let env = sanitize_env_vars(&request.env);
-    SandboxCommandRequest {
-        command: request.command.clone(),
-        cwd: request.cwd.clone(),
-        env,
-        timeout_ms: request.timeout_ms,
     }
 }
 
@@ -100,9 +99,11 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use std::collections::HashMap;
 
-    use super::sanitize_env_vars;
+    use super::{SandboxCommandRequest, sanitize_env_vars, starts_with_ascii_case_insensitive};
 
     #[test]
     fn strips_loader_and_shell_injection_env_when_sandboxed() {
@@ -140,5 +141,43 @@ mod tests {
         assert!(!sanitized.contains_key("Ld_PreLoAd"));
         assert!(!sanitized.contains_key("BaSh_FuNc_x"));
         assert_eq!(sanitized.get("SAFE_VAR"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn request_sanitization_preserves_non_env_fields() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("LD_PRELOAD".to_string(), "evil.so".to_string());
+        let request = SandboxCommandRequest {
+            command: vec!["echo".to_string(), "hello".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            env,
+            timeout_ms: Some(1234),
+        };
+
+        let sanitized = request.sanitized_for_execution();
+        assert_eq!(sanitized.command, request.command);
+        assert_eq!(sanitized.cwd, request.cwd);
+        assert_eq!(sanitized.timeout_ms, request.timeout_ms);
+        assert_eq!(sanitized.env.get("PATH"), Some(&"/usr/bin".to_string()));
+        assert!(!sanitized.env.contains_key("LD_PRELOAD"));
+    }
+
+    #[test]
+    fn blocks_exact_loader_keys_case_insensitively() {
+        let mut env = HashMap::new();
+        env.insert("ld_library_path".to_string(), "/tmp/lib".to_string());
+        env.insert("Ld_AuDiT".to_string(), "evil.so".to_string());
+
+        let sanitized = sanitize_env_vars(&env);
+
+        assert!(!sanitized.contains_key("ld_library_path"));
+        assert!(!sanitized.contains_key("Ld_AuDiT"));
+    }
+
+    #[test]
+    fn prefix_check_rejects_shorter_candidate_without_panicking() {
+        assert!(!starts_with_ascii_case_insensitive("LD", "LD_PRE"));
+        assert!(starts_with_ascii_case_insensitive("DyLd_Value", "DYLD_"));
     }
 }

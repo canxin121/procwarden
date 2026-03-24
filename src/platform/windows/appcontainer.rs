@@ -14,9 +14,9 @@ pub(super) fn execute(
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
-    let acl_plan = collect_acl_plan(policy, workspace_root)?;
-    let allow_paths = sanitize_allow_paths(policy, acl_plan.allow_paths)?;
-    let deny_paths = sanitize_allow_paths(policy, acl_plan.deny_paths)?;
+    let acl_plan = collect_acl_plan(policy, workspace_root);
+    let allow_paths = sanitize_policy_paths(policy, acl_plan.allow_paths)?;
+    let deny_paths = sanitize_policy_paths(policy, acl_plan.deny_paths)?;
 
     if policy.enforce_world_writable_audit {
         audit::audit_paths_for_world_writable(&allow_paths, env_map, &request.cwd)?;
@@ -52,17 +52,13 @@ pub(super) fn execute(
     drop(acl_rollback);
     drop(appcontainer);
 
-    let stdout = String::from_utf8_lossy(&capture.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&capture.stderr).to_string();
-
-    Ok(SandboxExecOutput {
-        exit_code: capture.exit_code,
-        stdout: stdout.clone(),
-        stderr: stderr.clone(),
-        aggregated_output: format!("{stdout}{stderr}"),
-        duration: start.elapsed(),
-        timed_out: capture.timed_out,
-    })
+    Ok(SandboxExecOutput::from_utf8_lossy(
+        capture.exit_code,
+        &capture.stdout,
+        &capture.stderr,
+        start.elapsed(),
+        capture.timed_out,
+    ))
 }
 
 struct AclPlan {
@@ -70,53 +66,28 @@ struct AclPlan {
     deny_paths: Vec<PathBuf>,
 }
 
-fn collect_acl_plan(
-    policy: &SandboxPolicy,
-    _workspace_root: &Path,
-) -> Result<AclPlan, SandboxError> {
-    if matches!(policy.global_access, crate::SandboxAccess::ReadWrite) {
-        return Ok(AclPlan {
+fn collect_acl_plan(policy: &SandboxPolicy, _workspace_root: &Path) -> AclPlan {
+    if policy.full_disk_write_access() {
+        return AclPlan {
             allow_paths: Vec::new(),
             deny_paths: Vec::new(),
-        });
+        };
     }
 
-    let mut allow_paths = policy
-        .path_permissions
-        .iter()
-        .filter(|permission| {
-            matches!(
-                permission.access,
-                crate::SandboxAccess::ReadOnly | crate::SandboxAccess::ReadWrite
-            )
-        })
-        .map(|permission| permission.path.clone())
-        .collect::<Vec<_>>();
-    allow_paths.extend(
-        policy
-            .path_permissions
-            .iter()
-            .filter(|permission| matches!(permission.access, crate::SandboxAccess::ReadWrite))
-            .map(|permission| permission.path.clone()),
-    );
-    let deny_paths = policy
-        .path_permissions
-        .iter()
-        .filter(|permission| matches!(permission.access, crate::SandboxAccess::NoAccess))
-        .map(|permission| permission.path.clone())
-        .collect::<Vec<_>>();
+    let allow_paths = policy.readable_paths();
+    let deny_paths = policy.denied_paths();
 
-    Ok(AclPlan {
+    AclPlan {
         allow_paths,
         deny_paths,
-    })
+    }
 }
 
-fn sanitize_allow_paths(
+fn sanitize_policy_paths(
     policy: &SandboxPolicy,
-    allow_paths: Vec<PathBuf>,
+    paths: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, SandboxError> {
-    cap_fs::PathPolicy::ascii_case_insensitive().validate_and_dedupe(allow_paths, |path| {
+    cap_fs::PathPolicy::ascii_case_insensitive().validate_and_dedupe(paths, |path| {
         util::ensure_safe_allow_path(
             path,
             util::PathSafetyOptions {

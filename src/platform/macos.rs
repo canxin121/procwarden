@@ -12,15 +12,7 @@ const MACOS_RUNNER_ENV: &str = "PROCWARDEN_MACOS_RUNNER";
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    workspace_root: &Path,
-) -> Result<SandboxExecOutput, SandboxError> {
-    execute_with_virtualization_runner(request, policy, workspace_root)
-}
-
-fn execute_with_virtualization_runner(
-    request: &SandboxCommandRequest,
-    policy: &SandboxPolicy,
-    workspace_root: &Path,
+    _workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let runner_path = std::env::var(MACOS_RUNNER_ENV)
         .ok()
@@ -37,7 +29,7 @@ fn execute_with_virtualization_runner(
     }
 
     let mut argv = vec![runner_path];
-    argv.extend(build_runner_policy_args(policy, workspace_root));
+    argv.extend(build_runner_policy_args(policy));
     if let Some(timeout_ms) = request.timeout_ms {
         argv.push("--timeout-ms".to_string());
         argv.push(timeout_ms.to_string());
@@ -50,7 +42,7 @@ fn execute_with_virtualization_runner(
     execute_command(&argv, &request.cwd, &request.env, request.timeout_ms)
 }
 
-fn build_runner_policy_args(policy: &SandboxPolicy, _workspace_root: &Path) -> Vec<String> {
+fn build_runner_policy_args(policy: &SandboxPolicy) -> Vec<String> {
     let mut args = Vec::new();
 
     if policy.network_access {
@@ -65,24 +57,12 @@ fn build_runner_policy_args(policy: &SandboxPolicy, _workspace_root: &Path) -> V
         SandboxAccess::NoAccess => args.push("--global-none".to_string()),
     }
 
-    for permission in &policy.path_permissions {
-        match permission.access {
-            SandboxAccess::NoAccess => {
-                args.push("--deny-path".to_string());
-                args.push(permission.path.to_string_lossy().to_string());
-            }
-            SandboxAccess::ReadOnly => {
-                args.push("--ro-path".to_string());
-                args.push(permission.path.to_string_lossy().to_string());
-            }
-            SandboxAccess::ReadWrite => {
-                args.push("--rw-path".to_string());
-                args.push(permission.path.to_string_lossy().to_string());
-            }
-        }
+    for read_only in policy.read_only_paths() {
+        args.push("--ro-path".to_string());
+        args.push(read_only.to_string_lossy().to_string());
     }
 
-    for writable in policy.writable_paths() {
+    for writable in policy.read_write_paths() {
         args.push("--rw-path".to_string());
         args.push(writable.to_string_lossy().to_string());
     }
@@ -111,4 +91,92 @@ fn execute_command(
     configure_piped_stdio(&mut command);
 
     run_command_with_timeout(&mut command, timeout_ms, start)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        SandboxAccess, SandboxCommandRequest, SandboxError, SandboxPathPermission, SandboxPolicy,
+    };
+    use std::collections::HashMap;
+
+    use super::{MACOS_RUNNER_ENV, build_runner_policy_args, execute};
+
+    #[test]
+    fn policy_args_map_to_expected_flags_without_duplicates() {
+        let policy = SandboxPolicy {
+            path_permissions: vec![
+                SandboxPathPermission::read_only("/tmp/ro"),
+                SandboxPathPermission::read_write("/tmp/rw"),
+                SandboxPathPermission::deny("/tmp/no"),
+            ],
+            global_access: SandboxAccess::NoAccess,
+            network_access: false,
+            enforce_world_writable_audit: false,
+            reject_reparse_points: true,
+            allow_unc_paths: false,
+        };
+
+        let args = build_runner_policy_args(&policy);
+
+        assert!(args.contains(&"--deny-network".to_string()));
+        assert!(args.contains(&"--global-none".to_string()));
+        assert_eq!(args.iter().filter(|entry| *entry == "--ro-path").count(), 1);
+        assert_eq!(args.iter().filter(|entry| *entry == "--rw-path").count(), 1);
+        assert_eq!(
+            args.iter().filter(|entry| *entry == "--deny-path").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn execute_fails_closed_when_runner_is_missing() {
+        let _guard = EnvVarGuard::set(
+            MACOS_RUNNER_ENV,
+            "/definitely/not/installed/procwarden-runner",
+        );
+        let cwd = std::env::temp_dir();
+        let request = SandboxCommandRequest {
+            command: vec!["true".to_string()],
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+            timeout_ms: Some(100),
+        };
+
+        let result = execute(&request, &SandboxPolicy::default(), &cwd);
+        let message = match result {
+            Err(SandboxError::Unavailable(message)) => message,
+            other => panic!("expected unavailable error, got {other:?}"),
+        };
+        assert!(message.contains(MACOS_RUNNER_ENV));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 }
