@@ -3,17 +3,10 @@ use std::path::{Path, PathBuf};
 use super::cap_fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowsEnforcementLevel {
-    Auto,
-    CompatAclTokenJob,
-    AppContainer,
-    Lpac,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailStrategy {
-    FailClosed,
-    FailOpenWithReport,
+pub enum SandboxAccess {
+    NoAccess,
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,14 +15,14 @@ pub struct SandboxPathPermission {
     pub access: SandboxAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxAccess {
-    NoAccess,
-    ReadOnly,
-    ReadWrite,
-}
-
 impl SandboxPathPermission {
+    pub fn deny(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: SandboxAccess::NoAccess,
+        }
+    }
+
     pub fn read_only(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -43,13 +36,6 @@ impl SandboxPathPermission {
             access: SandboxAccess::ReadWrite,
         }
     }
-
-    pub fn deny(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            access: SandboxAccess::NoAccess,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +43,6 @@ pub struct SandboxPolicy {
     path_permissions: Vec<SandboxPathPermission>,
     global_access: SandboxAccess,
     network_access: bool,
-    windows_enforcement: WindowsEnforcementLevel,
-    fail_strategy: FailStrategy,
     enforce_world_writable_audit: bool,
     reject_reparse_points: bool,
     allow_unc_paths: bool,
@@ -79,8 +63,6 @@ impl SandboxPolicy {
         path_permissions: Vec::new(),
         global_access: SandboxAccess::ReadOnly,
         network_access: false,
-        windows_enforcement: WindowsEnforcementLevel::Auto,
-        fail_strategy: FailStrategy::FailClosed,
         enforce_world_writable_audit: true,
         reject_reparse_points: true,
         allow_unc_paths: false,
@@ -94,8 +76,6 @@ impl SandboxPolicy {
         path_permissions: Vec::new(),
         global_access: SandboxAccess::ReadOnly,
         network_access: false,
-        windows_enforcement: WindowsEnforcementLevel::Auto,
-        fail_strategy: FailStrategy::FailClosed,
         enforce_world_writable_audit: true,
         reject_reparse_points: true,
         allow_unc_paths: false,
@@ -109,8 +89,6 @@ impl SandboxPolicy {
             path_permissions: Vec::new(),
             global_access: SandboxAccess::ReadWrite,
             network_access: true,
-            windows_enforcement: WindowsEnforcementLevel::Auto,
-            fail_strategy: FailStrategy::FailOpenWithReport,
             enforce_world_writable_audit: false,
             reject_reparse_points: false,
             allow_unc_paths: true,
@@ -137,8 +115,6 @@ impl SandboxPolicy {
             path_permissions: Vec::new(),
             global_access: SandboxAccess::ReadWrite,
             network_access: false,
-            windows_enforcement: WindowsEnforcementLevel::Auto,
-            fail_strategy: FailStrategy::FailClosed,
             enforce_world_writable_audit: false,
             reject_reparse_points: false,
             allow_unc_paths: true,
@@ -153,8 +129,6 @@ impl SandboxPolicy {
             path_permissions: Vec::new(),
             global_access: SandboxAccess::NoAccess,
             network_access: false,
-            windows_enforcement: WindowsEnforcementLevel::Auto,
-            fail_strategy: FailStrategy::FailClosed,
             enforce_world_writable_audit: true,
             reject_reparse_points: true,
             allow_unc_paths: false,
@@ -204,22 +178,6 @@ impl SandboxPolicy {
         self.network_access
     }
 
-    pub fn windows_enforcement(&self) -> WindowsEnforcementLevel {
-        self.windows_enforcement
-    }
-
-    pub fn fail_strategy(&self) -> FailStrategy {
-        self.fail_strategy
-    }
-
-    pub fn should_fail_closed(&self) -> bool {
-        matches!(self.fail_strategy, FailStrategy::FailClosed)
-    }
-
-    pub fn allows_degraded_execution(&self) -> bool {
-        matches!(self.fail_strategy, FailStrategy::FailOpenWithReport)
-    }
-
     pub fn enforce_world_writable_audit(&self) -> bool {
         self.enforce_world_writable_audit
     }
@@ -258,6 +216,11 @@ impl SandboxPolicy {
         self
     }
 
+    pub fn with_global_access(mut self, access: SandboxAccess) -> Self {
+        self.global_access = access;
+        self
+    }
+
     pub fn with_full_disk_read_access(mut self, enabled: bool) -> Self {
         self.global_access = if enabled {
             if matches!(self.global_access, SandboxAccess::ReadWrite) {
@@ -282,23 +245,8 @@ impl SandboxPolicy {
         self
     }
 
-    pub fn with_global_access(mut self, access: SandboxAccess) -> Self {
-        self.global_access = access;
-        self
-    }
-
     pub fn with_network_access(mut self, enabled: bool) -> Self {
         self.network_access = enabled;
-        self
-    }
-
-    pub fn with_windows_enforcement(mut self, level: WindowsEnforcementLevel) -> Self {
-        self.windows_enforcement = level;
-        self
-    }
-
-    pub fn with_fail_strategy(mut self, strategy: FailStrategy) -> Self {
-        self.fail_strategy = strategy;
         self
     }
 
@@ -409,7 +357,6 @@ impl SandboxPolicy {
             return true;
         }
 
-        let _ = workspace_root;
         self.readable_roots_with_workspace(workspace_root)
             .iter()
             .any(|root| path.starts_with(root))
@@ -446,9 +393,7 @@ impl Default for SandboxPolicy {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        FailStrategy, SandboxAccess, SandboxPathPermission, SandboxPolicy, WindowsEnforcementLevel,
-    };
+    use super::{SandboxAccess, SandboxPathPermission, SandboxPolicy};
 
     #[test]
     fn workspace_write_contains_workspace_root() {
@@ -497,11 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn full_read_write_policy_enables_all_disk_access_without_danger_mode() {
-        let policy = SandboxPolicy::new_full_read_write_policy();
+    fn unsandboxed_is_full_access_and_networked() {
+        let policy = SandboxPolicy::new_unsandboxed_policy();
         assert!(policy.has_full_disk_read_access());
         assert!(policy.has_full_disk_write_access());
-        assert!(!policy.is_danger_full_access());
+        assert!(policy.has_full_network_access());
+        assert!(policy.is_danger_full_access());
     }
 
     #[test]
@@ -524,17 +470,5 @@ mod tests {
         let policy = SandboxPolicy::new_custom_policy().with_global_access(SandboxAccess::ReadOnly);
         assert!(policy.has_full_disk_read_access());
         assert!(!policy.has_full_disk_write_access());
-    }
-
-    #[test]
-    fn supports_windows_enforcement_and_fail_strategy_configuration() {
-        let policy = SandboxPolicy::new_custom_policy()
-            .with_windows_enforcement(WindowsEnforcementLevel::Lpac)
-            .with_fail_strategy(FailStrategy::FailOpenWithReport);
-
-        assert_eq!(policy.windows_enforcement(), WindowsEnforcementLevel::Lpac);
-        assert_eq!(policy.fail_strategy(), FailStrategy::FailOpenWithReport);
-        assert!(policy.allows_degraded_execution());
-        assert!(!policy.should_fail_closed());
     }
 }

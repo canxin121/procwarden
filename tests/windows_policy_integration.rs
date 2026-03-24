@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    ChildProcessCoverage, DegradeReasonCode, FailStrategy, SandboxCommandRequest, SandboxError,
-    SandboxManager, SandboxPolicy, WindowsEnforcementLevel,
+    ChildProcessCoverage, EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy,
 };
 
 fn temp_workspace(prefix: &str) -> PathBuf {
@@ -29,43 +28,19 @@ fn base_request(cwd: &PathBuf) -> SandboxCommandRequest {
 }
 
 #[test]
-fn windows_fail_closed_rejects_read_allowlist_on_compat_backend() {
-    let workspace = temp_workspace("fail-closed");
-    let manager = SandboxManager::new();
-    let request = base_request(&workspace);
-
-    let policy = SandboxPolicy::new_custom_policy()
-        .with_additional_readable_roots([workspace.clone()])
-        .with_windows_enforcement(WindowsEnforcementLevel::CompatAclTokenJob)
-        .with_fail_strategy(FailStrategy::FailClosed);
-
-    let result = manager.execute(&request, &policy, &workspace);
-    match result {
-        Err(SandboxError::Unavailable(message)) => {
-            assert!(message.contains("cannot enforce read allowlists"));
-        }
-        other => panic!("expected unavailable error, got: {other:?}"),
-    }
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn windows_fail_open_reports_degraded_read_enforcement_and_child_coverage() {
-    let workspace = temp_workspace("fail-open");
+fn windows_reports_strong_enforcement_for_allowlists() {
+    let workspace = temp_workspace("appcontainer-strong");
     let manager = SandboxManager::new();
     let request = base_request(&workspace);
 
     let policy = SandboxPolicy::new_custom_policy()
         .with_additional_readable_roots([workspace.clone()])
         .with_additional_writable_roots([workspace.clone()])
-        .with_windows_enforcement(WindowsEnforcementLevel::CompatAclTokenJob)
-        .with_fail_strategy(FailStrategy::FailOpenWithReport)
         .with_world_writable_audit(false);
 
     let output = match manager.execute(&request, &policy, &workspace) {
         Ok(value) => value,
-        Err(SandboxError::Windows(message))
+        Err(procwarden::SandboxError::Windows(message))
             if message.contains("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)") =>
         {
             let _ = std::fs::remove_dir_all(&workspace);
@@ -74,18 +49,16 @@ fn windows_fail_open_reports_degraded_read_enforcement_and_child_coverage() {
         Err(other) => panic!("unexpected execution error: {other:?}"),
     };
 
-    assert!(!output.enforcement.read_allowlist_enforced);
-    assert!(
-        output
-            .enforcement
-            .degraded_reason_codes
-            .contains(&DegradeReasonCode::CompatReadAllowlistBestEffort)
+    assert_eq!(output.enforcement.backend, "windows-appcontainer");
+    assert!(output.enforcement.read_allowlist_enforced);
+    assert!(output.enforcement.write_allowlist_enforced);
+    assert_eq!(
+        output.enforcement.effective_read_enforcement,
+        EnforcementStrength::Strong
     );
-    assert!(
-        output
-            .enforcement
-            .degraded_reason_codes
-            .contains(&DegradeReasonCode::FailOpenDegraded)
+    assert_eq!(
+        output.enforcement.effective_write_enforcement,
+        EnforcementStrength::Strong
     );
     assert_eq!(
         output.enforcement.child_process_coverage,
@@ -103,8 +76,6 @@ fn windows_dangerous_namespace_allow_path_is_blocked() {
 
     let policy = SandboxPolicy::new_custom_policy()
         .with_additional_writable_roots([PathBuf::from(r"\\.\NUL")])
-        .with_windows_enforcement(WindowsEnforcementLevel::CompatAclTokenJob)
-        .with_fail_strategy(FailStrategy::FailOpenWithReport)
         .with_reparse_point_rejection(false);
 
     let result = manager.execute(&request, &policy, &workspace);

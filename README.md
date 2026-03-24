@@ -10,11 +10,8 @@ Policy is modeled as:
 
 - `path_permissions: Vec<SandboxPathPermission>`
   - each entry is read-only or read-write
-- `global_read: bool`
-- `global_write: bool`
+- `global_access: SandboxAccess` (`NoAccess` / `ReadOnly` / `ReadWrite`)
 - `network_access: bool`
-- `windows_enforcement: WindowsEnforcementLevel`
-- `fail_strategy: FailStrategy`
 
 This enables flexible combinations:
 
@@ -28,10 +25,7 @@ This enables flexible combinations:
 ```rust
 use std::path::PathBuf;
 
-use procwarden::{
-    SandboxCommandRequest, SandboxManager, SandboxPathPermission, SandboxPolicy,
-    WindowsEnforcementLevel, FailStrategy,
-};
+use procwarden::{SandboxCommandRequest, SandboxManager, SandboxPathPermission, SandboxPolicy};
 
 let manager = SandboxManager::new();
 
@@ -40,9 +34,7 @@ let policy = SandboxPolicy::new_custom_policy()
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ])
-    .with_network_access(false)
-    .with_windows_enforcement(WindowsEnforcementLevel::Auto)
-    .with_fail_strategy(FailStrategy::FailClosed);
+    .with_network_access(false);
 
 let request = SandboxCommandRequest {
     command: vec!["python3".into(), "script.py".into()],
@@ -63,23 +55,15 @@ println!("backend = {}", output.enforcement.backend);
 |---|---|---|---|---|
 | Linux (landlock+seccomp) | Strong | Strong | Strong (seccomp) | RestrictedAndJob |
 | macOS (seatbelt/sandbox-exec) | BestEffort | BestEffort | BestEffort | RestrictedAndJob |
-| Windows AppContainer/LPAC | Strong | Strong | BestEffort (env hardening) | RestrictedAndJob |
-| Windows Compat ACL+Token+Job | BestEffort | Strong | BestEffort (env hardening) | RestrictedAndJob |
+| Windows AppContainer | Strong | Strong | BestEffort (env hardening) | RestrictedAndJob |
 | Fallback adapter | None | None | BestEffort | None |
 
-## Windows guarantee levels
+## Windows backend
 
-`WindowsEnforcementLevel`:
+Windows uses a single sandbox backend: **AppContainer**.
 
-- `Auto`: choose best backend by requested policy
-- `CompatAclTokenJob`: compatibility backend (read is best-effort)
-- `AppContainer`: strong read/write allowlist path
-- `Lpac`: appcontainer-restricted variant
-
-If a requested capability cannot be strongly enforced on chosen backend:
-
-- `FailStrategy::FailClosed` => return error
-- `FailStrategy::FailOpenWithReport` => continue with degraded enforcement and report it
+There is no runtime backend selection. This keeps policy behavior consistent
+with the permission model.
 
 ## Enforcement report
 
@@ -93,7 +77,7 @@ Each execution returns `SandboxExecOutput.enforcement` with:
 - machine-readable degrade codes (`DegradeReasonCode`)
 - human-readable degrade reasons
 
-This report is intended for policy telemetry, audit trails, and fail-open governance.
+This report is intended for policy telemetry and audit trails.
 
 ## Unsandboxed mode
 

@@ -17,9 +17,7 @@ pub enum ChildProcessCoverage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradeReasonCode {
     SeatbeltDeprecated,
-    CompatReadAllowlistBestEffort,
     OsSandboxUnavailable,
-    FailOpenDegraded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

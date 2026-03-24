@@ -14,7 +14,6 @@ pub(super) fn execute(
     policy: &SandboxPolicy,
     workspace_root: &Path,
     env_map: &HashMap<String, String>,
-    use_lpac: bool,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
@@ -35,7 +34,7 @@ pub(super) fn execute(
             ))
         })?;
 
-    let appcontainer = token::create_appcontainer_context(use_lpac)?;
+    let appcontainer = token::create_appcontainer_context()?;
     let sid = appcontainer.sid();
 
     let acl_plan = acl::AclAccessPlan {
@@ -67,11 +66,7 @@ pub(super) fn execute(
         duration: start.elapsed(),
         timed_out: capture.timed_out,
         enforcement: EnforcementReport {
-            backend: if use_lpac {
-                "windows-lpac".to_string()
-            } else {
-                "windows-appcontainer".to_string()
-            },
+            backend: "windows-appcontainer".to_string(),
             requested_read_allowlist: policy.requested_read_enforcement(),
             requested_write_allowlist: policy.requested_write_enforcement(),
             effective_read_enforcement: if policy.requested_read_enforcement() {

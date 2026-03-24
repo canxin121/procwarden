@@ -19,7 +19,6 @@ use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
-use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::CreateProcessW;
 use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
@@ -145,150 +144,6 @@ fn path_extensions(env_map: &HashMap<String, String>) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-pub(super) fn run_process_as_user(
-    token: HANDLE,
-    application_name: &Path,
-    command: &[String],
-    cwd: &Path,
-    env_map: &HashMap<String, String>,
-    timeout_ms: Option<u64>,
-) -> Result<CaptureResult, SandboxError> {
-    unsafe {
-        let (stdin_pair, stdout_pair, stderr_pair) = setup_stdio_pipes()?;
-        let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
-
-        let job_handle = create_job_kill_on_close()?;
-        let mut attrs = match prepare_child_and_job_attributes(job_handle) {
-            Ok(value) => value,
-            Err(error) => {
-                close_many(&[in_r, in_w, out_r, out_w, err_r, err_w, job_handle]);
-                return Err(error);
-            }
-        };
-
-        let mut startup_info_ex: STARTUPINFOEXW = std::mem::zeroed();
-        startup_info_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-        startup_info_ex.StartupInfo.hStdInput = in_r;
-        startup_info_ex.StartupInfo.hStdOutput = out_w;
-        startup_info_ex.StartupInfo.hStdError = err_w;
-        startup_info_ex.lpAttributeList = attrs.as_mut_ptr();
-
-        let desktop = to_wide("Winsta0\\Default");
-        startup_info_ex.StartupInfo.lpDesktop = desktop.as_ptr() as *mut u16;
-
-        let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
-        let command_line_string = command
-            .iter()
-            .map(|arg| quote_windows_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut command_line = to_wide(&command_line_string);
-        let env_block = make_env_block(env_map);
-        let app_name = to_wide(application_name.as_os_str());
-
-        let cwd_wide = to_wide(cwd);
-        let spawn_ok = CreateProcessAsUserW(
-            token,
-            app_name.as_ptr(),
-            command_line.as_mut_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            1,
-            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-            env_block.as_ptr() as *mut c_void,
-            cwd_wide.as_ptr(),
-            &startup_info_ex.StartupInfo,
-            &mut process_info,
-        );
-        if spawn_ok == 0 {
-            let code = GetLastError() as i32;
-            close_many(&[in_r, in_w, out_r, out_w, err_r, err_w, job_handle]);
-            return Err(SandboxError::Windows(format!(
-                "CreateProcessAsUserW failed: {} ({})",
-                code,
-                format_last_error(code)
-            )));
-        }
-
-        close_many(&[in_r, in_w, out_w, err_w]);
-
-        let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
-        let out_r_raw = out_r as usize;
-        let stdout_thread = std::thread::spawn(move || {
-            let out_r = out_r_raw as HANDLE;
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = ReadFile(
-                    out_r,
-                    chunk.as_mut_ptr(),
-                    chunk.len() as u32,
-                    &mut read_bytes,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read_bytes as usize]);
-            }
-            CloseHandle(out_r);
-            let _ = tx_out.send(buffer);
-        });
-
-        let err_r_raw = err_r as usize;
-        let stderr_thread = std::thread::spawn(move || {
-            let err_r = err_r_raw as HANDLE;
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = ReadFile(
-                    err_r,
-                    chunk.as_mut_ptr(),
-                    chunk.len() as u32,
-                    &mut read_bytes,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read_bytes as usize]);
-            }
-            CloseHandle(err_r);
-            let _ = tx_err.send(buffer);
-        });
-
-        let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
-        let wait_result = WaitForSingleObject(process_info.hProcess, timeout);
-        let timed_out = wait_result == 0x0000_0102;
-        if timed_out {
-            let _ = TerminateProcess(process_info.hProcess, 1);
-        }
-
-        let mut exit_code_raw: u32 = 1;
-        if !timed_out {
-            let _ = GetExitCodeProcess(process_info.hProcess, &mut exit_code_raw);
-        }
-
-        close_many(&[process_info.hThread, process_info.hProcess, job_handle]);
-
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-        let stdout = rx_out.recv().unwrap_or_default();
-        let stderr = rx_err.recv().unwrap_or_default();
-
-        Ok(CaptureResult {
-            exit_code: if timed_out { 124 } else { exit_code_raw as i32 },
-            stdout,
-            stderr,
-            timed_out,
-        })
-    }
 }
 
 pub(super) fn run_process_in_appcontainer(
@@ -433,44 +288,6 @@ pub(super) fn run_process_in_appcontainer(
             timed_out,
         })
     }
-}
-
-unsafe fn prepare_child_and_job_attributes(
-    job_handle: HANDLE,
-) -> Result<ProcThreadAttributes, SandboxError> {
-    let mut attrs = ProcThreadAttributes::new(2)?;
-
-    let mut child_policy: u64 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED as u64;
-    if UpdateProcThreadAttribute(
-        attrs.as_mut_ptr(),
-        0,
-        PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
-        &mut child_policy as *mut _ as *mut c_void,
-        std::mem::size_of::<u64>(),
-        std::ptr::null_mut(),
-        std::ptr::null(),
-    ) == 0
-    {
-        return Err(last_error(
-            "UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)",
-        ));
-    }
-
-    let mut job = job_handle;
-    if UpdateProcThreadAttribute(
-        attrs.as_mut_ptr(),
-        0,
-        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        &mut job as *mut _ as *mut c_void,
-        std::mem::size_of::<HANDLE>(),
-        std::ptr::null_mut(),
-        std::ptr::null(),
-    ) == 0
-    {
-        return Err(last_error("UpdateProcThreadAttribute(JOB_LIST)"));
-    }
-
-    Ok(attrs)
 }
 
 unsafe fn prepare_appcontainer_child_job_attributes(
