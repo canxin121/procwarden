@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::{
-    ChildProcessCoverage, DegradeReasonCode, EnforcementReport, EnforcementStrength,
-    PathInterceptionStats, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
+    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -41,7 +41,6 @@ pub(super) fn execute(
         read_allowlist_enforced: false,
         write_allowlist_enforced: false,
         network_restricted: !policy.has_full_network_access(),
-        child_process_coverage: ChildProcessCoverage::None,
         path_interception: PathInterceptionStats::default(),
         degraded_reason_codes: vec![DegradeReasonCode::OsSandboxUnavailable],
         degraded_reasons: vec!["os-sandbox-unavailable-best-effort-only".to_string()],

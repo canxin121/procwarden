@@ -9,6 +9,6 @@ pub use error::SandboxError;
 pub use manager::{SandboxCommandRequest, SandboxManager};
 pub use policy::{SandboxAccess, SandboxPathPermission, SandboxPolicy, WritableRoot};
 pub use result::{
-    ChildProcessCoverage, DegradeReasonCode, EnforcementReport, EnforcementStrength,
-    PathInterceptionStats, SandboxExecOutput,
+    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    SandboxExecOutput,
 };

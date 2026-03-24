@@ -24,8 +24,8 @@ use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
 use crate::{
-    ChildProcessCoverage, EnforcementReport, EnforcementStrength, PathInterceptionStats,
-    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
+    EnforcementReport, EnforcementStrength, PathInterceptionStats, SandboxCommandRequest,
+    SandboxError, SandboxExecOutput, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -93,7 +93,6 @@ pub(super) fn execute(
         read_allowlist_enforced: policy.requested_read_enforcement(),
         write_allowlist_enforced: policy.requested_write_enforcement(),
         network_restricted: !policy.has_full_network_access(),
-        child_process_coverage: ChildProcessCoverage::RestrictedAndJob,
         path_interception: PathInterceptionStats::default(),
         degraded_reason_codes: Vec::new(),
         degraded_reasons: Vec::new(),

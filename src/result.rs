@@ -8,13 +8,6 @@ pub enum EnforcementStrength {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChildProcessCoverage {
-    None,
-    JobOnly,
-    RestrictedAndJob,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradeReasonCode {
     SeatbeltDeprecated,
     OsSandboxUnavailable,
@@ -40,7 +33,6 @@ pub struct EnforcementReport {
     pub read_allowlist_enforced: bool,
     pub write_allowlist_enforced: bool,
     pub network_restricted: bool,
-    pub child_process_coverage: ChildProcessCoverage,
     pub path_interception: PathInterceptionStats,
     pub degraded_reason_codes: Vec<DegradeReasonCode>,
     pub degraded_reasons: Vec<String>,

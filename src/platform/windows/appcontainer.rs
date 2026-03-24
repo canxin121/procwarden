@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::{
-    ChildProcessCoverage, EnforcementReport, EnforcementStrength, PathInterceptionStats,
-    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs,
+    EnforcementReport, EnforcementStrength, PathInterceptionStats, SandboxCommandRequest,
+    SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs,
 };
 
 use super::{acl, audit, process, token, util};
@@ -82,7 +82,6 @@ pub(super) fn execute(
             read_allowlist_enforced: policy.requested_read_enforcement(),
             write_allowlist_enforced: policy.requested_write_enforcement(),
             network_restricted: !policy.has_full_network_access(),
-            child_process_coverage: ChildProcessCoverage::RestrictedAndJob,
             path_interception: PathInterceptionStats {
                 allow_paths_checked: acl_plan.allow_paths.len() as u32,
                 deny_paths_checked: acl_plan.deny_paths.len() as u32,

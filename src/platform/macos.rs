@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use crate::cap_fs;
 use crate::{
-    ChildProcessCoverage, DegradeReasonCode, EnforcementReport, EnforcementStrength,
-    PathInterceptionStats, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
+    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -57,7 +57,6 @@ pub(super) fn execute(
             read_allowlist_enforced: false,
             write_allowlist_enforced: false,
             network_restricted: !policy.has_full_network_access(),
-            child_process_coverage: ChildProcessCoverage::RestrictedAndJob,
             path_interception: PathInterceptionStats::default(),
             degraded_reason_codes: vec![DegradeReasonCode::SeatbeltDeprecated],
             degraded_reasons: vec!["seatbelt-sandbox-exec-deprecated".to_string()],
@@ -163,7 +162,6 @@ fn execute_without_sandbox(
             read_allowlist_enforced: false,
             write_allowlist_enforced: false,
             network_restricted: false,
-            child_process_coverage: ChildProcessCoverage::None,
             path_interception: PathInterceptionStats::default(),
             degraded_reason_codes: Vec::new(),
             degraded_reasons: Vec::new(),

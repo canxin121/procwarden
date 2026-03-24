@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use procwarden::{
-    ChildProcessCoverage, EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy,
-};
+use procwarden::{EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy};
 
 fn temp_workspace(prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -60,11 +58,6 @@ fn windows_reports_strong_enforcement_for_allowlists() {
         output.enforcement.effective_write_enforcement,
         EnforcementStrength::Strong
     );
-    assert_eq!(
-        output.enforcement.child_process_coverage,
-        ChildProcessCoverage::RestrictedAndJob
-    );
-
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
