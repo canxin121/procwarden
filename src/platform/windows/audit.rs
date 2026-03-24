@@ -131,14 +131,11 @@ mod tests {
 
     #[test]
     fn gather_candidates_includes_cwd_and_dedupes_case_insensitive_entries() {
-        let allow_paths = vec![PathBuf::from(r"C:\\allow"), PathBuf::from(r"c:\\ALLOW")];
-        let cwd = PathBuf::from(r"C:\\workspace");
+        let allow_paths = vec![PathBuf::from(r"C:\allow"), PathBuf::from(r"c:\ALLOW")];
+        let cwd = PathBuf::from(r"C:\workspace");
 
         let mut env = HashMap::new();
-        env.insert(
-            "PATH".to_string(),
-            r"C:\\tools;c:\\TOOLS;C:\\bin".to_string(),
-        );
+        env.insert("PATH".to_string(), r"C:\tools;c:\TOOLS;C:\bin".to_string());
 
         let candidates = gather_candidates(&allow_paths, &env, &cwd);
         let matches_case_insensitive = |needle: &str| {
@@ -152,15 +149,15 @@ mod tests {
             candidates.iter().any(|path| path == &cwd),
             "cwd should always be audited"
         );
-        assert_eq!(matches_case_insensitive(r"C:\\allow"), 1);
-        assert_eq!(matches_case_insensitive(r"C:\\tools"), 1);
-        assert_eq!(matches_case_insensitive(r"C:\\bin"), 1);
+        assert_eq!(matches_case_insensitive(r"C:\allow"), 1);
+        assert_eq!(matches_case_insensitive(r"C:\tools"), 1);
+        assert_eq!(matches_case_insensitive(r"C:\bin"), 1);
     }
 
     #[test]
     fn gather_candidates_handles_missing_path_variable() {
-        let allow_paths = vec![PathBuf::from(r"C:\\allow")];
-        let cwd = PathBuf::from(r"C:\\workspace");
+        let allow_paths = vec![PathBuf::from(r"C:\allow")];
+        let cwd = PathBuf::from(r"C:\workspace");
         let env = HashMap::new();
 
         let candidates = gather_candidates(&allow_paths, &env, &cwd);
@@ -168,11 +165,12 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .any(|path| path.to_string_lossy().eq_ignore_ascii_case(r"C:\\allow"))
+                .any(|path| path.to_string_lossy().eq_ignore_ascii_case(r"C:\allow"))
         );
-        assert!(candidates.iter().any(|path| {
-            path.to_string_lossy()
-                .eq_ignore_ascii_case(r"C:\\workspace")
-        }));
+        assert!(
+            candidates
+                .iter()
+                .any(|path| { path.to_string_lossy().eq_ignore_ascii_case(r"C:\workspace") })
+        );
     }
 }
