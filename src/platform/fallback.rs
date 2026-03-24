@@ -41,6 +41,11 @@ pub(super) fn execute(
         read_allowlist_enforced: false,
         write_allowlist_enforced: false,
         network_restricted: !policy.has_full_network_access(),
+        effective_network_enforcement: if policy.has_full_network_access() {
+            EnforcementStrength::None
+        } else {
+            EnforcementStrength::BestEffort
+        },
         path_interception: PathInterceptionStats::default(),
         degraded_reason_codes: vec![DegradeReasonCode::OsSandboxUnavailable],
         degraded_reasons: vec!["os-sandbox-unavailable-best-effort-only".to_string()],

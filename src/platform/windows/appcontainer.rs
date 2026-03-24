@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
+use windows_sys::Win32::Security::{EqualSid, PSID, SID_AND_ATTRIBUTES};
+
 use crate::{
-    EnforcementReport, EnforcementStrength, PathInterceptionStats, SandboxCommandRequest,
-    SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs,
+    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs,
 };
 
 use super::{acl, audit, process, token, util};
@@ -57,6 +62,8 @@ pub(super) fn execute(
 
     let stdout = String::from_utf8_lossy(&capture.stdout).to_string();
     let stderr = String::from_utf8_lossy(&capture.stderr).to_string();
+    let (network_strength, mut degraded_reason_codes, mut degraded_reasons) =
+        assess_network_enforcement(policy, sid);
 
     Ok(SandboxExecOutput {
         exit_code: capture.exit_code,
@@ -82,6 +89,7 @@ pub(super) fn execute(
             read_allowlist_enforced: policy.requested_read_enforcement(),
             write_allowlist_enforced: policy.requested_write_enforcement(),
             network_restricted: !policy.has_full_network_access(),
+            effective_network_enforcement: network_strength,
             path_interception: PathInterceptionStats {
                 allow_paths_checked: acl_plan.allow_paths.len() as u32,
                 deny_paths_checked: acl_plan.deny_paths.len() as u32,
@@ -90,10 +98,68 @@ pub(super) fn execute(
                 reparse_blocks: 0,
                 symlink_blocks: 0,
             },
-            degraded_reason_codes: Vec::new(),
-            degraded_reasons: Vec::new(),
+            degraded_reason_codes: {
+                degraded_reason_codes.shrink_to_fit();
+                degraded_reason_codes
+            },
+            degraded_reasons: {
+                degraded_reasons.shrink_to_fit();
+                degraded_reasons
+            },
         },
     })
+}
+
+fn assess_network_enforcement(
+    policy: &SandboxPolicy,
+    appcontainer_sid: PSID,
+) -> (EnforcementStrength, Vec<DegradeReasonCode>, Vec<String>) {
+    if policy.has_full_network_access() {
+        return (EnforcementStrength::None, Vec::new(), Vec::new());
+    }
+
+    match is_loopback_exempt(appcontainer_sid) {
+        Ok(true) => (
+            EnforcementStrength::BestEffort,
+            vec![DegradeReasonCode::WindowsLoopbackExemptionDetected],
+            vec![
+                "appcontainer sid is present in loopback exemption list; network block is not strictly strong"
+                    .to_string(),
+            ],
+        ),
+        Ok(false) => (EnforcementStrength::Strong, Vec::new(), Vec::new()),
+        Err(err) => (
+            EnforcementStrength::BestEffort,
+            vec![DegradeReasonCode::WindowsLoopbackExemptionCheckFailed],
+            vec![format!("failed to verify loopback exemptions: {err}")],
+        ),
+    }
+}
+
+fn is_loopback_exempt(appcontainer_sid: PSID) -> Result<bool, SandboxError> {
+    let mut count: u32 = 0;
+    let mut entries: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+    let status = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
+    if status != 0 {
+        return Err(SandboxError::Windows(format!(
+            "NetworkIsolationGetAppContainerConfig failed: {}",
+            status
+        )));
+    }
+
+    let mut exempt = false;
+    if !entries.is_null() {
+        let list = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+        exempt = list.iter().any(|entry| unsafe {
+            !entry.Sid.is_null() && EqualSid(entry.Sid, appcontainer_sid) != 0
+        });
+
+        unsafe {
+            LocalFree(entries as *mut c_void as HLOCAL);
+        }
+    }
+
+    Ok(exempt)
 }
 
 struct AclPlan {

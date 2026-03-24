@@ -54,8 +54,8 @@ println!("backend = {}", output.enforcement.backend);
 | Platform | Filesystem read allowlist | Filesystem write allowlist | Network restriction | Child-process coverage |
 |---|---|---|---|---|
 | Linux (landlock+seccomp) | Strong | Strong | Strong (seccomp) | RestrictedAndJob |
-| macOS (seatbelt/sandbox-exec) | BestEffort | BestEffort | BestEffort | RestrictedAndJob |
-| Windows AppContainer | Strong | Strong | BestEffort (env hardening) | RestrictedAndJob |
+| macOS (virtualization runner) | Strong | Strong | Strong (runner-configurable) | RestrictedAndJob |
+| Windows AppContainer | Strong | Strong | Strong (AppContainer capability isolation; downgraded if loopback exemption is detected/unverifiable) | RestrictedAndJob |
 | Fallback adapter | None | None | BestEffort | None |
 
 ## Windows backend
@@ -65,6 +65,21 @@ Windows uses a single sandbox backend: **AppContainer**.
 There is no runtime backend selection. This keeps policy behavior consistent
 with the permission model.
 
+## macOS backend
+
+macOS uses a non-deprecated virtualization runner integration.
+
+By default, procwarden looks for the runner at:
+
+- `/usr/local/bin/procwarden-macos-runner`
+
+You can override this path with:
+
+- `PROCWARDEN_MACOS_RUNNER`
+
+If the runner is unavailable, macOS sandboxed execution fails closed with
+`SandboxError::Unavailable`.
+
 ## Enforcement report
 
 Each execution returns `SandboxExecOutput.enforcement` with:
@@ -72,7 +87,7 @@ Each execution returns `SandboxExecOutput.enforcement` with:
 - requested read/write allowlist flags
 - effective strength (`None`, `BestEffort`, `Strong`)
 - boolean effective read/write enforcement flags
-- child-process coverage level
+- effective network enforcement strength
 - path interception counters
 - machine-readable degrade codes (`DegradeReasonCode`)
 - human-readable degrade reasons

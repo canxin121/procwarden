@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use procwarden::{EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy};
+use procwarden::{
+    DegradeReasonCode, EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy,
+};
 
 fn temp_workspace(prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -58,6 +60,23 @@ fn windows_reports_strong_enforcement_for_allowlists() {
         output.enforcement.effective_write_enforcement,
         EnforcementStrength::Strong
     );
+    assert!(output.enforcement.network_restricted);
+    match output.enforcement.effective_network_enforcement {
+        EnforcementStrength::Strong => {}
+        EnforcementStrength::BestEffort => {
+            assert!(
+                output
+                    .enforcement
+                    .degraded_reason_codes
+                    .contains(&DegradeReasonCode::WindowsLoopbackExemptionDetected)
+                    || output
+                        .enforcement
+                        .degraded_reason_codes
+                        .contains(&DegradeReasonCode::WindowsLoopbackExemptionCheckFailed),
+            );
+        }
+        EnforcementStrength::None => panic!("network enforcement should not be none"),
+    }
     let _ = std::fs::remove_dir_all(&workspace);
 }
 

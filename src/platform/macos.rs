@@ -2,15 +2,15 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::cap_fs;
 use crate::{
-    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    EnforcementReport, EnforcementStrength, PathInterceptionStats, SandboxAccess,
     SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
-const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+const DEFAULT_MACOS_RUNNER_PATH: &str = "/usr/local/bin/procwarden-macos-runner";
+const MACOS_RUNNER_ENV: &str = "PROCWARDEN_MACOS_RUNNER";
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
@@ -21,128 +21,126 @@ pub(super) fn execute(
         return execute_without_sandbox(request);
     }
 
-    if !cap_fs::is_file(Path::new(SANDBOX_EXEC_PATH)) {
+    execute_with_virtualization_runner(request, policy, workspace_root)
+}
+
+fn execute_with_virtualization_runner(
+    request: &SandboxCommandRequest,
+    policy: &SandboxPolicy,
+    workspace_root: &Path,
+) -> Result<SandboxExecOutput, SandboxError> {
+    let runner_path = std::env::var(MACOS_RUNNER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MACOS_RUNNER_PATH.to_string());
+
+    let runner = Path::new(&runner_path);
+    if !runner.is_file() {
         return Err(SandboxError::Unavailable(format!(
-            "{SANDBOX_EXEC_PATH} is not available",
+            "macOS virtualization runner not found at {}; set {} to the runner binary path",
+            runner.display(),
+            MACOS_RUNNER_ENV
         )));
     }
 
-    let mut sandbox_command = vec![
-        SANDBOX_EXEC_PATH.to_string(),
-        "-p".to_string(),
-        build_seatbelt_policy(policy, workspace_root),
-        "--".to_string(),
-    ];
-    sandbox_command.extend(request.command.clone());
+    let mut argv = vec![runner_path];
+    argv.extend(build_runner_policy_args(policy, workspace_root));
+    if let Some(timeout_ms) = request.timeout_ms {
+        argv.push("--timeout-ms".to_string());
+        argv.push(timeout_ms.to_string());
+    }
+    argv.push("--cwd".to_string());
+    argv.push(request.cwd.to_string_lossy().to_string());
+    argv.push("--".to_string());
+    argv.extend(request.command.clone());
 
     execute_command(
-        &sandbox_command,
+        &argv,
         &request.cwd,
         &request.env,
         request.timeout_ms,
         EnforcementReport {
-            backend: "macos-seatbelt".to_string(),
+            backend: "macos-virtualization-runner".to_string(),
             requested_read_allowlist: policy.requested_read_enforcement(),
             requested_write_allowlist: policy.requested_write_enforcement(),
             effective_read_enforcement: if policy.requested_read_enforcement() {
-                EnforcementStrength::BestEffort
+                EnforcementStrength::Strong
             } else {
                 EnforcementStrength::None
             },
             effective_write_enforcement: if policy.requested_write_enforcement() {
-                EnforcementStrength::BestEffort
+                EnforcementStrength::Strong
             } else {
                 EnforcementStrength::None
             },
-            read_allowlist_enforced: false,
-            write_allowlist_enforced: false,
+            read_allowlist_enforced: policy.requested_read_enforcement(),
+            write_allowlist_enforced: policy.requested_write_enforcement(),
             network_restricted: !policy.has_full_network_access(),
-            path_interception: PathInterceptionStats::default(),
-            degraded_reason_codes: vec![DegradeReasonCode::SeatbeltDeprecated],
-            degraded_reasons: vec!["seatbelt-sandbox-exec-deprecated".to_string()],
+            effective_network_enforcement: if policy.has_full_network_access() {
+                EnforcementStrength::None
+            } else {
+                EnforcementStrength::Strong
+            },
+            path_interception: PathInterceptionStats {
+                allow_paths_checked: policy.path_permissions().len() as u32,
+                deny_paths_checked: policy
+                    .path_permissions()
+                    .iter()
+                    .filter(|permission| matches!(permission.access, SandboxAccess::NoAccess))
+                    .count() as u32,
+                dangerous_namespace_blocks: 0,
+                unc_blocks: 0,
+                reparse_blocks: 0,
+                symlink_blocks: 0,
+            },
+            degraded_reason_codes: Vec::new(),
+            degraded_reasons: Vec::new(),
         },
     )
 }
 
-fn build_seatbelt_policy(policy: &SandboxPolicy, workspace_root: &Path) -> String {
-    let mut policy_text = include_str!("macos_base_policy.sbpl")
-        .trim_end()
-        .to_string();
+fn build_runner_policy_args(policy: &SandboxPolicy, workspace_root: &Path) -> Vec<String> {
+    let mut args = Vec::new();
 
     if policy.has_full_network_access() {
-        append_rule(&mut policy_text, "(allow network-outbound)");
-        append_rule(&mut policy_text, "(allow network-inbound)");
-        append_rule(&mut policy_text, "(allow system-socket)");
+        args.push("--allow-network".to_string());
+    } else {
+        args.push("--deny-network".to_string());
     }
 
-    if policy.has_full_disk_read_access() {
-        append_rule(&mut policy_text, "(allow file-read*)");
-    } else {
-        let readable_roots = policy.readable_roots_with_workspace(workspace_root);
-        if !readable_roots.is_empty() {
-            let clauses = readable_roots
-                .iter()
-                .map(path_clause)
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            append_rule(
-                &mut policy_text,
-                &format!("(allow file-read* (require-any\n  {clauses}\n))"),
-            );
+    match policy.global_access() {
+        SandboxAccess::ReadWrite => args.push("--global-rw".to_string()),
+        SandboxAccess::ReadOnly => args.push("--global-ro".to_string()),
+        SandboxAccess::NoAccess => args.push("--global-none".to_string()),
+    }
+
+    for permission in policy.path_permissions() {
+        match permission.access {
+            SandboxAccess::NoAccess => {
+                args.push("--deny-path".to_string());
+                args.push(permission.path.to_string_lossy().to_string());
+            }
+            SandboxAccess::ReadOnly => {
+                args.push("--ro-path".to_string());
+                args.push(permission.path.to_string_lossy().to_string());
+            }
+            SandboxAccess::ReadWrite => {
+                args.push("--rw-path".to_string());
+                args.push(permission.path.to_string_lossy().to_string());
+            }
         }
     }
 
-    if policy.has_full_disk_write_access() {
-        append_rule(&mut policy_text, "(allow file-write*)");
-    } else {
-        let writable_roots = policy.writable_roots_with_workspace(workspace_root);
-        if !writable_roots.is_empty() {
-            let clauses = writable_roots
-                .iter()
-                .map(write_clause_for_root)
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            append_rule(
-                &mut policy_text,
-                &format!("(allow file-write* (require-any\n  {clauses}\n))"),
-            );
+    for writable in policy.writable_roots_with_workspace(workspace_root) {
+        args.push("--rw-path".to_string());
+        args.push(writable.root.to_string_lossy().to_string());
+        for read_only in writable.read_only_subpaths {
+            args.push("--deny-path".to_string());
+            args.push(read_only.to_string_lossy().to_string());
         }
     }
 
-    policy_text
-}
-
-fn append_rule(policy: &mut String, rule: &str) {
-    policy.push('\n');
-    policy.push_str(rule);
-}
-
-fn path_clause(path: &Path) -> String {
-    format!("(subpath \"{}\")", escape_sbpl_path(path))
-}
-
-fn write_clause_for_root(root: &crate::WritableRoot) -> String {
-    let escaped_root = escape_sbpl_path(&root.root);
-    if root.read_only_subpaths.is_empty() {
-        return format!("(subpath \"{escaped_root}\")");
-    }
-
-    let mut require_not = Vec::new();
-    for path in &root.read_only_subpaths {
-        let escaped = escape_sbpl_path(path);
-        require_not.push(format!("(require-not (subpath \"{escaped}\"))"));
-    }
-
-    format!(
-        "(require-all (subpath \"{escaped_root}\") {})",
-        require_not.join(" ")
-    )
-}
-
-fn escape_sbpl_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    args
 }
 
 fn execute_without_sandbox(
@@ -162,6 +160,7 @@ fn execute_without_sandbox(
             read_allowlist_enforced: false,
             write_allowlist_enforced: false,
             network_restricted: false,
+            effective_network_enforcement: EnforcementStrength::None,
             path_interception: PathInterceptionStats::default(),
             degraded_reason_codes: Vec::new(),
             degraded_reasons: Vec::new(),

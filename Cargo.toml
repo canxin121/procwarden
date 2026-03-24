@@ -26,6 +26,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Memory",
     "Win32_System_JobObjects",
     "Win32_System_WindowsProgramming",
+    "Win32_NetworkManagement_WindowsFirewall",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

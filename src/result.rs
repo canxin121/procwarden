@@ -9,8 +9,9 @@ pub enum EnforcementStrength {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradeReasonCode {
-    SeatbeltDeprecated,
     OsSandboxUnavailable,
+    WindowsLoopbackExemptionDetected,
+    WindowsLoopbackExemptionCheckFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -33,6 +34,7 @@ pub struct EnforcementReport {
     pub read_allowlist_enforced: bool,
     pub write_allowlist_enforced: bool,
     pub network_restricted: bool,
+    pub effective_network_enforcement: EnforcementStrength,
     pub path_interception: PathInterceptionStats,
     pub degraded_reason_codes: Vec<DegradeReasonCode>,
     pub degraded_reasons: Vec<String>,

@@ -69,6 +69,7 @@ fn execute_without_sandbox_with_env(
         read_allowlist_enforced: false,
         write_allowlist_enforced: false,
         network_restricted: false,
+        effective_network_enforcement: EnforcementStrength::None,
         path_interception: PathInterceptionStats::default(),
         degraded_reason_codes: Vec::new(),
         degraded_reasons: Vec::new(),

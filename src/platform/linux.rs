@@ -93,6 +93,11 @@ pub(super) fn execute(
         read_allowlist_enforced: policy.requested_read_enforcement(),
         write_allowlist_enforced: policy.requested_write_enforcement(),
         network_restricted: !policy.has_full_network_access(),
+        effective_network_enforcement: if policy.has_full_network_access() {
+            EnforcementStrength::None
+        } else {
+            EnforcementStrength::Strong
+        },
         path_interception: PathInterceptionStats::default(),
         degraded_reason_codes: Vec::new(),
         degraded_reasons: Vec::new(),
