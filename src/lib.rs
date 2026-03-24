@@ -7,8 +7,5 @@ mod result;
 
 pub use error::SandboxError;
 pub use manager::{SandboxCommandRequest, SandboxManager};
-pub use policy::{SandboxAccess, SandboxPathPermission, SandboxPolicy, WritableRoot};
-pub use result::{
-    DegradeReasonCode, EnforcementReport, EnforcementStrength, PathInterceptionStats,
-    SandboxExecOutput,
-};
+pub use policy::{SandboxAccess, SandboxPathPermission, SandboxPolicy};
+pub use result::SandboxExecOutput;

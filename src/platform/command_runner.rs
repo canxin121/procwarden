@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use command_group::CommandGroup;
 
-use crate::{EnforcementReport, SandboxError, SandboxExecOutput};
+use crate::{SandboxError, SandboxExecOutput};
 
 pub(super) fn configure_piped_stdio(command: &mut Command) {
     command
@@ -18,7 +18,6 @@ pub(super) fn run_command_with_timeout(
     command: &mut Command,
     timeout_ms: Option<u64>,
     start: Instant,
-    enforcement: EnforcementReport,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let mut child = command.group_spawn()?;
 
@@ -71,7 +70,6 @@ pub(super) fn run_command_with_timeout(
         aggregated_output: format!("{stdout}{stderr}"),
         duration: start.elapsed(),
         timed_out,
-        enforcement,
     })
 }
 

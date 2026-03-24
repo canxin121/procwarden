@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    DegradeReasonCode, EnforcementStrength, SandboxCommandRequest, SandboxManager, SandboxPolicy,
+    SandboxAccess, SandboxCommandRequest, SandboxManager, SandboxPathPermission, SandboxPolicy,
 };
 
 fn temp_workspace(prefix: &str) -> PathBuf {
@@ -28,15 +28,22 @@ fn base_request(cwd: &PathBuf) -> SandboxCommandRequest {
 }
 
 #[test]
-fn windows_reports_strong_enforcement_for_allowlists() {
+fn windows_executes_with_explicit_allowlists() {
     let workspace = temp_workspace("appcontainer-strong");
     let manager = SandboxManager::new();
     let request = base_request(&workspace);
 
-    let policy = SandboxPolicy::new_custom_policy()
-        .with_additional_readable_roots([workspace.clone()])
-        .with_additional_writable_roots([workspace.clone()])
-        .with_world_writable_audit(false);
+    let policy = SandboxPolicy {
+        path_permissions: vec![
+            SandboxPathPermission::read_only(workspace.clone()),
+            SandboxPathPermission::read_write(workspace.clone()),
+        ],
+        global_access: SandboxAccess::NoAccess,
+        network_access: false,
+        enforce_world_writable_audit: false,
+        reject_reparse_points: true,
+        allow_unc_paths: false,
+    };
 
     let output = match manager.execute(&request, &policy, &workspace) {
         Ok(value) => value,
@@ -49,34 +56,8 @@ fn windows_reports_strong_enforcement_for_allowlists() {
         Err(other) => panic!("unexpected execution error: {other:?}"),
     };
 
-    assert_eq!(output.enforcement.backend, "windows-appcontainer");
-    assert!(output.enforcement.read_allowlist_enforced);
-    assert!(output.enforcement.write_allowlist_enforced);
-    assert_eq!(
-        output.enforcement.effective_read_enforcement,
-        EnforcementStrength::Strong
-    );
-    assert_eq!(
-        output.enforcement.effective_write_enforcement,
-        EnforcementStrength::Strong
-    );
-    assert!(output.enforcement.network_restricted);
-    match output.enforcement.effective_network_enforcement {
-        EnforcementStrength::Strong => {}
-        EnforcementStrength::BestEffort => {
-            assert!(
-                output
-                    .enforcement
-                    .degraded_reason_codes
-                    .contains(&DegradeReasonCode::WindowsLoopbackExemptionDetected)
-                    || output
-                        .enforcement
-                        .degraded_reason_codes
-                        .contains(&DegradeReasonCode::WindowsLoopbackExemptionCheckFailed),
-            );
-        }
-        EnforcementStrength::None => panic!("network enforcement should not be none"),
-    }
+    assert_eq!(output.exit_code, 0);
+    assert!(!output.timed_out);
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -86,9 +67,14 @@ fn windows_dangerous_namespace_allow_path_is_blocked() {
     let manager = SandboxManager::new();
     let request = base_request(&workspace);
 
-    let policy = SandboxPolicy::new_custom_policy()
-        .with_additional_writable_roots([PathBuf::from(r"\\.\NUL")])
-        .with_reparse_point_rejection(false);
+    let policy = SandboxPolicy {
+        path_permissions: vec![SandboxPathPermission::read_write(PathBuf::from(r"\\.\NUL"))],
+        global_access: SandboxAccess::NoAccess,
+        network_access: false,
+        enforce_world_writable_audit: true,
+        reject_reparse_points: true,
+        allow_unc_paths: false,
+    };
 
     let result = manager.execute(&request, &policy, &workspace);
     assert!(

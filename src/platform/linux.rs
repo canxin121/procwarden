@@ -23,17 +23,14 @@ use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
-use crate::{
-    EnforcementReport, EnforcementStrength, PathInterceptionStats, SandboxCommandRequest,
-    SandboxError, SandboxExecOutput, SandboxPolicy,
-};
+use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    workspace_root: &Path,
+    _workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
@@ -48,62 +45,44 @@ pub(super) fn execute(
         .envs(request.env.clone());
     configure_piped_stdio(&mut command);
 
-    if !policy.is_danger_full_access() {
-        let full_disk_read_access = policy.has_full_disk_read_access();
-        let full_disk_write_access = policy.has_full_disk_write_access();
-        let readable_roots = policy.readable_roots_with_workspace(workspace_root);
-        let writable_roots = policy
-            .writable_roots_with_workspace(workspace_root)
-            .into_iter()
-            .map(|root| root.root)
-            .collect::<Vec<_>>();
-        let network_access = policy.has_full_network_access();
+    let full_disk_read_access = !matches!(policy.global_access, crate::SandboxAccess::NoAccess);
+    let full_disk_write_access = matches!(policy.global_access, crate::SandboxAccess::ReadWrite);
+    let readable_roots = policy
+        .path_permissions
+        .iter()
+        .filter(|permission| {
+            matches!(
+                permission.access,
+                crate::SandboxAccess::ReadOnly | crate::SandboxAccess::ReadWrite
+            )
+        })
+        .map(|permission| permission.path.clone())
+        .collect::<Vec<_>>();
+    let writable_roots = policy
+        .path_permissions
+        .iter()
+        .filter(|permission| matches!(permission.access, crate::SandboxAccess::ReadWrite))
+        .map(|permission| permission.path.clone())
+        .collect::<Vec<_>>();
+    let network_access = policy.network_access;
 
-        unsafe {
-            command.pre_exec(move || {
-                if !network_access {
-                    install_network_seccomp_filter_on_current_thread()?;
-                }
-                if !full_disk_write_access {
-                    install_filesystem_landlock_rules_on_current_thread(
-                        full_disk_read_access,
-                        &readable_roots,
-                        &writable_roots,
-                    )?;
-                }
-                Ok(())
-            });
-        }
+    unsafe {
+        command.pre_exec(move || {
+            if !network_access {
+                install_network_seccomp_filter_on_current_thread()?;
+            }
+            if !full_disk_write_access {
+                install_filesystem_landlock_rules_on_current_thread(
+                    full_disk_read_access,
+                    &readable_roots,
+                    &writable_roots,
+                )?;
+            }
+            Ok(())
+        });
     }
 
-    let enforcement = EnforcementReport {
-        backend: "linux-landlock-seccomp".to_string(),
-        requested_read_allowlist: policy.requested_read_enforcement(),
-        requested_write_allowlist: policy.requested_write_enforcement(),
-        effective_read_enforcement: if policy.requested_read_enforcement() {
-            EnforcementStrength::Strong
-        } else {
-            EnforcementStrength::None
-        },
-        effective_write_enforcement: if policy.requested_write_enforcement() {
-            EnforcementStrength::Strong
-        } else {
-            EnforcementStrength::None
-        },
-        read_allowlist_enforced: policy.requested_read_enforcement(),
-        write_allowlist_enforced: policy.requested_write_enforcement(),
-        network_restricted: !policy.has_full_network_access(),
-        effective_network_enforcement: if policy.has_full_network_access() {
-            EnforcementStrength::None
-        } else {
-            EnforcementStrength::Strong
-        },
-        path_interception: PathInterceptionStats::default(),
-        degraded_reason_codes: Vec::new(),
-        degraded_reasons: Vec::new(),
-    };
-
-    run_command_with_timeout(&mut command, request.timeout_ms, start, enforcement)
+    run_command_with_timeout(&mut command, request.timeout_ms, start)
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(

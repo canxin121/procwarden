@@ -1,6 +1,4 @@
 mod command_runner;
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-mod fallback;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -11,6 +9,11 @@ mod windows;
 use std::path::Path;
 
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "procwarden only supports windows, linux, and macos targets. Unsupported OS builds are intentionally disallowed."
+);
 
 pub(crate) fn execute(
     request: &SandboxCommandRequest,
@@ -30,10 +33,5 @@ pub(crate) fn execute(
     #[cfg(target_os = "macos")]
     {
         macos::execute(request, policy, workspace_root)
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        fallback::execute(request, policy, workspace_root)
     }
 }

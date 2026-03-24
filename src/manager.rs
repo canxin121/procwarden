@@ -54,16 +54,13 @@ impl SandboxManager {
         workspace_root: &Path,
     ) -> Result<SandboxExecOutput, SandboxError> {
         request.validate()?;
-        let sanitized = sanitize_request_env(request, policy);
+        let sanitized = sanitize_request_env(request);
         platform::execute(&sanitized, policy, workspace_root)
     }
 }
 
-fn sanitize_request_env(
-    request: &SandboxCommandRequest,
-    policy: &SandboxPolicy,
-) -> SandboxCommandRequest {
-    let env = sanitize_env_vars(&request.env, policy);
+fn sanitize_request_env(request: &SandboxCommandRequest) -> SandboxCommandRequest {
+    let env = sanitize_env_vars(&request.env);
     SandboxCommandRequest {
         command: request.command.clone(),
         cwd: request.cwd.clone(),
@@ -72,14 +69,7 @@ fn sanitize_request_env(
     }
 }
 
-fn sanitize_env_vars(
-    env: &HashMap<String, String>,
-    policy: &SandboxPolicy,
-) -> HashMap<String, String> {
-    if policy.should_bypass_env_sanitization() {
-        return env.clone();
-    }
-
+fn sanitize_env_vars(env: &HashMap<String, String>) -> HashMap<String, String> {
     const BLOCKED_EXACT: [&str; 5] = [
         "BASH_ENV",
         "ENV",
@@ -112,8 +102,6 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::SandboxPolicy;
-
     use super::sanitize_env_vars;
 
     #[test]
@@ -127,22 +115,12 @@ mod tests {
         );
         env.insert("BASH_ENV".to_string(), "/tmp/rc".to_string());
 
-        let sanitized = sanitize_env_vars(&env, &SandboxPolicy::new_workspace_write_policy());
+        let sanitized = sanitize_env_vars(&env);
 
         assert!(sanitized.contains_key("PATH"));
         assert!(!sanitized.contains_key("LD_PRELOAD"));
         assert!(!sanitized.contains_key("DYLD_INSERT_LIBRARIES"));
         assert!(!sanitized.contains_key("BASH_ENV"));
-    }
-
-    #[test]
-    fn keeps_env_unchanged_for_danger_full_access() {
-        let mut env = HashMap::new();
-        env.insert("LD_PRELOAD".to_string(), "allowed.so".to_string());
-
-        let sanitized = sanitize_env_vars(&env, &SandboxPolicy::new_unsandboxed_policy());
-
-        assert_eq!(sanitized.get("LD_PRELOAD"), Some(&"allowed.so".to_string()));
     }
 
     #[test]
@@ -156,7 +134,7 @@ mod tests {
         env.insert("BaSh_FuNc_x".to_string(), "() { :; }".to_string());
         env.insert("SAFE_VAR".to_string(), "1".to_string());
 
-        let sanitized = sanitize_env_vars(&env, &SandboxPolicy::new_read_only_policy());
+        let sanitized = sanitize_env_vars(&env);
 
         assert!(!sanitized.contains_key("dyld_insert_libraries"));
         assert!(!sanitized.contains_key("Ld_PreLoAd"));
