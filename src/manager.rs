@@ -180,4 +180,32 @@ mod tests {
         assert!(!starts_with_ascii_case_insensitive("LD", "LD_PRE"));
         assert!(starts_with_ascii_case_insensitive("DyLd_Value", "DYLD_"));
     }
+
+    #[test]
+    fn data_driven_blocked_keys_and_prefixes_are_removed() {
+        let blocked_keys = [
+            "LD_PRELOAD",
+            "ld_library_path",
+            "Ld_AuDiT",
+            "DYLD_INSERT_LIBRARIES",
+            "dyld_anything",
+            "BASH_FUNC_payload",
+            "bash_func_payload",
+            "ENV",
+            "bash_env",
+        ];
+
+        for blocked in blocked_keys {
+            let mut env = HashMap::new();
+            env.insert(blocked.to_string(), "evil".to_string());
+            env.insert("SAFE_KEY".to_string(), "ok".to_string());
+
+            let sanitized = sanitize_env_vars(&env);
+            assert!(
+                !sanitized.contains_key(blocked),
+                "blocked key should be removed: {blocked}"
+            );
+            assert_eq!(sanitized.get("SAFE_KEY"), Some(&"ok".to_string()));
+        }
+    }
 }
