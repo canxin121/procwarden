@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{SandboxError, cap_fs};
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PathSafetyOptions {
+    pub reject_reparse_points: bool,
+    pub allow_unc_paths: bool,
+}
+
 pub(super) fn to_wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -39,7 +45,7 @@ pub(super) fn ensure_non_interactive_pager(env_map: &mut HashMap<String, String>
 
 pub(super) fn ensure_safe_allow_path(
     path: &Path,
-    reject_reparse_points: bool,
+    options: PathSafetyOptions,
 ) -> Result<PathBuf, SandboxError> {
     if !cap_fs::path_exists(path) {
         return Err(SandboxError::InvalidRequest(format!(
@@ -48,34 +54,179 @@ pub(super) fn ensure_safe_allow_path(
         )));
     }
 
-    if cap_fs::is_symlink(path)? {
+    reject_dangerous_namespace(path)?;
+
+    let (final_path, file_attributes) = resolve_final_path_and_attributes(path)?;
+
+    if !options.allow_unc_paths && is_unc_path(&final_path) {
         return Err(SandboxError::Denied(format!(
-            "allow path cannot be a symlink: {}",
-            path.display()
+            "allow path cannot be UNC when UNC is disabled: {}",
+            final_path.display()
         )));
     }
 
-    if reject_reparse_points && is_reparse_point(path)? {
+    if options.reject_reparse_points
+        && (file_attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT)
+            != 0
+    {
         return Err(SandboxError::Denied(format!(
             "allow path cannot be a reparse point: {}",
-            path.display()
+            final_path.display()
         )));
     }
 
-    cap_fs::canonicalize_path(path).map_err(SandboxError::Io)
+    if cap_fs::is_symlink(&final_path)? {
+        return Err(SandboxError::Denied(format!(
+            "allow path cannot be a symlink: {}",
+            final_path.display()
+        )));
+    }
+
+    cap_fs::canonicalize_path(&final_path).map_err(SandboxError::Io)
 }
 
-pub(super) fn is_reparse_point(path: &Path) -> Result<bool, SandboxError> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-    use windows_sys::Win32::Storage::FileSystem::GetFileAttributesW;
-
-    let wide = to_wide(path.as_os_str());
-    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
-    if attributes == u32::MAX {
-        return Err(SandboxError::Windows(format!(
-            "GetFileAttributesW failed for {}",
+fn reject_dangerous_namespace(path: &Path) -> Result<(), SandboxError> {
+    let raw = path.to_string_lossy();
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with(r"\\.\")
+        || lower.starts_with(r"\??\")
+        || lower.starts_with(r"\\?\globalroot")
+    {
+        return Err(SandboxError::Denied(format!(
+            "allow path uses disallowed namespace: {}",
             path.display()
         )));
     }
-    Ok((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    Ok(())
+}
+
+fn resolve_final_path_and_attributes(path: &Path) -> Result<(PathBuf, u32), SandboxError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
+
+    let wide_path = to_wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let code = unsafe { GetLastError() } as i32;
+        return Err(SandboxError::Windows(format!(
+            "CreateFileW failed for {}: {}",
+            path.display(),
+            format_last_error(code)
+        )));
+    }
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        let code = unsafe { GetLastError() } as i32;
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(SandboxError::Windows(format!(
+            "GetFileInformationByHandle failed for {}: {}",
+            path.display(),
+            format_last_error(code)
+        )));
+    }
+
+    let required_len = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if required_len == 0 {
+        let code = unsafe { GetLastError() } as i32;
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(SandboxError::Windows(format!(
+            "GetFinalPathNameByHandleW(size) failed for {}: {}",
+            path.display(),
+            format_last_error(code)
+        )));
+    }
+
+    let mut buffer = vec![0_u16; required_len as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if written == 0 {
+        return Err(SandboxError::Windows(format!(
+            "GetFinalPathNameByHandleW(path) failed for {}",
+            path.display()
+        )));
+    }
+
+    let text = String::from_utf16_lossy(&buffer[..written as usize]);
+    let normalized = normalize_final_path_string(&text);
+    Ok((PathBuf::from(normalized), info.dwFileAttributes))
+}
+
+fn normalize_final_path_string(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        return format!(r"\\{}", &path[8..]);
+    }
+    if lower.starts_with(r"\\?\") {
+        return path[4..].to_string();
+    }
+    path.to_string()
+}
+
+fn is_unc_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with(r"\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{is_unc_path, normalize_final_path_string, reject_dangerous_namespace};
+
+    #[test]
+    fn rejects_dangerous_windows_namespaces() {
+        let paths = [
+            Path::new(r"\\.\NUL"),
+            Path::new(r"\??\C:\\temp"),
+            Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume1"),
+        ];
+
+        for path in paths {
+            let result = reject_dangerous_namespace(path);
+            assert!(result.is_err(), "path should be rejected: {path:?}");
+        }
+    }
+
+    #[test]
+    fn normalizes_final_path_prefixes() {
+        let dos = normalize_final_path_string(r"\\?\C:\repo");
+        let unc = normalize_final_path_string(r"\\?\UNC\server\share\dir");
+        assert_eq!(dos, r"C:\repo");
+        assert_eq!(unc, r"\\server\share\dir");
+    }
+
+    #[test]
+    fn detects_unc_paths() {
+        assert!(is_unc_path(&PathBuf::from(r"\\server\share")));
+        assert!(!is_unc_path(&PathBuf::from(r"C:\\repo")));
+    }
 }

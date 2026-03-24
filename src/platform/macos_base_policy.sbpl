@@ -91,6 +91,3 @@
 (allow mach-lookup
   (global-name "com.apple.PowerManagement.control")
 )
-
-; allow reads by default
-(allow file-read*)

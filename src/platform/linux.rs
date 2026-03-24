@@ -23,7 +23,10 @@ use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
-use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+use crate::{
+    ChildProcessCoverage, EnforcementReport, EnforcementStrength, PathInterceptionStats,
+    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
+};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
@@ -45,7 +48,10 @@ pub(super) fn execute(
         .envs(request.env.clone());
     configure_piped_stdio(&mut command);
 
-    if !matches!(policy, SandboxPolicy::DangerFullAccess) {
+    if !policy.is_danger_full_access() {
+        let full_disk_read_access = policy.has_full_disk_read_access();
+        let full_disk_write_access = policy.has_full_disk_write_access();
+        let readable_roots = policy.readable_roots_with_workspace(workspace_root);
         let writable_roots = policy
             .writable_roots_with_workspace(workspace_root)
             .into_iter()
@@ -58,16 +64,47 @@ pub(super) fn execute(
                 if !network_access {
                     install_network_seccomp_filter_on_current_thread()?;
                 }
-                install_filesystem_landlock_rules_on_current_thread(&writable_roots)?;
+                if !full_disk_write_access {
+                    install_filesystem_landlock_rules_on_current_thread(
+                        full_disk_read_access,
+                        &readable_roots,
+                        &writable_roots,
+                    )?;
+                }
                 Ok(())
             });
         }
     }
 
-    run_command_with_timeout(&mut command, request.timeout_ms, start)
+    let enforcement = EnforcementReport {
+        backend: "linux-landlock-seccomp".to_string(),
+        requested_read_allowlist: policy.requested_read_enforcement(),
+        requested_write_allowlist: policy.requested_write_enforcement(),
+        effective_read_enforcement: if policy.requested_read_enforcement() {
+            EnforcementStrength::Strong
+        } else {
+            EnforcementStrength::None
+        },
+        effective_write_enforcement: if policy.requested_write_enforcement() {
+            EnforcementStrength::Strong
+        } else {
+            EnforcementStrength::None
+        },
+        read_allowlist_enforced: policy.requested_read_enforcement(),
+        write_allowlist_enforced: policy.requested_write_enforcement(),
+        network_restricted: !policy.has_full_network_access(),
+        child_process_coverage: ChildProcessCoverage::RestrictedAndJob,
+        path_interception: PathInterceptionStats::default(),
+        degraded_reason_codes: Vec::new(),
+        degraded_reasons: Vec::new(),
+    };
+
+    run_command_with_timeout(&mut command, request.timeout_ms, start, enforcement)
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(
+    full_disk_read_access: bool,
+    readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
 ) -> io::Result<()> {
     let abi = ABI::V5;
@@ -79,9 +116,23 @@ fn install_filesystem_landlock_rules_on_current_thread(
         .handle_access(access_rw)
         .map_err(to_io_error)?
         .create()
-        .map_err(to_io_error)?
-        .add_rules(landlock::path_beneath_rules(&["/"], access_ro))
-        .map_err(to_io_error)?
+        .map_err(to_io_error)?;
+
+    if full_disk_read_access {
+        ruleset = ruleset
+            .add_rules(landlock::path_beneath_rules(&["/"], access_ro))
+            .map_err(to_io_error)?;
+    } else if !readable_roots.is_empty() {
+        let refs = readable_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        ruleset = ruleset
+            .add_rules(landlock::path_beneath_rules(&refs, access_ro))
+            .map_err(to_io_error)?;
+    }
+
+    ruleset = ruleset
         .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))
         .map_err(to_io_error)?
         .set_no_new_privs(true);

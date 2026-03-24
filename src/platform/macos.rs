@@ -3,7 +3,10 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::cap_fs;
-use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+use crate::{
+    ChildProcessCoverage, DegradeReasonCode, EnforcementReport, EnforcementStrength,
+    PathInterceptionStats, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy,
+};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
@@ -14,7 +17,7 @@ pub(super) fn execute(
     policy: &SandboxPolicy,
     workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
-    if matches!(policy, SandboxPolicy::DangerFullAccess) {
+    if policy.is_danger_full_access() {
         return execute_without_sandbox(request);
     }
 
@@ -37,6 +40,28 @@ pub(super) fn execute(
         &request.cwd,
         &request.env,
         request.timeout_ms,
+        EnforcementReport {
+            backend: "macos-seatbelt".to_string(),
+            requested_read_allowlist: policy.requested_read_enforcement(),
+            requested_write_allowlist: policy.requested_write_enforcement(),
+            effective_read_enforcement: if policy.requested_read_enforcement() {
+                EnforcementStrength::BestEffort
+            } else {
+                EnforcementStrength::None
+            },
+            effective_write_enforcement: if policy.requested_write_enforcement() {
+                EnforcementStrength::BestEffort
+            } else {
+                EnforcementStrength::None
+            },
+            read_allowlist_enforced: false,
+            write_allowlist_enforced: false,
+            network_restricted: !policy.has_full_network_access(),
+            child_process_coverage: ChildProcessCoverage::RestrictedAndJob,
+            path_interception: PathInterceptionStats::default(),
+            degraded_reason_codes: vec![DegradeReasonCode::SeatbeltDeprecated],
+            degraded_reasons: vec!["seatbelt-sandbox-exec-deprecated".to_string()],
+        },
     )
 }
 
@@ -49,6 +74,23 @@ fn build_seatbelt_policy(policy: &SandboxPolicy, workspace_root: &Path) -> Strin
         append_rule(&mut policy_text, "(allow network-outbound)");
         append_rule(&mut policy_text, "(allow network-inbound)");
         append_rule(&mut policy_text, "(allow system-socket)");
+    }
+
+    if policy.has_full_disk_read_access() {
+        append_rule(&mut policy_text, "(allow file-read*)");
+    } else {
+        let readable_roots = policy.readable_roots_with_workspace(workspace_root);
+        if !readable_roots.is_empty() {
+            let clauses = readable_roots
+                .iter()
+                .map(path_clause)
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            append_rule(
+                &mut policy_text,
+                &format!("(allow file-read* (require-any\n  {clauses}\n))"),
+            );
+        }
     }
 
     if policy.has_full_disk_write_access() {
@@ -74,6 +116,10 @@ fn build_seatbelt_policy(policy: &SandboxPolicy, workspace_root: &Path) -> Strin
 fn append_rule(policy: &mut String, rule: &str) {
     policy.push('\n');
     policy.push_str(rule);
+}
+
+fn path_clause(path: &Path) -> String {
+    format!("(subpath \"{}\")", escape_sbpl_path(path))
 }
 
 fn write_clause_for_root(root: &crate::WritableRoot) -> String {
@@ -108,6 +154,20 @@ fn execute_without_sandbox(
         &request.cwd,
         &request.env,
         request.timeout_ms,
+        EnforcementReport {
+            backend: "danger-full-access".to_string(),
+            requested_read_allowlist: false,
+            requested_write_allowlist: false,
+            effective_read_enforcement: EnforcementStrength::None,
+            effective_write_enforcement: EnforcementStrength::None,
+            read_allowlist_enforced: false,
+            write_allowlist_enforced: false,
+            network_restricted: false,
+            child_process_coverage: ChildProcessCoverage::None,
+            path_interception: PathInterceptionStats::default(),
+            degraded_reason_codes: Vec::new(),
+            degraded_reasons: Vec::new(),
+        },
     )
 }
 
@@ -116,6 +176,7 @@ fn execute_command(
     cwd: &Path,
     env_map: &std::collections::HashMap<String, String>,
     timeout_ms: Option<u64>,
+    enforcement: EnforcementReport,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
     let mut command = Command::new(&argv[0]);
@@ -126,5 +187,5 @@ fn execute_command(
     command.current_dir(cwd).env_clear().envs(env_map.clone());
     configure_piped_stdio(&mut command);
 
-    run_command_with_timeout(&mut command, timeout_ms, start)
+    run_command_with_timeout(&mut command, timeout_ms, start, enforcement)
 }

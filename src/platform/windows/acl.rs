@@ -48,6 +48,36 @@ pub(super) struct AclRollback {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct AclAccessPlan {
+    pub(super) allow_paths: Vec<PathBuf>,
+    pub(super) deny_paths: Vec<PathBuf>,
+}
+
+pub(super) unsafe fn apply_access_plan(
+    plan: &AclAccessPlan,
+    sid: *mut c_void,
+) -> Result<AclRollback, SandboxError> {
+    let mut rollback = AclRollback::new(sid);
+
+    for path in &plan.deny_paths {
+        let added = add_deny_write_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
+
+    for path in &plan.allow_paths {
+        let added = add_allow_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
+
+    allow_null_device(sid);
+    Ok(rollback)
+}
+
 impl AclRollback {
     pub(super) fn new(sid: *mut c_void) -> Self {
         Self {
@@ -58,6 +88,11 @@ impl AclRollback {
 
     pub(super) fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_len(&self) -> usize {
+        self.paths.len()
     }
 }
 
@@ -337,9 +372,9 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
         std::ptr::null_mut(),
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
-        0,
+        std::ptr::null_mut(),
     );
-    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return;
     }
 
@@ -391,4 +426,19 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
         LocalFree(p_sd as HLOCAL);
     }
     CloseHandle(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::AclRollback;
+
+    #[test]
+    fn rollback_tracks_paths_for_future_revoke() {
+        let mut rollback = AclRollback::new(std::ptr::null_mut());
+        rollback.track(PathBuf::from(r"C:\temp\one"));
+        rollback.track(PathBuf::from(r"C:\temp\two"));
+        assert_eq!(rollback.tracked_len(), 2);
+    }
 }

@@ -76,7 +76,7 @@ fn sanitize_env_vars(
     env: &HashMap<String, String>,
     policy: &SandboxPolicy,
 ) -> HashMap<String, String> {
-    if matches!(policy, SandboxPolicy::DangerFullAccess) {
+    if policy.should_bypass_env_sanitization() {
         return env.clone();
     }
 
@@ -140,7 +140,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("LD_PRELOAD".to_string(), "allowed.so".to_string());
 
-        let sanitized = sanitize_env_vars(&env, &SandboxPolicy::DangerFullAccess);
+        let sanitized = sanitize_env_vars(&env, &SandboxPolicy::new_unsandboxed_policy());
 
         assert_eq!(sanitized.get("LD_PRELOAD"), Some(&"allowed.so".to_string()));
     }
