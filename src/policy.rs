@@ -43,8 +43,6 @@ pub struct SandboxPolicy {
     pub global_access: SandboxAccess,
     pub network_access: bool,
     pub enforce_world_writable_audit: bool,
-    pub reject_reparse_points: bool,
-    pub allow_unc_paths: bool,
 }
 
 impl SandboxPolicy {
@@ -103,8 +101,6 @@ mod tests {
             global_access: SandboxAccess::NoAccess,
             network_access: false,
             enforce_world_writable_audit: false,
-            reject_reparse_points: true,
-            allow_unc_paths: false,
         }
     }
 

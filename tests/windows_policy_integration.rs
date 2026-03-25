@@ -41,8 +41,6 @@ fn windows_executes_with_explicit_allowlists() {
         global_access: SandboxAccess::NoAccess,
         network_access: false,
         enforce_world_writable_audit: false,
-        reject_reparse_points: true,
-        allow_unc_paths: false,
     };
 
     let output = match manager.execute(&request, &policy) {
@@ -72,8 +70,6 @@ fn windows_dangerous_namespace_allow_path_is_blocked() {
         global_access: SandboxAccess::NoAccess,
         network_access: false,
         enforce_world_writable_audit: true,
-        reject_reparse_points: true,
-        allow_unc_paths: false,
     };
 
     let result = manager.execute(&request, &policy);

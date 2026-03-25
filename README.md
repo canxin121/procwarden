@@ -12,8 +12,6 @@ Policy is modeled as:
 - `network_access: bool`
 
 - `enforce_world_writable_audit: bool`
-- `reject_reparse_points: bool`
-- `allow_unc_paths: bool`
 
 ## Quick example
 
@@ -34,8 +32,6 @@ let policy = SandboxPolicy {
     global_access: SandboxAccess::NoAccess,
     network_access: false,
     enforce_world_writable_audit: true,
-    reject_reparse_points: true,
-    allow_unc_paths: false,
 };
 
 let request = SandboxCommandRequest {
@@ -61,6 +57,11 @@ println!("exit = {}", output.exit_code);
 ## Windows backend
 
 Windows uses a single sandbox backend: **AppContainer**.
+
+Path safety defaults are fixed:
+
+- Reparse points are always rejected for allowlisted paths.
+- UNC paths are always permitted as allowlisted paths.
 
 ## macOS backend
 

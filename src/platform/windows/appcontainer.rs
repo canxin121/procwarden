@@ -14,8 +14,8 @@ pub(super) fn execute(
     let start = Instant::now();
 
     let acl_plan = collect_acl_plan(policy);
-    let allow_paths = sanitize_policy_paths(policy, acl_plan.allow_paths)?;
-    let deny_paths = sanitize_policy_paths(policy, acl_plan.deny_paths)?;
+    let allow_paths = sanitize_policy_paths(acl_plan.allow_paths)?;
+    let deny_paths = sanitize_policy_paths(acl_plan.deny_paths)?;
 
     if policy.enforce_world_writable_audit {
         audit::audit_paths_for_world_writable(&allow_paths, env_map, &request.cwd)?;
@@ -82,17 +82,7 @@ fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
     }
 }
 
-fn sanitize_policy_paths(
-    policy: &SandboxPolicy,
-    paths: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>, SandboxError> {
-    cap_fs::PathPolicy::ascii_case_insensitive().validate_and_dedupe(paths, |path| {
-        util::ensure_safe_allow_path(
-            path,
-            util::PathSafetyOptions {
-                reject_reparse_points: policy.reject_reparse_points,
-                allow_unc_paths: policy.allow_unc_paths,
-            },
-        )
-    })
+fn sanitize_policy_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SandboxError> {
+    cap_fs::PathPolicy::ascii_case_insensitive()
+        .validate_and_dedupe(paths, |path| util::ensure_safe_allow_path(path))
 }

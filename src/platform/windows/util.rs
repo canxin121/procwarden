@@ -3,12 +3,6 @@ use std::path::{Path, PathBuf};
 
 use crate::{SandboxError, cap_fs};
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PathSafetyOptions {
-    pub reject_reparse_points: bool,
-    pub allow_unc_paths: bool,
-}
-
 pub(super) fn to_wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -41,10 +35,7 @@ pub(super) fn ensure_non_interactive_pager(env_map: &mut HashMap<String, String>
     env_map.entry("LESS".to_string()).or_default();
 }
 
-pub(super) fn ensure_safe_allow_path(
-    path: &Path,
-    options: PathSafetyOptions,
-) -> Result<PathBuf, SandboxError> {
+pub(super) fn ensure_safe_allow_path(path: &Path) -> Result<PathBuf, SandboxError> {
     if !cap_fs::path_exists(path) {
         return Err(SandboxError::InvalidRequest(format!(
             "allow path does not exist: {}",
@@ -56,16 +47,8 @@ pub(super) fn ensure_safe_allow_path(
 
     let (final_path, file_attributes) = resolve_final_path_and_attributes(path)?;
 
-    if !options.allow_unc_paths && is_unc_path(&final_path) {
-        return Err(SandboxError::Denied(format!(
-            "allow path cannot be UNC when UNC is disabled: {}",
-            final_path.display()
-        )));
-    }
-
-    if options.reject_reparse_points
-        && (file_attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT)
-            != 0
+    if (file_attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT)
+        != 0
     {
         return Err(SandboxError::Denied(format!(
             "allow path cannot be a reparse point: {}",
@@ -190,15 +173,11 @@ fn normalize_final_path_string(path: &str) -> String {
     path.to_string()
 }
 
-fn is_unc_path(path: &Path) -> bool {
-    path.to_string_lossy().starts_with(r"\\")
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    use super::{is_unc_path, normalize_final_path_string, reject_dangerous_namespace};
+    use super::{normalize_final_path_string, reject_dangerous_namespace};
 
     #[test]
     fn rejects_dangerous_windows_namespaces() {
@@ -220,11 +199,5 @@ mod tests {
         let unc = normalize_final_path_string(r"\\?\UNC\server\share\dir");
         assert_eq!(dos, r"C:\repo");
         assert_eq!(unc, r"\\server\share\dir");
-    }
-
-    #[test]
-    fn detects_unc_paths() {
-        assert!(is_unc_path(&PathBuf::from(r"\\server\share")));
-        assert!(!is_unc_path(&PathBuf::from(r"C:\\repo")));
     }
 }

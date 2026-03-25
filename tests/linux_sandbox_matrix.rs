@@ -1494,8 +1494,6 @@ fn policy(
         global_access,
         network_access,
         enforce_world_writable_audit: false,
-        reject_reparse_points: true,
-        allow_unc_paths: false,
     }
 }
 
