@@ -205,7 +205,7 @@ fn cross_platform_cli_tool_runs_under_restricted_policy() {
     let manager = SandboxManager::new();
     let policy = SandboxPolicy {
         path_permissions: Vec::new(),
-        global_access: SandboxAccess::ReadWrite,
+        default_access: SandboxAccess::ReadWrite,
         network_access: true,
     };
 
@@ -710,7 +710,7 @@ fn policy_read_only(
             SandboxPathPermission::read_write(runtime_cwd.to_path_buf()),
             SandboxPathPermission::read_only(readonly_parent.to_path_buf()),
         ],
-        global_access: SandboxAccess::ReadOnly,
+        default_access: SandboxAccess::ReadOnly,
         network_access,
     }
 }
@@ -727,7 +727,7 @@ fn policy_with_writable_scope(
             SandboxPathPermission::read_only(readonly_parent.to_path_buf()),
             SandboxPathPermission::read_write(writable_scope.to_path_buf()),
         ],
-        global_access: SandboxAccess::ReadOnly,
+        default_access: SandboxAccess::ReadOnly,
         network_access,
     }
 }

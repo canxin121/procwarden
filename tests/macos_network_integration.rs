@@ -51,7 +51,7 @@ fn loopback_connect_request(cwd: &Path, python3: &str, port: u16) -> SandboxComm
 fn loopback_policy(network_access: bool) -> SandboxPolicy {
     SandboxPolicy {
         path_permissions: Vec::new(),
-        global_access: SandboxAccess::ReadWrite,
+        default_access: SandboxAccess::ReadWrite,
         network_access,
     }
 }

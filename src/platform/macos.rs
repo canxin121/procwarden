@@ -53,7 +53,7 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
         push_path_rule(&mut lines, "deny", "file-write*", &denied);
     }
 
-    match policy.global_access {
+    match policy.default_access {
         SandboxAccess::ReadWrite => {
             for read_only in dedupe_paths(policy.read_only_paths()) {
                 push_path_rule(&mut lines, "deny", "file-write*", &read_only);

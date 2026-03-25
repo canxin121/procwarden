@@ -61,7 +61,7 @@ fn loopback_connect_request(cwd: &Path, port: u16) -> SandboxCommandRequest {
 fn loopback_policy(network_access: bool) -> SandboxPolicy {
     SandboxPolicy {
         path_permissions: Vec::new(),
-        global_access: SandboxAccess::ReadWrite,
+        default_access: SandboxAccess::ReadWrite,
         network_access,
     }
 }
@@ -100,7 +100,7 @@ fn windows_executes_with_explicit_allowlists() {
             SandboxPathPermission::read_only(workspace.clone()),
             SandboxPathPermission::read_write(workspace.clone()),
         ],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: true,
     };
 
@@ -135,7 +135,7 @@ fn windows_read_only_paths_reject_writes_while_read_write_paths_allow_them() {
             SandboxPathPermission::read_only(readonly_dir.clone()),
             SandboxPathPermission::read_write(readwrite_dir.clone()),
         ],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: true,
     };
 
@@ -196,7 +196,7 @@ fn windows_nonexistent_allow_path_is_blocked() {
         path_permissions: vec![SandboxPathPermission::read_write(
             workspace.join("definitely-missing-allow-path"),
         )],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: false,
     };
 

@@ -22,8 +22,10 @@
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
     - `SandboxPathPermission::deny(path)`
-- `global_access: SandboxAccess`
+- `default_access: SandboxAccess`
   - `NoAccess | ReadOnly | ReadWrite`
+  - 表示未命中 `path_permissions` 时的默认访问策略
+  - 具体路径规则（`read_only` / `read_write` / `deny`）会叠加覆盖默认策略
 - `network_access: bool`
 
 `SandboxCommandRequest` 包含：
@@ -57,7 +59,7 @@ let policy = SandboxPolicy {
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ],
-    global_access: SandboxAccess::NoAccess,
+    default_access: SandboxAccess::NoAccess,
     network_access: false,
 };
 
@@ -98,22 +100,23 @@ println!("exit = {}", output.exit_code);
 
 Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 
-- `global_access == ReadWrite`
-  - 跳过 Landlock 文件系统限制配置。
+- `default_access == ReadWrite`
+  - 若不存在 `ReadOnly` / `NoAccess` 覆盖路径，则跳过 Landlock 文件系统限制配置。
+  - 若存在 `ReadOnly` / `NoAccess` 覆盖路径，Linux 会返回 `SandboxError::InvalidRequest`（fail-closed），因为 Landlock 无法在“默认全可写”上安全表达减法覆盖规则。
 - 其他情况：
   - 创建并安装 Landlock ruleset。
   - 按策略推导出的读/写根路径授予权限。
 
 后端内部映射关系：
 
-- `full_disk_read_access = (global_access != NoAccess)`
-- `full_disk_write_access = (global_access == ReadWrite)`
+- `default_read_access = (default_access != NoAccess)`
+- `default_write_access = (default_access == ReadWrite)`
 - `readable_roots = path_permissions 中 access ∈ {ReadOnly, ReadWrite}`
 - `writable_roots = path_permissions 中 access == ReadWrite`
 
 规则细节：
 
-- 若 `full_disk_read_access` 为 true，则对 `"/"` 授予读权限。
+- 若 `default_read_access` 为 true，则对 `"/"` 授予读权限。
 - 否则仅对 `readable_roots` 授予读权限。
 - 始终对 `/dev/null` 授予读写权限（保证常见进程 I/O 兼容）。
 - 对 `writable_roots` 授予读写权限。
@@ -159,17 +162,17 @@ Windows allow/deny 路径通过 `ensure_safe_allow_path` 校验：
 
 ### ACL 计划实现
 
-policy 转换为 ACL 计划：
+policy 按“默认 + 覆盖”转换为 ACL 计划：
 
-- 若 `global_access == ReadWrite`：本层不额外附加 allow/deny ACL 覆盖。
-- 其他情况：
-  - `allow_readonly_paths = read_only_paths`
-  - `allow_readwrite_paths = read_write_paths`
-  - `deny_paths = denied_paths`（NoAccess）
+- `allow_readonly_paths = read_only_paths`
+- `allow_readwrite_paths = read_write_paths`
+- `deny_readwrite_paths = denied_paths`（NoAccess）
+- 当 `default_access == ReadWrite` 时，`read_only_paths` 还会作为 deny-write 覆盖路径生效
 
 随后：
 
-- 对 `deny_paths` 增加 deny-write ACE。
+- 对 `deny_readwrite_paths` 增加 deny read/write/execute ACE。
+- 对 `default_access == ReadWrite` 下的 read-only 覆盖路径增加 deny-write ACE。
 - 对 `allow_readonly_paths` 增加 allow read/execute ACE。
 - 对 `allow_readwrite_paths` 增加 allow read/write/execute ACE。
 - 用 rollback 对象跟踪并在结束时撤销。
@@ -223,7 +226,7 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 - `network_access == false` 时添加 `(deny network*)`
 - 该 deny 覆盖本地与外部网络访问（例如 loopback 与远端地址）。
 - `deny` 路径先生成显式的 `file-read*` 与 `file-write*` deny 规则
-- 再映射全局权限：
+- 再映射默认权限：
   - `ReadWrite`：默认可写，但受显式 read-only/deny 路径规则约束
   - `ReadOnly`：先加入可写 carve-out，再追加 `(deny file-write*)`
   - `NoAccess`：先加入可读/可写 carve-out，再追加 `(deny file-read*)` 与 `(deny file-write*)`

@@ -40,7 +40,7 @@ impl SandboxPathPermission {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     pub path_permissions: Vec<SandboxPathPermission>,
-    pub global_access: SandboxAccess,
+    pub default_access: SandboxAccess,
     pub network_access: bool,
 }
 
@@ -68,13 +68,13 @@ impl SandboxPolicy {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn full_disk_read_access(&self) -> bool {
-        !matches!(self.global_access, SandboxAccess::NoAccess)
+    pub(crate) fn default_read_access(&self) -> bool {
+        !matches!(self.default_access, SandboxAccess::NoAccess)
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows", test))]
-    pub(crate) fn full_disk_write_access(&self) -> bool {
-        matches!(self.global_access, SandboxAccess::ReadWrite)
+    pub(crate) fn default_write_access(&self) -> bool {
+        matches!(self.default_access, SandboxAccess::ReadWrite)
     }
 
     fn collect_paths(&self, mut include: impl FnMut(SandboxAccess) -> bool) -> Vec<PathBuf> {

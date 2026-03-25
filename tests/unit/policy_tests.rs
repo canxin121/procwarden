@@ -7,7 +7,7 @@ fn sample_policy() -> SandboxPolicy {
             SandboxPathPermission::read_write("/tmp/rw"),
             SandboxPathPermission::deny("/tmp/no"),
         ],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: false,
     }
 }
@@ -44,19 +44,19 @@ fn keeps_permission_order_within_extractors() {
 }
 
 #[test]
-fn reports_global_disk_access_flags() {
+fn reports_default_disk_access_flags() {
     let mut policy = SandboxPolicy {
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         ..SandboxPolicy::default()
     };
-    assert!(!policy.full_disk_read_access());
-    assert!(!policy.full_disk_write_access());
+    assert!(!policy.default_read_access());
+    assert!(!policy.default_write_access());
 
-    policy.global_access = SandboxAccess::ReadOnly;
-    assert!(policy.full_disk_read_access());
-    assert!(!policy.full_disk_write_access());
+    policy.default_access = SandboxAccess::ReadOnly;
+    assert!(policy.default_read_access());
+    assert!(!policy.default_write_access());
 
-    policy.global_access = SandboxAccess::ReadWrite;
-    assert!(policy.full_disk_read_access());
-    assert!(policy.full_disk_write_access());
+    policy.default_access = SandboxAccess::ReadWrite;
+    assert!(policy.default_read_access());
+    assert!(policy.default_write_access());
 }

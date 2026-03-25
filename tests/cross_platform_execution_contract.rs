@@ -81,7 +81,7 @@ fn cross_platform_output_contract_for_python_and_node() {
 
         let policy = SandboxPolicy {
             path_permissions: Vec::new(),
-            global_access: SandboxAccess::ReadWrite,
+            default_access: SandboxAccess::ReadWrite,
             network_access: true,
         };
 
@@ -153,7 +153,7 @@ fn cross_platform_timeout_contract_for_python_and_node() {
 
         let policy = SandboxPolicy {
             path_permissions: Vec::new(),
-            global_access: SandboxAccess::ReadWrite,
+            default_access: SandboxAccess::ReadWrite,
             network_access: true,
         };
 
@@ -230,7 +230,7 @@ fn cross_platform_env_sanitization_contract() {
     };
     let policy = SandboxPolicy {
         path_permissions: Vec::new(),
-        global_access: SandboxAccess::ReadWrite,
+        default_access: SandboxAccess::ReadWrite,
         network_access: true,
     };
 

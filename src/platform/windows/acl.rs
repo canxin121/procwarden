@@ -51,7 +51,8 @@ pub(super) struct AclRollback {
 pub(super) struct AclAccessPlan {
     pub(super) allow_readonly_paths: Vec<PathBuf>,
     pub(super) allow_readwrite_paths: Vec<PathBuf>,
-    pub(super) deny_paths: Vec<PathBuf>,
+    pub(super) deny_write_paths: Vec<PathBuf>,
+    pub(super) deny_readwrite_paths: Vec<PathBuf>,
 }
 
 pub(super) unsafe fn apply_access_plan(
@@ -60,7 +61,14 @@ pub(super) unsafe fn apply_access_plan(
 ) -> Result<AclRollback, SandboxError> {
     let mut rollback = AclRollback::new(sid);
 
-    for path in &plan.deny_paths {
+    for path in &plan.deny_readwrite_paths {
+        let added = add_deny_read_write_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
+
+    for path in &plan.deny_write_paths {
         let added = add_deny_write_ace(path, sid)?;
         if added {
             rollback.track(path.clone());
@@ -251,6 +259,25 @@ pub(super) unsafe fn add_deny_write_ace(
     path: &Path,
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
+    add_deny_access_ace(path, sid, FILE_GENERIC_WRITE)
+}
+
+pub(super) unsafe fn add_deny_read_write_ace(
+    path: &Path,
+    sid: *mut c_void,
+) -> Result<bool, SandboxError> {
+    add_deny_access_ace(
+        path,
+        sid,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+    )
+}
+
+unsafe fn add_deny_access_ace(
+    path: &Path,
+    sid: *mut c_void,
+    access_mask: u32,
+) -> Result<bool, SandboxError> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -279,7 +306,7 @@ pub(super) unsafe fn add_deny_write_ace(
         ptstrName: sid as *mut u16,
     };
     let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = FILE_GENERIC_WRITE;
+    explicit.grfAccessPermissions = access_mask;
     explicit.grfAccessMode = 3;
     explicit.grfInheritance = windows_sys::Win32::Security::CONTAINER_INHERIT_ACE
         | windows_sys::Win32::Security::OBJECT_INHERIT_ACE;

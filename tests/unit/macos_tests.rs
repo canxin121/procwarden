@@ -19,7 +19,7 @@ fn profile_contains_network_deny_when_disabled() {
 fn profile_readonly_allows_rw_paths_before_global_write_deny() {
     let policy = SandboxPolicy {
         path_permissions: vec![SandboxPathPermission::read_write("/tmp/w")],
-        global_access: SandboxAccess::ReadOnly,
+        default_access: SandboxAccess::ReadOnly,
         network_access: true,
     };
     let profile = build_sbpl_profile(&policy);
@@ -45,7 +45,7 @@ fn profile_noaccess_adds_read_write_fallback_denies() {
             SandboxPathPermission::read_write("/tmp/rw"),
             SandboxPathPermission::deny("/tmp/no"),
         ],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: true,
     };
     let profile = build_sbpl_profile(&policy);

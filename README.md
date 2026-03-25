@@ -22,8 +22,10 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
     - `SandboxPathPermission::deny(path)`
-- `global_access: SandboxAccess`
+- `default_access: SandboxAccess`
   - `NoAccess | ReadOnly | ReadWrite`
+  - interpreted as a default rule for paths not explicitly listed in `path_permissions`
+  - explicit path rules (`read_only` / `read_write` / `deny`) are overlays on top of this default
 - `network_access: bool`
 
 `SandboxCommandRequest` contains:
@@ -57,7 +59,7 @@ let policy = SandboxPolicy {
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ],
-    global_access: SandboxAccess::NoAccess,
+    default_access: SandboxAccess::NoAccess,
     network_access: false,
 };
 
@@ -98,22 +100,23 @@ Implementation entry: `src/platform/linux.rs`
 
 Linux filesystem restrictions are applied in `pre_exec` using Landlock:
 
-- `global_access == ReadWrite`
-  - skips Landlock filesystem restriction setup.
+- `default_access == ReadWrite`
+  - if no `ReadOnly`/`NoAccess` overlays are present, skips Landlock filesystem restriction setup.
+  - if `ReadOnly`/`NoAccess` overlays are present, Linux returns `SandboxError::InvalidRequest` (fail-closed) because Landlock cannot safely express these subtractive overrides over a full-write default.
 - otherwise:
   - installs a Landlock ruleset.
   - grants read scopes and write scopes based on policy-derived roots.
 
 Internal mapping used by the backend:
 
-- `full_disk_read_access = (global_access != NoAccess)`
-- `full_disk_write_access = (global_access == ReadWrite)`
+- `default_read_access = (default_access != NoAccess)`
+- `default_write_access = (default_access == ReadWrite)`
 - `readable_roots = path_permissions where access in {ReadOnly, ReadWrite}`
 - `writable_roots = path_permissions where access == ReadWrite`
 
 Rule construction details:
 
-- if `full_disk_read_access` is true, `"/"` is granted read access.
+- if `default_read_access` is true, `"/"` is granted read access.
 - otherwise, read access is granted only to `readable_roots`.
 - `/dev/null` is always granted read/write for practical process I/O compatibility.
 - `writable_roots` receive read/write permissions.
@@ -159,17 +162,17 @@ Windows allow/deny paths are validated through `ensure_safe_allow_path`:
 
 ### ACL plan implementation
 
-Policy is converted to an ACL plan:
+Policy is converted to an ACL plan using default+overlay semantics:
 
-- if `global_access == ReadWrite`: no explicit allow/deny ACL overlay is added by this layer.
-- otherwise:
-  - `allow_readonly_paths = read_only_paths`
-  - `allow_readwrite_paths = read_write_paths`
-  - `deny_paths = denied_paths` (NoAccess entries)
+- `allow_readonly_paths = read_only_paths`
+- `allow_readwrite_paths = read_write_paths`
+- `deny_readwrite_paths = denied_paths` (`NoAccess` entries)
+- if `default_access == ReadWrite`, `read_only_paths` are additionally enforced as deny-write overlays
 
 Then the backend:
 
-- adds deny-write ACEs for `deny_paths`.
+- adds deny read/write/execute ACEs for `deny_readwrite_paths`.
+- adds deny-write ACEs for read-only overlays under `default_access == ReadWrite`.
 - adds allow read/execute ACEs for `allow_readonly_paths`.
 - adds allow read/write/execute ACEs for `allow_readwrite_paths`.
 - tracks changes and revokes them on drop (rollback object).
@@ -223,7 +226,7 @@ Current mapping strategy:
 - `network_access == false` adds `(deny network*)`
 - this deny applies to local and external network access (e.g. loopback and remote endpoints).
 - `deny` paths are translated first into explicit `file-read*` and `file-write*` deny rules
-- global access is then mapped:
+- default access is then mapped:
   - `ReadWrite`: writable everywhere except explicit read-only/deny path rules
   - `ReadOnly`: optional writable carve-outs, then fallback `(deny file-write*)`
   - `NoAccess`: optional read/write carve-outs, then fallback `(deny file-read*)` + `(deny file-write*)`
