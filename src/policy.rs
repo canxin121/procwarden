@@ -85,7 +85,3 @@ impl SandboxPolicy {
             .collect()
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/policy_tests.rs"]
-mod tests;

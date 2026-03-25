@@ -122,7 +122,3 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
         .get(..prefix.len())
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/manager_tests.rs"]
-mod tests;

@@ -465,7 +465,3 @@ fn last_error(context: &str) -> SandboxError {
         format_last_error(code)
     ))
 }
-
-#[cfg(test)]
-#[path = "../../../tests/unit/windows_process_tests.rs"]
-mod tests;

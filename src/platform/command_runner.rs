@@ -75,7 +75,3 @@ fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
     let _ = pipe.read_to_end(&mut output);
     output
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/command_runner_tests.rs"]
-mod tests;

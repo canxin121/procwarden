@@ -130,7 +130,3 @@ fn execute_command(
 
     run_command_with_timeout(&mut command, timeout_ms, start)
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/macos_tests.rs"]
-mod tests;

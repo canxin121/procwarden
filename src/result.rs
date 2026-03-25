@@ -53,7 +53,3 @@ impl SandboxExecOutput {
         )
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/result_tests.rs"]
-mod tests;

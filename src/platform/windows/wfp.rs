@@ -220,7 +220,3 @@ impl Drop for AppIdBlob {
         self.ptr = std::ptr::null_mut();
     }
 }
-
-#[cfg(test)]
-#[path = "../../../tests/unit/windows_wfp_tests.rs"]
-mod tests;

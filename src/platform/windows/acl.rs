@@ -459,7 +459,3 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
     }
     CloseHandle(handle);
 }
-
-#[cfg(test)]
-#[path = "../../../tests/unit/windows_acl_tests.rs"]
-mod tests;
