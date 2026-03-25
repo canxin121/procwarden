@@ -153,16 +153,7 @@ Implementation entry: `src/platform/windows/mod.rs`
 Windows allow/deny paths are validated through `ensure_safe_allow_path`:
 
 - path must exist.
-- dangerous namespaces are rejected (`\\.\`, `\??\`, `\\?\GLOBALROOT...`).
-- final path is resolved via Win32 handle APIs.
-- reparse points are rejected.
-- symlinks are rejected.
 - path is canonicalized and de-duplicated (ASCII case-insensitive mode).
-
-Path safety defaults are fixed by implementation:
-
-- Reparse points are always rejected for allowlisted paths.
-- UNC paths are permitted as allowlisted paths.
 
 ### ACL plan implementation
 
@@ -170,13 +161,15 @@ Policy is converted to an ACL plan:
 
 - if `global_access == ReadWrite`: no explicit allow/deny ACL overlay is added by this layer.
 - otherwise:
-  - `allow_paths = readable_paths` (ReadOnly + ReadWrite entries)
+  - `allow_readonly_paths = read_only_paths`
+  - `allow_readwrite_paths = read_write_paths`
   - `deny_paths = denied_paths` (NoAccess entries)
 
 Then the backend:
 
 - adds deny-write ACEs for `deny_paths`.
-- adds allow ACEs for `allow_paths`.
+- adds allow read/execute ACEs for `allow_readonly_paths`.
+- adds allow read/write/execute ACEs for `allow_readwrite_paths`.
 - tracks changes and revokes them on drop (rollback object).
 
 ### Process creation and containment
@@ -202,35 +195,36 @@ If WFP setup fails (for example due to missing privileges), execution fails clos
 
 ---
 
-## macOS backend (external virtualization runner)
+## macOS backend (built-in Seatbelt via sandbox-exec)
 
 Implementation entry: `src/platform/macos.rs`
 
-The macOS backend delegates enforcement to an external runner binary.
+The macOS backend uses the system Seatbelt interface through `/usr/bin/sandbox-exec`.
 
-### Runner resolution
+### Runtime resolution
 
-- default runner path: `/usr/local/bin/procwarden-macos-runner`
-- override via env var: `PROCWARDEN_MACOS_RUNNER`
+- default sandbox binary: `/usr/bin/sandbox-exec`
+- override via env var: `PROCWARDEN_MACOS_SANDBOX_EXEC`
 
-If the runner binary is missing, execution fails closed with `SandboxError::Unavailable`.
+If the sandbox executable is missing, execution fails closed with `SandboxError::Unavailable`.
 
-### Policy serialization to runner args
+### Policy translation to SBPL profile
 
-The crate translates policy into command-line flags:
+The crate compiles `SandboxPolicy` into an inline SBPL profile string and invokes:
 
-- network: `--allow-network` / `--deny-network`
-- global access: `--global-rw` / `--global-ro` / `--global-none`
-- path scopes:
-  - `--ro-path <path>`
-  - `--rw-path <path>`
-  - `--deny-path <path>`
-- execution parameters:
-  - `--timeout-ms <n>` (if configured)
-  - `--cwd <path>`
-  - `--` followed by the target command
+- `sandbox-exec -p <profile> -- <command...>`
 
-The actual low-level sandboxing on macOS is therefore defined by the runner implementation.
+Current mapping strategy:
+
+- base profile starts with `(version 1)` and `(allow default)`
+- `network_access == false` adds `(deny network*)`
+- `deny` paths are translated first into explicit `file-read*` and `file-write*` deny rules
+- global access is then mapped:
+  - `ReadWrite`: writable everywhere except explicit read-only/deny path rules
+  - `ReadOnly`: optional writable carve-outs, then fallback `(deny file-write*)`
+  - `NoAccess`: optional read/write carve-outs, then fallback `(deny file-read*)` + `(deny file-write*)`
+
+Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
 
 ---
 
@@ -238,12 +232,12 @@ The actual low-level sandboxing on macOS is therefore defined by the runner impl
 
 | Dimension | Linux | Windows | macOS |
 |---|---|---|---|
-| Primary backend | Landlock + seccomp in-process setup | AppContainer + ACL overlay + WFP filters | External virtualization runner |
-| Filesystem enforcement location | Kernel (Landlock) | OS isolation + ACL adjustments | Runner-defined |
-| Network enforcement location | seccomp syscall filtering | WFP ALE-layer filter enforcement | Runner-defined |
+| Primary backend | Landlock + seccomp in-process setup | AppContainer + ACL overlay + WFP filters | Seatbelt profile via system `sandbox-exec` |
+| Filesystem enforcement location | Kernel (Landlock) | OS isolation + ACL adjustments | Seatbelt policy (`sandbox-exec`) |
+| Network enforcement location | seccomp syscall filtering | WFP ALE-layer filter enforcement | Seatbelt `network*` rule filtering |
 | Path pre-validation in this crate | Minimal path extraction; kernel decides enforcement | Strict path safety validation before ACL apply | Paths forwarded to runner arguments |
 | Process timeout handling | Process-group aware timeout kill | Explicit timeout with termination and job containment | Uses shared timeout runner wrapper |
-| Missing backend dependency behavior | N/A | N/A | Fails closed when runner missing |
+| Missing backend dependency behavior | N/A | N/A | Fails closed when `sandbox-exec` missing |
 
 ---
 
@@ -259,7 +253,7 @@ Current automated coverage emphasis:
 
 - Linux: extensive runtime integration matrix (policy permutations, parent/child/grandchild behavior, network on/off, stress, timeout, path boundaries).
 - Windows: compile + integration coverage around AppContainer policy and path safety behavior.
-- macOS: runner contract and fail-closed behavior tests in crate; real sandbox depth depends on runner implementation.
+- macOS: SBPL profile compilation and fail-closed behavior tests in crate; runtime enforcement is provided by system `sandbox-exec`.
 
 ---
 

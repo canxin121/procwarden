@@ -153,16 +153,7 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 Windows allow/deny 路径通过 `ensure_safe_allow_path` 校验：
 
 - 路径必须存在。
-- 拒绝危险命名空间（`\\.\`、`\??\`、`\\?\GLOBALROOT...`）。
-- 通过 Win32 handle API 解析最终路径。
-- 拒绝 reparse point。
-- 拒绝 symlink。
 - 进行 canonicalize 与大小写不敏感去重（ASCII case-insensitive）。
-
-路径安全默认行为（固定）：
-
-- allowlist 路径始终拒绝 reparse point。
-- allowlist 路径允许 UNC。
 
 ### ACL 计划实现
 
@@ -170,13 +161,15 @@ policy 转换为 ACL 计划：
 
 - 若 `global_access == ReadWrite`：本层不额外附加 allow/deny ACL 覆盖。
 - 其他情况：
-  - `allow_paths = readable_paths`（ReadOnly + ReadWrite）
+  - `allow_readonly_paths = read_only_paths`
+  - `allow_readwrite_paths = read_write_paths`
   - `deny_paths = denied_paths`（NoAccess）
 
 随后：
 
 - 对 `deny_paths` 增加 deny-write ACE。
-- 对 `allow_paths` 增加 allow ACE。
+- 对 `allow_readonly_paths` 增加 allow read/execute ACE。
+- 对 `allow_readwrite_paths` 增加 allow read/write/execute ACE。
 - 用 rollback 对象跟踪并在结束时撤销。
 
 ### 进程创建与约束
@@ -202,35 +195,36 @@ policy 转换为 ACL 计划：
 
 ---
 
-## macOS 后端（外部 virtualization runner）
+## macOS 后端（内置 Seatbelt：sandbox-exec）
 
 实现入口：`src/platform/macos.rs`
 
-macOS 后端将底层约束委托给外部 runner 二进制。
+macOS 后端通过系统自带的 `/usr/bin/sandbox-exec` 使用 Seatbelt 策略。
 
-### runner 解析
+### 运行时解析
 
-- 默认路径：`/usr/local/bin/procwarden-macos-runner`
-- 可通过环境变量覆盖：`PROCWARDEN_MACOS_RUNNER`
+- 默认 sandbox 可执行路径：`/usr/bin/sandbox-exec`
+- 可通过环境变量覆盖：`PROCWARDEN_MACOS_SANDBOX_EXEC`
 
-如果 runner 不存在，执行会 fail-closed，返回 `SandboxError::Unavailable`。
+如果 sandbox 可执行文件不存在，执行会 fail-closed，返回 `SandboxError::Unavailable`。
 
-### 策略序列化到 runner 参数
+### 策略映射到 SBPL profile
 
-crate 会把 policy 转为命令行参数：
+crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 
-- 网络：`--allow-network` / `--deny-network`
-- 全局权限：`--global-rw` / `--global-ro` / `--global-none`
-- 路径范围：
-  - `--ro-path <path>`
-  - `--rw-path <path>`
-  - `--deny-path <path>`
-- 执行参数：
-  - `--timeout-ms <n>`（若设置）
-  - `--cwd <path>`
-  - `--` 后接目标命令
+- `sandbox-exec -p <profile> -- <command...>`
 
-因此 macOS 上的低层沙盒强度取决于 runner 的实现细节。
+当前映射策略：
+
+- profile 以 `(version 1)` 和 `(allow default)` 开始
+- `network_access == false` 时添加 `(deny network*)`
+- `deny` 路径先生成显式的 `file-read*` 与 `file-write*` deny 规则
+- 再映射全局权限：
+  - `ReadWrite`：默认可写，但受显式 read-only/deny 路径规则约束
+  - `ReadOnly`：先加入可写 carve-out，再追加 `(deny file-write*)`
+  - `NoAccess`：先加入可读/可写 carve-out，再追加 `(deny file-read*)` 与 `(deny file-write*)`
+
+每条路径规则会同时输出 `(literal "...")` 与 `(subpath "...")` 条件。
 
 ---
 
@@ -238,12 +232,12 @@ crate 会把 policy 转为命令行参数：
 
 | 维度 | Linux | Windows | macOS |
 |---|---|---|---|
-| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + WFP 过滤 | 外部 virtualization runner |
-| 文件系统约束位置 | 内核（Landlock） | OS 隔离 + ACL 调整 | 由 runner 决定 |
-| 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | 由 runner 决定 |
+| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + WFP 过滤 | 系统 `sandbox-exec` + Seatbelt profile |
+| 文件系统约束位置 | 内核（Landlock） | OS 隔离 + ACL 调整 | Seatbelt 策略（sandbox-exec） |
+| 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | Seatbelt `network*` 规则过滤 |
 | 本 crate 的路径预校验 | 较少，更多由内核策略生效 | 先严格校验再应用 ACL | 路径作为参数传给 runner |
 | 超时处理 | 进程组感知的超时 kill | 显式超时终止 + job 约束 | 复用共享超时执行器 |
-| 后端依赖缺失行为 | N/A | N/A | runner 缺失时 fail-closed |
+| 后端依赖缺失行为 | N/A | N/A | `sandbox-exec` 缺失时 fail-closed |
 
 ---
 
@@ -259,7 +253,7 @@ crate 会把 policy 转为命令行参数：
 
 - Linux：大量真实运行集成矩阵（策略组合、父/子/孙进程链路、联网开关、压力、超时、路径边界）。
 - Windows：围绕 AppContainer 策略与路径安全行为的编译 + 集成覆盖。
-- macOS：crate 内覆盖 runner 协议与 fail-closed 行为；更深层沙盒能力取决于 runner。
+- macOS：crate 内覆盖 SBPL profile 编译与 fail-closed 行为；运行时约束由系统 `sandbox-exec` 提供。
 
 ---
 

@@ -142,7 +142,7 @@ pub(crate) fn is_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) fn is_symlink(path: &Path) -> io::Result<bool> {
     let absolute = absolute_path(path)?;
 
