@@ -72,7 +72,7 @@ impl SandboxPolicy {
         !matches!(self.default_access, SandboxAccess::NoAccess)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn default_write_access(&self) -> bool {
         matches!(self.default_access, SandboxAccess::ReadWrite)
     }
