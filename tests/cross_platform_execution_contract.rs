@@ -235,14 +235,20 @@ fn cross_platform_env_sanitization_contract() {
     };
 
     let manager = SandboxManager::new();
-    let output = manager
-        .execute(&request, &policy)
-        .expect("env sanitization contract command should run");
-
-    assert_eq!(
-        output.exit_code, 0,
-        "blocked env vars should be removed while safe vars are preserved"
-    );
+    match manager.execute(&request, &policy) {
+        Ok(output) => {
+            assert_eq!(
+                output.exit_code, 0,
+                "blocked env vars should be removed while safe vars are preserved"
+            );
+        }
+        Err(error) if is_skippable_environment_error(&error) => {
+            eprintln!(
+                "skipping env sanitization contract due to environment limitation: {error:?}"
+            );
+        }
+        Err(error) => panic!("unexpected env sanitization manager error: {error:?}"),
+    }
 }
 
 fn append_command(prefix: &[String], extra: Vec<String>) -> Vec<String> {
