@@ -45,7 +45,7 @@ let request = SandboxCommandRequest {
     timeout_ms: Some(30_000),
 };
 
-let output = manager.execute(&request, &policy, &PathBuf::from("/workspace"))?;
+let output = manager.execute(&request, &policy)?;
 println!("exit = {}", output.exit_code);
 # Ok::<(), procwarden::SandboxError>(())
 ```

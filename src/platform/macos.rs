@@ -12,7 +12,6 @@ const MACOS_RUNNER_ENV: &str = "PROCWARDEN_MACOS_RUNNER";
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    _workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let runner_path = std::env::var(MACOS_RUNNER_ENV)
         .ok()
@@ -143,7 +142,7 @@ mod tests {
             timeout_ms: Some(100),
         };
 
-        let result = execute(&request, &SandboxPolicy::default(), &cwd);
+        let result = execute(&request, &SandboxPolicy::default());
         let message = match result {
             Err(SandboxError::Unavailable(message)) => message,
             other => panic!("expected unavailable error, got {other:?}"),

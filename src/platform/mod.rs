@@ -7,8 +7,6 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::path::Path;
-
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -19,20 +17,19 @@ compile_error!(
 pub(crate) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     #[cfg(target_os = "windows")]
     {
-        windows::execute(request, policy, workspace_root)
+        windows::execute(request, policy)
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux::execute(request, policy, workspace_root)
+        linux::execute(request, policy)
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::execute(request, policy, workspace_root)
+        macos::execute(request, policy)
     }
 }

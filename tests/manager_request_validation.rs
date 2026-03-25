@@ -19,7 +19,7 @@ fn rejects_empty_command_vector() {
 
     let manager = SandboxManager::new();
     let error = manager
-        .execute(&request, &SandboxPolicy::default(), &cwd)
+        .execute(&request, &SandboxPolicy::default())
         .expect_err("empty command should be rejected");
 
     assert!(matches!(error, SandboxError::InvalidRequest(_)));
@@ -37,7 +37,7 @@ fn rejects_blank_executable_token() {
 
     let manager = SandboxManager::new();
     let error = manager
-        .execute(&request, &SandboxPolicy::default(), &cwd)
+        .execute(&request, &SandboxPolicy::default())
         .expect_err("blank executable should be rejected");
 
     assert!(matches!(error, SandboxError::InvalidRequest(_)));
@@ -54,9 +54,8 @@ fn rejects_nonexistent_cwd_before_platform_dispatch() {
     };
 
     let manager = SandboxManager::new();
-    let root = workspace();
     let error = manager
-        .execute(&request, &SandboxPolicy::default(), &root)
+        .execute(&request, &SandboxPolicy::default())
         .expect_err("missing cwd should be rejected");
 
     assert!(matches!(error, SandboxError::InvalidRequest(_)));

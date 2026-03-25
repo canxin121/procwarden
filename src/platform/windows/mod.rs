@@ -6,14 +6,11 @@ mod process;
 mod token;
 mod util;
 
-use std::path::Path;
-
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let mut env_map = request.env.clone();
     util::normalize_null_device_env(&mut env_map);
@@ -23,5 +20,5 @@ pub(super) fn execute(
         env::apply_no_network_hardening(&mut env_map, None)?;
     }
 
-    appcontainer::execute(request, policy, workspace_root, &env_map)
+    appcontainer::execute(request, policy, &env_map)
 }

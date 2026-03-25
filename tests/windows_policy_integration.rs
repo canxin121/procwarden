@@ -45,7 +45,7 @@ fn windows_executes_with_explicit_allowlists() {
         allow_unc_paths: false,
     };
 
-    let output = match manager.execute(&request, &policy, &workspace) {
+    let output = match manager.execute(&request, &policy) {
         Ok(value) => value,
         Err(procwarden::SandboxError::Windows(message))
             if message.contains("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)") =>
@@ -76,7 +76,7 @@ fn windows_dangerous_namespace_allow_path_is_blocked() {
         allow_unc_paths: false,
     };
 
-    let result = manager.execute(&request, &policy, &workspace);
+    let result = manager.execute(&request, &policy);
     assert!(
         result.is_err(),
         "dangerous namespace path should be blocked"

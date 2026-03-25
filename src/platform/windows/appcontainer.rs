@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
@@ -9,12 +9,11 @@ use super::{acl, audit, process, token, util};
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    workspace_root: &Path,
     env_map: &HashMap<String, String>,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
-    let acl_plan = collect_acl_plan(policy, workspace_root);
+    let acl_plan = collect_acl_plan(policy);
     let allow_paths = sanitize_policy_paths(policy, acl_plan.allow_paths)?;
     let deny_paths = sanitize_policy_paths(policy, acl_plan.deny_paths)?;
 
@@ -66,7 +65,7 @@ struct AclPlan {
     deny_paths: Vec<PathBuf>,
 }
 
-fn collect_acl_plan(policy: &SandboxPolicy, _workspace_root: &Path) -> AclPlan {
+fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
     if policy.full_disk_write_access() {
         return AclPlan {
             allow_paths: Vec::new(),

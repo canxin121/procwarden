@@ -331,7 +331,7 @@ fn data_driven_write_policy_matrix_executes_expected_results() {
         };
 
         let output = manager
-            .execute(&request, &case.policy, workspace.path())
+            .execute(&request, &case.policy)
             .unwrap_or_else(|error| panic!("case {} execution failed: {error:?}", case.name));
 
         assert!(!output.timed_out, "case {} should not time out", case.name);
@@ -379,11 +379,7 @@ fn timeout_matrix_case_uses_standard_timeout_semantics() {
     };
 
     let output = manager
-        .execute(
-            &request,
-            &policy(SandboxAccess::ReadWrite, true, vec![]),
-            workspace.path(),
-        )
+        .execute(&request, &policy(SandboxAccess::ReadWrite, true, vec![]))
         .expect("timeout case should return output");
 
     assert!(output.timed_out, "timeout case should be flagged");
@@ -428,11 +424,7 @@ fn data_driven_env_sanitization_applies_during_real_execution() {
         };
 
         let output = manager
-            .execute(
-                &request,
-                &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
-            )
+            .execute(&request, &policy(SandboxAccess::ReadWrite, true, vec![]))
             .unwrap_or_else(|error| panic!("blocked key {blocked} execution failed: {error:?}"));
 
         assert_eq!(
@@ -474,11 +466,7 @@ fn network_enabled_can_connect_loopback_via_bash_dev_tcp() {
     };
 
     let output = manager
-        .execute(
-            &request,
-            &policy(SandboxAccess::ReadWrite, true, vec![]),
-            workspace.path(),
-        )
+        .execute(&request, &policy(SandboxAccess::ReadWrite, true, vec![]))
         .expect("network-allow execution should return output");
 
     let accepted = accepted_rx
@@ -521,11 +509,7 @@ fn network_disabled_blocks_loopback_connect_via_bash_dev_tcp() {
     };
 
     let output = manager
-        .execute(
-            &request,
-            &policy(SandboxAccess::ReadWrite, false, vec![]),
-            workspace.path(),
-        )
+        .execute(&request, &policy(SandboxAccess::ReadWrite, false, vec![]))
         .expect("network-deny execution should return output");
 
     let accepted = accepted_rx
@@ -554,7 +538,6 @@ fn concurrent_stress_matrix_parallel_10_to_50_execs() {
             let manager = manager.clone();
             let policy = policy.clone();
             let cwd = workspace_path.clone();
-            let workspace_root = workspace_path.clone();
             let target = workspace_path.join(format!("parallel-{index}.txt"));
             let payload = format!("payload-{index}");
             let command = harness.command_for_depth(&shell, (index % 3) + 1, &target, &payload);
@@ -566,13 +549,9 @@ fn concurrent_stress_matrix_parallel_10_to_50_execs() {
                     env: HashMap::new(),
                     timeout_ms: Some(5_000),
                 };
-                let output = manager
-                    .execute(&request, &policy, &workspace_root)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "parallel case {index} should execute without manager error: {error:?}"
-                        )
-                    });
+                let output = manager.execute(&request, &policy).unwrap_or_else(|error| {
+                    panic!("parallel case {index} should execute without manager error: {error:?}")
+                });
                 (target, payload, output)
             }));
         }
@@ -715,7 +694,7 @@ fn write_permissions_hold_across_parent_child_and_grandchild_processes() {
         };
 
         let output = manager
-            .execute(&request, &case.policy, workspace.path())
+            .execute(&request, &case.policy)
             .unwrap_or_else(|error| panic!("case {} should execute: {error:?}", case.name));
 
         if case.expect_success {
@@ -775,7 +754,6 @@ fn readonly_and_readwrite_read_behavior_across_parent_child_and_grandchild() {
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadOnly, true, vec![]),
-                workspace.path(),
             )
             .expect("readonly read should execute");
         assert_eq!(
@@ -796,7 +774,6 @@ fn readonly_and_readwrite_read_behavior_across_parent_child_and_grandchild() {
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
             )
             .expect("readwrite read should execute");
         assert_eq!(
@@ -840,7 +817,6 @@ fn noaccess_unlisted_paths_are_not_readable_across_depths() {
                     timeout_ms: Some(4_000),
                 },
                 &policy,
-                workspace.path(),
             )
             .expect("noaccess allowed read should execute");
         assert_eq!(
@@ -861,7 +837,6 @@ fn noaccess_unlisted_paths_are_not_readable_across_depths() {
                     timeout_ms: Some(4_000),
                 },
                 &policy,
-                workspace.path(),
             )
             .expect("noaccess blocked read should execute");
 
@@ -901,7 +876,6 @@ fn noaccess_child_allowlist_blocks_parent_reads_across_depths() {
                     timeout_ms: Some(4_000),
                 },
                 &policy,
-                workspace.path(),
             )
             .expect("child allowlisted read should execute");
         assert_eq!(
@@ -919,7 +893,6 @@ fn noaccess_child_allowlist_blocks_parent_reads_across_depths() {
                     timeout_ms: Some(4_000),
                 },
                 &policy,
-                workspace.path(),
             )
             .expect("parent non-allowlisted read should execute");
         assert_ne!(
@@ -967,7 +940,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadOnly, true, vec![]),
-                workspace.path(),
             )
             .expect("readonly parent write should execute");
         assert_ne!(ro_parent_output.exit_code, 0);
@@ -987,7 +959,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadOnly, true, vec![]),
-                workspace.path(),
             )
             .expect("readonly child write should execute");
         assert_ne!(ro_child_output.exit_code, 0);
@@ -1007,7 +978,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
             )
             .expect("readwrite parent write should execute");
         assert_eq!(rw_parent_output.exit_code, 0);
@@ -1030,7 +1000,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     timeout_ms: Some(4_000),
                 },
                 &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
             )
             .expect("readwrite child write should execute");
         assert_eq!(rw_child_output.exit_code, 0);
@@ -1057,7 +1026,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     true,
                     vec![SandboxPathPermission::read_write(child_dir.clone())],
                 ),
-                workspace.path(),
             )
             .expect("readonly plus child-rw parent write should execute");
         assert_ne!(
@@ -1084,7 +1052,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     true,
                     vec![SandboxPathPermission::read_write(child_dir.clone())],
                 ),
-                workspace.path(),
             )
             .expect("readonly plus child-rw child write should execute");
         assert_eq!(
@@ -1114,7 +1081,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     true,
                     vec![SandboxPathPermission::read_write(parent_dir.clone())],
                 ),
-                workspace.path(),
             )
             .expect("readonly plus parent-rw parent write should execute");
         assert_eq!(ro_rw_parent_parent_output.exit_code, 0);
@@ -1141,7 +1107,6 @@ fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths()
                     true,
                     vec![SandboxPathPermission::read_write(parent_dir.clone())],
                 ),
-                workspace.path(),
             )
             .expect("readonly plus parent-rw child write should execute");
         assert_eq!(ro_rw_parent_child_output.exit_code, 0);
@@ -1180,7 +1145,6 @@ fn large_output_long_command_and_high_frequency_timeouts_are_stable() {
                 timeout_ms: Some(12_000),
             },
             &policy(SandboxAccess::ReadWrite, true, vec![]),
-            workspace.path(),
         )
         .expect("large output command should execute");
 
@@ -1221,7 +1185,6 @@ fn large_output_long_command_and_high_frequency_timeouts_are_stable() {
                     timeout_ms: Some(25),
                 },
                 &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
             )
             .unwrap_or_else(|error| panic!("timeout attempt {attempt} should execute: {error:?}"));
 
@@ -1261,7 +1224,6 @@ fn filesystem_boundaries_cover_deep_paths_readonly_permissions_and_symlink_chain
                 true,
                 vec![SandboxPathPermission::read_write(deep_dir.clone())],
             ),
-            workspace.path(),
         )
         .expect("deep allowed case should execute");
     assert_eq!(
@@ -1286,7 +1248,6 @@ fn filesystem_boundaries_cover_deep_paths_readonly_permissions_and_symlink_chain
                 true,
                 vec![SandboxPathPermission::read_only(deep_dir.clone())],
             ),
-            workspace.path(),
         )
         .expect("deep denied case should execute");
     assert_ne!(denied_output.exit_code, 0, "deep denied write should fail");
@@ -1317,7 +1278,6 @@ fn filesystem_boundaries_cover_deep_paths_readonly_permissions_and_symlink_chain
                     workspace.path().to_path_buf(),
                 )],
             ),
-            workspace.path(),
         )
         .expect("symlink escape case should execute");
     assert_ne!(
@@ -1345,7 +1305,6 @@ fn filesystem_boundaries_cover_deep_paths_readonly_permissions_and_symlink_chain
                 timeout_ms: Some(4_000),
             },
             &policy(SandboxAccess::ReadWrite, true, vec![]),
-            workspace.path(),
         )
         .expect("readonly permission case should execute");
 
@@ -1393,7 +1352,6 @@ fn network_policy_holds_across_parent_child_and_grandchild_processes() {
                     timeout_ms: Some(3_000),
                 },
                 &policy(SandboxAccess::ReadWrite, true, vec![]),
-                workspace.path(),
             )
             .expect("network-allow depth case should execute");
 
@@ -1424,7 +1382,6 @@ fn network_policy_holds_across_parent_child_and_grandchild_processes() {
                     timeout_ms: Some(3_000),
                 },
                 &policy(SandboxAccess::ReadWrite, false, vec![]),
-                workspace.path(),
             )
             .expect("network-deny depth case should execute");
 
@@ -1494,7 +1451,6 @@ fn property_style_randomized_policy_combinations_match_write_expectations() {
                     timeout_ms: Some(5_000),
                 },
                 &policy(global_access, network_access, permissions),
-                workspace.path(),
             )
             .unwrap_or_else(|error| panic!("property case {case_index} should execute: {error:?}"));
 

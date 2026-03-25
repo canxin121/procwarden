@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -30,7 +30,6 @@ use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 pub(super) fn execute(
     request: &SandboxCommandRequest,
     policy: &SandboxPolicy,
-    _workspace_root: &Path,
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 

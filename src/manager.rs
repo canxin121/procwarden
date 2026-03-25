@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::{SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs, platform};
 
@@ -60,11 +60,10 @@ impl SandboxManager {
         &self,
         request: &SandboxCommandRequest,
         policy: &SandboxPolicy,
-        workspace_root: &Path,
     ) -> Result<SandboxExecOutput, SandboxError> {
         request.validate()?;
         let sanitized = request.sanitized_for_execution();
-        platform::execute(&sanitized, policy, workspace_root)
+        platform::execute(&sanitized, policy)
     }
 }
 
