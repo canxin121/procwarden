@@ -124,6 +124,7 @@ When `network_access == false`, a seccomp filter is installed in `pre_exec`:
 - denies key network syscalls (`connect`, `accept`, `bind`, `listen`, `send*`, `recv*`, `setsockopt`, etc.).
 - denies `ptrace`.
 - restricts `socket` and `socketpair` to `AF_UNIX` only.
+- this is an all-IP-network deny mode (not internet-only): loopback (`127.0.0.1` / `::1`), local subnet, and external network traffic are blocked.
 
 ### Notes specific to Linux backend
 
@@ -190,6 +191,7 @@ When `network_access == false`, the backend installs Windows Filtering Platform 
   - AppContainer package identity (`ALE_PACKAGE_ID`, sandbox SID).
 - Block action is applied on ALE layers for connect/accept/resource-assignment in IPv4 and IPv6.
 - Filters live only for the sandbox session lifetime and are removed when the engine session closes (dynamic session semantics).
+- Effectively this is all-IP-network deny for the sandboxed process (loopback + local subnet + external network), not only public internet deny.
 
 If WFP setup fails (for example due to missing privileges), execution fails closed with an error.
 
@@ -218,6 +220,7 @@ Current mapping strategy:
 
 - base profile starts with `(version 1)` and `(allow default)`
 - `network_access == false` adds `(deny network*)`
+- this deny applies to local and external network access (e.g. loopback and remote endpoints).
 - `deny` paths are translated first into explicit `file-read*` and `file-write*` deny rules
 - global access is then mapped:
   - `ReadWrite`: writable everywhere except explicit read-only/deny path rules
@@ -251,9 +254,10 @@ Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
 
 Current automated coverage emphasis:
 
+- Cross-platform shared matrix: `tests/cross_platform_unified_matrix.rs` runs common policy checks on all OS targets (CLI + Python + Node runtime coverage, depth 1/2/3 child-chain behavior, parent/child path scope checks, and loopback allow/deny validation).
 - Linux: extensive runtime integration matrix (policy permutations, parent/child/grandchild behavior, network on/off, stress, timeout, path boundaries).
-- Windows: compile + integration coverage around AppContainer policy and path safety behavior.
-- macOS: SBPL profile compilation and fail-closed behavior tests in crate; runtime enforcement is provided by system `sandbox-exec`.
+- Windows: compile + integration coverage around AppContainer policy/path safety plus loopback deny checks when baseline loopback is reachable.
+- macOS: SBPL profile compilation/fail-closed behavior plus loopback deny integration checks when runtime prerequisites are available.
 
 ---
 

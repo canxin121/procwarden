@@ -124,6 +124,7 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 - 拒绝核心网络 syscall（`connect`、`accept`、`bind`、`listen`、`send*`、`recv*`、`setsockopt` 等）。
 - 拒绝 `ptrace`。
 - `socket` / `socketpair` 仅允许 `AF_UNIX`。
+- 该模式是“全 IP 网络阻断”（不是只禁公网）：会阻断 loopback（`127.0.0.1` / `::1`）、内网网段与外网访问。
 
 ### Linux 后端说明
 
@@ -190,6 +191,7 @@ policy 转换为 ACL 计划：
   - AppContainer 包身份（`ALE_PACKAGE_ID`，对应沙盒 SID）
 - 在 IPv4/IPv6 的 connect/accept/resource-assignment 对应 ALE 层执行 block。
 - 过滤器随动态会话生命周期存在；会话关闭后自动清理。
+- 效果上属于沙盒进程“全 IP 网络阻断”（loopback + 内网 + 外网），不是仅阻断公网。
 
 若 WFP 安装失败（例如权限不足），执行会 fail-closed 返回错误。
 
@@ -218,6 +220,7 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 
 - profile 以 `(version 1)` 和 `(allow default)` 开始
 - `network_access == false` 时添加 `(deny network*)`
+- 该 deny 覆盖本地与外部网络访问（例如 loopback 与远端地址）。
 - `deny` 路径先生成显式的 `file-read*` 与 `file-write*` deny 规则
 - 再映射全局权限：
   - `ReadWrite`：默认可写，但受显式 read-only/deny 路径规则约束
@@ -251,9 +254,10 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 
 当前覆盖重点：
 
+- 全平台共享矩阵：`tests/cross_platform_unified_matrix.rs` 在所有 OS 目标运行同一套策略校验（CLI + Python + Node，深度 1/2/3 子进程链路、父/子路径作用域、loopback 联网允许/阻断）。
 - Linux：大量真实运行集成矩阵（策略组合、父/子/孙进程链路、联网开关、压力、超时、路径边界）。
-- Windows：围绕 AppContainer 策略与路径安全行为的编译 + 集成覆盖。
-- macOS：crate 内覆盖 SBPL profile 编译与 fail-closed 行为；运行时约束由系统 `sandbox-exec` 提供。
+- Windows：围绕 AppContainer 策略/路径安全的覆盖，并在“基线可连 loopback”条件下校验禁网阻断。
+- macOS：除 SBPL profile 编译与 fail-closed 外，在运行条件满足时增加 loopback 禁网集成校验。
 
 ---
 
