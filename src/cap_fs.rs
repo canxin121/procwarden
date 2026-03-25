@@ -34,6 +34,7 @@ impl PathPolicy {
         Self::new(PathKeyMode::AsciiCaseInsensitive)
     }
 
+    #[cfg(test)]
     pub(crate) fn normalize_paths(self, paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         dedupe_canonical_paths(paths, self.key_mode)
     }
@@ -57,12 +58,12 @@ pub(crate) fn canonicalize_path(path: &Path) -> io::Result<PathBuf> {
     canonicalize_absolute(&absolute)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) fn canonicalize_or_original(path: &Path) -> PathBuf {
     canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) fn dedupe_canonical_paths(
     paths: impl IntoIterator<Item = PathBuf>,
     mode: PathKeyMode,
@@ -154,7 +155,7 @@ pub(crate) fn is_symlink(path: &Path) -> io::Result<bool> {
     Ok(metadata.file_type().is_symlink())
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 pub(crate) fn child_directories(path: &Path, limit: usize) -> io::Result<Vec<PathBuf>> {
     let absolute = absolute_path(path)?;
     let dir = Dir::open_ambient_dir(&absolute, ambient_authority())?;

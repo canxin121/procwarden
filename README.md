@@ -11,8 +11,6 @@ Policy is modeled as:
 - `global_access: SandboxAccess` (`NoAccess` / `ReadOnly` / `ReadWrite`)
 - `network_access: bool`
 
-- `enforce_world_writable_audit: bool`
-
 ## Quick example
 
 ```rust
@@ -31,7 +29,6 @@ let policy = SandboxPolicy {
     ],
     global_access: SandboxAccess::NoAccess,
     network_access: false,
-    enforce_world_writable_audit: true,
 };
 
 let request = SandboxCommandRequest {

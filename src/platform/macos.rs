@@ -111,7 +111,6 @@ mod tests {
             ],
             global_access: SandboxAccess::NoAccess,
             network_access: false,
-            enforce_world_writable_audit: false,
         };
 
         let args = build_runner_policy_args(&policy);

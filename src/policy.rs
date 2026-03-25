@@ -42,7 +42,6 @@ pub struct SandboxPolicy {
     pub path_permissions: Vec<SandboxPathPermission>,
     pub global_access: SandboxAccess,
     pub network_access: bool,
-    pub enforce_world_writable_audit: bool,
 }
 
 impl SandboxPolicy {
@@ -100,7 +99,6 @@ mod tests {
             ],
             global_access: SandboxAccess::NoAccess,
             network_access: false,
-            enforce_world_writable_audit: false,
         }
     }
 

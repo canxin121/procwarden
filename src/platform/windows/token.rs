@@ -17,23 +17,6 @@ pub(super) struct OwnedSid {
 }
 
 impl OwnedSid {
-    pub(super) fn from_string_sid(sid: &str) -> Result<Self, SandboxError> {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut PSID) -> i32;
-        }
-
-        let mut out: PSID = std::ptr::null_mut();
-        let wide = to_wide(sid);
-        let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut out as *mut PSID) };
-        if ok == 0 || out.is_null() {
-            return Err(SandboxError::Windows(
-                "ConvertStringSidToSidW failed".to_string(),
-            ));
-        }
-        Ok(Self { ptr: out })
-    }
-
     pub(super) fn raw(&self) -> PSID {
         self.ptr
     }

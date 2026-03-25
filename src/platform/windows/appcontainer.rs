@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
 
-use super::{acl, audit, process, token, util};
+use super::{acl, process, token, util};
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
@@ -16,10 +16,6 @@ pub(super) fn execute(
     let acl_plan = collect_acl_plan(policy);
     let allow_paths = sanitize_policy_paths(acl_plan.allow_paths)?;
     let deny_paths = sanitize_policy_paths(acl_plan.deny_paths)?;
-
-    if policy.enforce_world_writable_audit {
-        audit::audit_paths_for_world_writable(&allow_paths, env_map, &request.cwd)?;
-    }
 
     let executable = process::resolve_executable(&request.command[0], &request.cwd, env_map)
         .ok_or_else(|| {
@@ -84,5 +80,5 @@ fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
 
 fn sanitize_policy_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SandboxError> {
     cap_fs::PathPolicy::ascii_case_insensitive()
-        .validate_and_dedupe(paths, |path| util::ensure_safe_allow_path(path))
+        .validate_and_dedupe(paths, util::ensure_safe_allow_path)
 }

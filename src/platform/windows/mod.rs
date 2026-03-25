@@ -1,6 +1,5 @@
 mod acl;
 mod appcontainer;
-mod audit;
 mod env;
 mod process;
 mod token;

@@ -1493,7 +1493,6 @@ fn policy(
         path_permissions,
         global_access,
         network_access,
-        enforce_world_writable_audit: false,
     }
 }
 

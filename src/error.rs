@@ -6,8 +6,6 @@ pub enum SandboxError {
     InvalidRequest(String),
     #[error("sandbox denied execution: {0}")]
     Denied(String),
-    #[error("sandbox audit failed: {0}")]
-    AuditFailed(String),
     #[error("sandbox is unavailable on this platform: {0}")]
     Unavailable(String),
     #[error("windows sandbox error: {0}")]

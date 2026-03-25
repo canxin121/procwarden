@@ -14,7 +14,6 @@ use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
 use windows_sys::Win32::Security::AclSizeInformation;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
-use windows_sys::Win32::Security::Authorization::GetEffectiveRightsFromAclW;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
@@ -147,33 +146,6 @@ pub(super) unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, sid: *mut c_
     }
 
     false
-}
-
-pub(super) unsafe fn dacl_effective_allows_write(p_dacl: *mut ACL, sid: *mut c_void) -> bool {
-    if p_dacl.is_null() {
-        return false;
-    }
-
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: sid as *mut u16,
-    };
-
-    let mut rights: u32 = 0;
-    let ok = GetEffectiveRightsFromAclW(p_dacl, &trustee, &mut rights);
-    if ok != 0 {
-        let write_bits = FILE_GENERIC_WRITE
-            | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA
-            | windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA
-            | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA
-            | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
-        return (rights & write_bits) != 0;
-    }
-
-    dacl_has_write_allow_for_sid(p_dacl, sid)
 }
 
 pub(super) unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, SandboxError> {
