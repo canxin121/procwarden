@@ -36,7 +36,8 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
 Before platform dispatch, the manager:
 
 1. Validates request shape (`command` non-empty, executable token non-empty, `cwd` exists and is a directory).
-2. Sanitizes environment variables (removes dangerous loader/shell injection variables such as `LD_PRELOAD`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `BASH_FUNC_*`).
+2. Validates allow-path policy entries (`ReadOnly` / `ReadWrite`) are non-empty and currently exist, otherwise returns `SandboxError::InvalidRequest`.
+3. Sanitizes environment variables (removes dangerous loader/shell injection variables such as `LD_PRELOAD`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `BASH_FUNC_*`).
 
 ---
 

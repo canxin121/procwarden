@@ -36,7 +36,8 @@
 在进入平台后端前，manager 会先做：
 
 1. 请求校验（`command` 非空、可执行 token 非空、`cwd` 必须存在且为目录）。
-2. 环境变量净化（移除高风险加载/注入变量，如 `LD_PRELOAD`、`LD_*`、`DYLD_*`、`BASH_ENV`、`ENV`、`BASH_FUNC_*`）。
+2. 策略 allow 路径校验（`ReadOnly` / `ReadWrite` 路径必须非空且当前存在，否则返回 `SandboxError::InvalidRequest`）。
+3. 环境变量净化（移除高风险加载/注入变量，如 `LD_PRELOAD`、`LD_*`、`DYLD_*`、`BASH_ENV`、`ENV`、`BASH_FUNC_*`）。
 
 ---
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs, platform};
+use super::{SandboxAccess, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs, platform};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommandRequest {
@@ -62,9 +62,36 @@ impl SandboxManager {
         policy: &SandboxPolicy,
     ) -> Result<SandboxExecOutput, SandboxError> {
         request.validate()?;
+        validate_policy_allow_paths(policy)?;
         let sanitized = request.sanitized_for_execution();
         platform::execute(&sanitized, policy)
     }
+}
+
+fn validate_policy_allow_paths(policy: &SandboxPolicy) -> Result<(), SandboxError> {
+    for permission in &policy.path_permissions {
+        if !matches!(
+            permission.access,
+            SandboxAccess::ReadOnly | SandboxAccess::ReadWrite
+        ) {
+            continue;
+        }
+
+        if permission.path.as_os_str().is_empty() {
+            return Err(SandboxError::InvalidRequest(
+                "allow path must not be empty".to_string(),
+            ));
+        }
+
+        if !cap_fs::path_exists(&permission.path) {
+            return Err(SandboxError::InvalidRequest(format!(
+                "allow path does not exist: {}",
+                permission.path.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn sanitize_env_vars(env: &HashMap<String, String>) -> HashMap<String, String> {
