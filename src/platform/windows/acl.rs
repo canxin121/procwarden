@@ -104,11 +104,6 @@ impl AclRollback {
     pub(super) fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
     }
-
-    #[cfg(test)]
-    pub(super) fn tracked_len(&self) -> usize {
-        self.paths.len()
-    }
 }
 
 impl Drop for AclRollback {

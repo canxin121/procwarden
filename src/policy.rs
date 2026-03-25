@@ -67,12 +67,12 @@ impl SandboxPolicy {
         self.collect_paths(|access| matches!(access, SandboxAccess::NoAccess))
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn default_read_access(&self) -> bool {
         !matches!(self.default_access, SandboxAccess::NoAccess)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn default_write_access(&self) -> bool {
         matches!(self.default_access, SandboxAccess::ReadWrite)
     }
