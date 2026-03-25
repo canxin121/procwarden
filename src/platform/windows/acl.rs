@@ -434,16 +434,5 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::AclRollback;
-
-    #[test]
-    fn rollback_tracks_paths_for_future_revoke() {
-        let mut rollback = AclRollback::new(std::ptr::null_mut());
-        rollback.track(PathBuf::from(r"C:\temp\one"));
-        rollback.track(PathBuf::from(r"C:\temp\two"));
-        assert_eq!(rollback.tracked_len(), 2);
-    }
-}
+#[path = "../../../tests/unit/windows_acl_tests.rs"]
+mod tests;
