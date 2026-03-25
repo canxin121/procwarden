@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::TcpListener;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -47,6 +48,155 @@ struct WriteCase {
     target: PathBuf,
     payload: &'static str,
     expect_success: bool,
+}
+
+struct WriteScriptHarness {
+    direct: PathBuf,
+    child: PathBuf,
+    grandchild: PathBuf,
+}
+
+impl WriteScriptHarness {
+    fn new(base_dir: &Path) -> Self {
+        let direct = base_dir.join("write-direct.sh");
+        let child = base_dir.join("write-child.sh");
+        let grandchild = base_dir.join("write-grandchild.sh");
+
+        write_script(
+            &direct,
+            r#"
+printf '%s' "$2" > "$1"
+"#,
+        );
+        write_script(
+            &child,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/write-direct.sh" "$1" "$2"
+"#,
+        );
+        write_script(
+            &grandchild,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/write-child.sh" "$1" "$2"
+"#,
+        );
+
+        Self {
+            direct,
+            child,
+            grandchild,
+        }
+    }
+
+    fn command_for_depth(
+        &self,
+        shell: &str,
+        depth: usize,
+        target: &Path,
+        payload: &str,
+    ) -> Vec<String> {
+        vec![
+            shell.to_string(),
+            self.script_for_depth(depth).to_string_lossy().to_string(),
+            target.to_string_lossy().to_string(),
+            payload.to_string(),
+        ]
+    }
+
+    fn script_for_depth(&self, depth: usize) -> &Path {
+        match depth {
+            1 => &self.direct,
+            2 => &self.child,
+            3 => &self.grandchild,
+            _ => panic!("unsupported write depth: {depth}"),
+        }
+    }
+}
+
+struct NetworkScriptHarness {
+    direct: PathBuf,
+    child: PathBuf,
+    grandchild: PathBuf,
+}
+
+impl NetworkScriptHarness {
+    fn new(base_dir: &Path) -> Self {
+        let direct = base_dir.join("net-direct.sh");
+        let child = base_dir.join("net-child.sh");
+        let grandchild = base_dir.join("net-grandchild.sh");
+
+        write_script(
+            &direct,
+            r#"
+exec "$1" -lc "exec 3<>/dev/tcp/127.0.0.1/$2"
+"#,
+        );
+        write_script(
+            &child,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/net-direct.sh" "$1" "$2"
+"#,
+        );
+        write_script(
+            &grandchild,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/net-child.sh" "$1" "$2"
+"#,
+        );
+
+        Self {
+            direct,
+            child,
+            grandchild,
+        }
+    }
+
+    fn command_for_depth(&self, shell: &str, depth: usize, bash: &str, port: u16) -> Vec<String> {
+        vec![
+            shell.to_string(),
+            self.script_for_depth(depth).to_string_lossy().to_string(),
+            bash.to_string(),
+            port.to_string(),
+        ]
+    }
+
+    fn script_for_depth(&self, depth: usize) -> &Path {
+        match depth {
+            1 => &self.direct,
+            2 => &self.child,
+            3 => &self.grandchild,
+            _ => panic!("unsupported network depth: {depth}"),
+        }
+    }
+}
+
+struct DeterministicRng(u64);
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_bool(&mut self) -> bool {
+        (self.next_u64() & 1) == 1
+    }
+
+    fn choose_depth(&mut self) -> usize {
+        ((self.next_u64() % 3) as usize) + 1
+    }
 }
 
 #[test]
@@ -330,6 +480,590 @@ fn network_disabled_blocks_loopback_connect_via_bash_dev_tcp() {
     );
 }
 
+#[test]
+fn concurrent_stress_matrix_parallel_10_to_50_execs() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+
+    for concurrency in [10_usize, 25, 50] {
+        let workspace = TempDir::new(&format!("parallel-{concurrency}"));
+        let harness = WriteScriptHarness::new(workspace.path());
+        let workspace_path = workspace.path().to_path_buf();
+        let policy = policy(SandboxAccess::ReadWrite, true, vec![]);
+
+        let mut handles = Vec::new();
+        for index in 0..concurrency {
+            let manager = manager.clone();
+            let policy = policy.clone();
+            let cwd = workspace_path.clone();
+            let workspace_root = workspace_path.clone();
+            let target = workspace_path.join(format!("parallel-{index}.txt"));
+            let payload = format!("payload-{index}");
+            let command = harness.command_for_depth(&shell, (index % 3) + 1, &target, &payload);
+
+            handles.push(thread::spawn(move || {
+                let request = SandboxCommandRequest {
+                    command,
+                    cwd: cwd.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(5_000),
+                };
+                let output = manager
+                    .execute(&request, &policy, &workspace_root)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "parallel case {index} should execute without manager error: {error:?}"
+                        )
+                    });
+                (target, payload, output)
+            }));
+        }
+
+        for handle in handles {
+            let (target, payload, output) = handle
+                .join()
+                .expect("parallel execution thread should not panic");
+            assert_eq!(
+                output.exit_code, 0,
+                "parallel write should succeed, stderr: {}",
+                output.stderr
+            );
+            assert!(!output.timed_out, "parallel write should not time out");
+
+            let content = fs::read_to_string(&target).unwrap_or_else(|error| {
+                panic!("parallel target {} should exist: {error}", target.display())
+            });
+            assert_eq!(
+                content, payload,
+                "parallel target content should match payload"
+            );
+        }
+    }
+}
+
+#[test]
+fn write_permissions_hold_across_parent_child_and_grandchild_processes() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("depth-write-workspace");
+    let outside = TempDir::new("depth-write-outside");
+    let harness = WriteScriptHarness::new(workspace.path());
+
+    #[derive(Clone)]
+    struct DepthCase {
+        name: &'static str,
+        depth: usize,
+        policy: SandboxPolicy,
+        target: PathBuf,
+        payload: &'static str,
+        expect_success: bool,
+    }
+
+    let workspace_path = workspace.path().to_path_buf();
+    let outside_path = outside.path().to_path_buf();
+    let cases = vec![
+        DepthCase {
+            name: "ro_parent_write_denied",
+            depth: 1,
+            policy: policy(SandboxAccess::ReadOnly, true, vec![]),
+            target: workspace_path.join("ro-parent.txt"),
+            payload: "denied-parent",
+            expect_success: false,
+        },
+        DepthCase {
+            name: "ro_child_write_denied",
+            depth: 2,
+            policy: policy(SandboxAccess::ReadOnly, true, vec![]),
+            target: workspace_path.join("ro-child.txt"),
+            payload: "denied-child",
+            expect_success: false,
+        },
+        DepthCase {
+            name: "ro_grandchild_write_denied",
+            depth: 3,
+            policy: policy(SandboxAccess::ReadOnly, true, vec![]),
+            target: workspace_path.join("ro-grandchild.txt"),
+            payload: "denied-grandchild",
+            expect_success: false,
+        },
+        DepthCase {
+            name: "ro_plus_workspace_rw_child_write_allowed",
+            depth: 2,
+            policy: policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_write(workspace_path.clone())],
+            ),
+            target: workspace_path.join("ro-rw-child.txt"),
+            payload: "allowed-child",
+            expect_success: true,
+        },
+        DepthCase {
+            name: "ro_plus_workspace_rw_grandchild_write_allowed",
+            depth: 3,
+            policy: policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_write(workspace_path.clone())],
+            ),
+            target: workspace_path.join("ro-rw-grandchild.txt"),
+            payload: "allowed-grandchild",
+            expect_success: true,
+        },
+        DepthCase {
+            name: "rw_parent_write_allowed",
+            depth: 1,
+            policy: policy(SandboxAccess::ReadWrite, true, vec![]),
+            target: workspace_path.join("rw-parent.txt"),
+            payload: "rw-parent",
+            expect_success: true,
+        },
+        DepthCase {
+            name: "rw_child_write_allowed",
+            depth: 2,
+            policy: policy(SandboxAccess::ReadWrite, true, vec![]),
+            target: workspace_path.join("rw-child.txt"),
+            payload: "rw-child",
+            expect_success: true,
+        },
+        DepthCase {
+            name: "rw_grandchild_write_allowed",
+            depth: 3,
+            policy: policy(SandboxAccess::ReadWrite, true, vec![]),
+            target: workspace_path.join("rw-grandchild.txt"),
+            payload: "rw-grandchild",
+            expect_success: true,
+        },
+        DepthCase {
+            name: "ro_plus_outside_rw_grandchild_write_allowed",
+            depth: 3,
+            policy: policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_write(outside_path.clone())],
+            ),
+            target: outside_path.join("outside-rw-grandchild.txt"),
+            payload: "outside-allowed",
+            expect_success: true,
+        },
+    ];
+
+    for case in cases {
+        let request = SandboxCommandRequest {
+            command: harness.command_for_depth(&shell, case.depth, &case.target, case.payload),
+            cwd: workspace_path.clone(),
+            env: HashMap::new(),
+            timeout_ms: Some(4_000),
+        };
+
+        let output = manager
+            .execute(&request, &case.policy, workspace.path())
+            .unwrap_or_else(|error| panic!("case {} should execute: {error:?}", case.name));
+
+        if case.expect_success {
+            assert_eq!(
+                output.exit_code, 0,
+                "case {} should allow write, stderr: {}",
+                case.name, output.stderr
+            );
+            let content = fs::read_to_string(&case.target)
+                .unwrap_or_else(|error| panic!("case {} should create file: {error}", case.name));
+            assert_eq!(
+                content, case.payload,
+                "case {} should preserve payload",
+                case.name
+            );
+        } else {
+            assert_ne!(
+                output.exit_code, 0,
+                "case {} should deny write through process depth {}",
+                case.name, case.depth
+            );
+            assert!(
+                !case.target.exists(),
+                "case {} should not create file {}",
+                case.name,
+                case.target.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn large_output_long_command_and_high_frequency_timeouts_are_stable() {
+    let shell = linux_shell_path();
+    let sleep_bin = linux_sleep_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("large-output-timeout");
+
+    let long_argument = "x".repeat(16 * 1024);
+    let script = "printf '%s\\n' \"${#1}\"; \
+        i=0; while [ \"$i\" -lt 3000 ]; do printf 'stdout-%04d\\n' \"$i\"; i=$((i + 1)); done; \
+        i=0; while [ \"$i\" -lt 2500 ]; do printf 'stderr-%04d\\n' \"$i\" >&2; i=$((i + 1)); done";
+
+    let output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: vec![
+                    shell.clone(),
+                    "-c".to_string(),
+                    script.to_string(),
+                    "procwarden-long".to_string(),
+                    long_argument.clone(),
+                ],
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(12_000),
+            },
+            &policy(SandboxAccess::ReadWrite, true, vec![]),
+            workspace.path(),
+        )
+        .expect("large output command should execute");
+
+    assert_eq!(output.exit_code, 0, "large output command should succeed");
+    let mut stdout_lines = output.stdout.lines();
+    let observed_len = stdout_lines
+        .next()
+        .expect("length line should be present")
+        .trim()
+        .parse::<usize>()
+        .expect("length line should be numeric");
+    assert_eq!(
+        observed_len,
+        long_argument.len(),
+        "long argument length should be preserved"
+    );
+    assert!(
+        stdout_lines.count() >= 3_000,
+        "stdout should include large payload"
+    );
+    assert!(
+        output.stderr.lines().count() >= 2_500,
+        "stderr should include large payload"
+    );
+    assert!(
+        output.aggregated_output.contains("stdout-2999")
+            && output.aggregated_output.contains("stderr-2499"),
+        "aggregated output should include both streams"
+    );
+
+    for attempt in 0..30 {
+        let timeout_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: vec![sleep_bin.clone(), "1".to_string()],
+                    cwd: workspace.path().to_path_buf(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(25),
+                },
+                &policy(SandboxAccess::ReadWrite, true, vec![]),
+                workspace.path(),
+            )
+            .unwrap_or_else(|error| panic!("timeout attempt {attempt} should execute: {error:?}"));
+
+        assert!(
+            timeout_output.timed_out,
+            "attempt {attempt} should time out"
+        );
+        assert_eq!(
+            timeout_output.exit_code, 124,
+            "attempt {attempt} should use timeout exit code"
+        );
+    }
+}
+
+#[test]
+fn filesystem_boundaries_cover_deep_paths_readonly_permissions_and_symlink_chains() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("fs-boundary-workspace");
+    let outside = TempDir::new("fs-boundary-outside");
+    let harness = WriteScriptHarness::new(workspace.path());
+
+    let deep_dir = create_deep_directory(workspace.path(), 24);
+    let deep_allowed = deep_dir.join("deep-allowed.txt");
+    let deep_denied = deep_dir.join("deep-denied.txt");
+
+    let allowed_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: harness.command_for_depth(&shell, 3, &deep_allowed, "deep-ok"),
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_write(deep_dir.clone())],
+            ),
+            workspace.path(),
+        )
+        .expect("deep allowed case should execute");
+    assert_eq!(
+        allowed_output.exit_code, 0,
+        "deep allowed write should succeed"
+    );
+    assert_eq!(
+        fs::read_to_string(&deep_allowed).expect("deep allowed file should exist"),
+        "deep-ok"
+    );
+
+    let denied_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: harness.command_for_depth(&shell, 2, &deep_denied, "deep-no"),
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_only(deep_dir.clone())],
+            ),
+            workspace.path(),
+        )
+        .expect("deep denied case should execute");
+    assert_ne!(denied_output.exit_code, 0, "deep denied write should fail");
+    assert!(
+        !deep_denied.exists(),
+        "deep denied target should remain absent"
+    );
+
+    let outside_target = outside.path().join("outside-target.txt");
+    fs::write(&outside_target, "seed").expect("outside seed file should be written");
+    let link2 = workspace.path().join("link2");
+    let link1 = workspace.path().join("link1");
+    symlink(&outside_target, &link2).expect("first symlink should be created");
+    symlink(&link2, &link1).expect("second symlink should be created");
+
+    let symlink_escape_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: harness.command_for_depth(&shell, 3, &link1, "escape-attempt"),
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy(
+                SandboxAccess::ReadOnly,
+                true,
+                vec![SandboxPathPermission::read_write(
+                    workspace.path().to_path_buf(),
+                )],
+            ),
+            workspace.path(),
+        )
+        .expect("symlink escape case should execute");
+    assert_ne!(
+        symlink_escape_output.exit_code, 0,
+        "symlink chain should not bypass denied outside write"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside_target).expect("outside target should stay readable"),
+        "seed",
+        "outside file should remain unchanged after denied escape"
+    );
+
+    let readonly_dir = workspace.path().join("readonly-perm-dir");
+    fs::create_dir_all(&readonly_dir).expect("readonly permission directory should exist");
+    fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555))
+        .expect("should set readonly directory permissions");
+
+    let readonly_target = readonly_dir.join("blocked-by-fs.txt");
+    let readonly_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: harness.command_for_depth(&shell, 1, &readonly_target, "perm-blocked"),
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy(SandboxAccess::ReadWrite, true, vec![]),
+            workspace.path(),
+        )
+        .expect("readonly permission case should execute");
+
+    assert_ne!(
+        readonly_output.exit_code, 0,
+        "filesystem readonly permissions should block writes"
+    );
+    assert!(
+        !readonly_target.exists(),
+        "filesystem permission block should keep file absent"
+    );
+
+    fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755))
+        .expect("should restore directory permissions for cleanup");
+}
+
+#[test]
+fn network_policy_holds_across_parent_child_and_grandchild_processes() {
+    let Some(bash) = linux_bash_path() else {
+        return;
+    };
+    if !bash_dev_tcp_supported(&bash) {
+        return;
+    }
+
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("network-depth-matrix");
+    let harness = NetworkScriptHarness::new(workspace.path());
+
+    for depth in [1_usize, 2, 3] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("allow listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("allow listener addr should resolve")
+            .port();
+        let accepted_rx = spawn_accept_probe(listener, Duration::from_secs(2));
+
+        let output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &bash, port),
+                    cwd: workspace.path().to_path_buf(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(3_000),
+                },
+                &policy(SandboxAccess::ReadWrite, true, vec![]),
+                workspace.path(),
+            )
+            .expect("network-allow depth case should execute");
+
+        let accepted = accepted_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(false);
+        assert_eq!(
+            output.exit_code, 0,
+            "depth {depth} should allow network when enabled"
+        );
+        assert!(accepted, "depth {depth} should reach loopback listener");
+    }
+
+    for depth in [1_usize, 2, 3] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("deny listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("deny listener addr should resolve")
+            .port();
+        let accepted_rx = spawn_accept_probe(listener, Duration::from_secs(2));
+
+        let output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &bash, port),
+                    cwd: workspace.path().to_path_buf(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(3_000),
+                },
+                &policy(SandboxAccess::ReadWrite, false, vec![]),
+                workspace.path(),
+            )
+            .expect("network-deny depth case should execute");
+
+        let accepted = accepted_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(false);
+        assert_ne!(
+            output.exit_code, 0,
+            "depth {depth} should deny network when disabled"
+        );
+        assert!(
+            !accepted,
+            "depth {depth} should not reach loopback listener when denied"
+        );
+    }
+}
+
+#[test]
+fn property_style_randomized_policy_combinations_match_write_expectations() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("property-workspace");
+    let outside = TempDir::new("property-outside");
+    let harness = WriteScriptHarness::new(workspace.path());
+    let workspace_path = workspace.path().to_path_buf();
+    let outside_path = outside.path().to_path_buf();
+
+    let mut rng = DeterministicRng::new(0x5eed_5eed_1234_5678);
+
+    for case_index in 0..120_usize {
+        let global_access = if rng.next_bool() {
+            SandboxAccess::ReadWrite
+        } else {
+            SandboxAccess::ReadOnly
+        };
+        let network_access = rng.next_bool();
+        let grant_workspace_rw = rng.next_bool();
+        let grant_outside_rw = rng.next_bool();
+        let target_workspace = rng.next_bool();
+        let depth = rng.choose_depth();
+
+        let mut permissions = Vec::new();
+        if grant_workspace_rw {
+            permissions.push(SandboxPathPermission::read_write(workspace_path.clone()));
+        } else if rng.next_bool() {
+            permissions.push(SandboxPathPermission::read_only(workspace_path.clone()));
+        }
+        if grant_outside_rw {
+            permissions.push(SandboxPathPermission::read_write(outside_path.clone()));
+        } else if rng.next_bool() {
+            permissions.push(SandboxPathPermission::read_only(outside_path.clone()));
+        }
+
+        let target = if target_workspace {
+            workspace_path.join(format!("property-workspace-{case_index}.txt"))
+        } else {
+            outside_path.join(format!("property-outside-{case_index}.txt"))
+        };
+        let payload = format!("property-payload-{case_index}-{depth}");
+
+        let output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &target, &payload),
+                    cwd: workspace_path.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(5_000),
+                },
+                &policy(global_access, network_access, permissions),
+                workspace.path(),
+            )
+            .unwrap_or_else(|error| panic!("property case {case_index} should execute: {error:?}"));
+
+        let expect_success = matches!(global_access, SandboxAccess::ReadWrite)
+            || (target_workspace && grant_workspace_rw)
+            || (!target_workspace && grant_outside_rw);
+
+        if expect_success {
+            assert_eq!(
+                output.exit_code, 0,
+                "property case {case_index} should succeed, stderr: {}",
+                output.stderr
+            );
+            let content = fs::read_to_string(&target)
+                .unwrap_or_else(|error| panic!("property case {case_index} file missing: {error}"));
+            assert_eq!(
+                content, payload,
+                "property case {case_index} should persist payload"
+            );
+        } else {
+            assert_ne!(
+                output.exit_code, 0,
+                "property case {case_index} should fail for denied write"
+            );
+            assert!(
+                !target.exists(),
+                "property case {case_index} should not create denied target {}",
+                target.display()
+            );
+        }
+    }
+}
+
 fn policy(
     global_access: SandboxAccess,
     network_access: bool,
@@ -354,6 +1088,26 @@ fn write_file_command(shell: &str, target: &Path, payload: &str) -> Vec<String> 
         target.to_string_lossy().to_string(),
         payload.to_string(),
     ]
+}
+
+fn write_script(path: &Path, body: &str) {
+    let script = format!("#!/bin/sh\nset -eu\n{}\n", body.trim());
+    fs::write(path, script)
+        .unwrap_or_else(|error| panic!("failed to write script {}: {error}", path.display()));
+}
+
+fn create_deep_directory(base: &Path, depth: usize) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for segment in 0..depth {
+        path.push(format!("deep-segment-{segment:02}-abcdefghijklmnop"));
+    }
+    fs::create_dir_all(&path).unwrap_or_else(|error| {
+        panic!(
+            "failed to create deep directory {}: {error}",
+            path.display()
+        )
+    });
+    path
 }
 
 fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {
