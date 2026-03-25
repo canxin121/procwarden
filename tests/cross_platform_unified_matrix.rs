@@ -203,8 +203,11 @@ fn cross_platform_cli_tool_runs_under_restricted_policy() {
 
     let workspace = TempDir::new("cli-smoke");
     let manager = SandboxManager::new();
-    let policy =
-        policy_with_writable_scope(true, workspace.path(), workspace.path(), workspace.path());
+    let policy = SandboxPolicy {
+        path_permissions: Vec::new(),
+        global_access: SandboxAccess::ReadWrite,
+        network_access: true,
+    };
 
     let request = sandbox_request(
         append_command(&git, vec!["--version".to_string()]),
@@ -237,17 +240,24 @@ fn run_runtime_matrix(kind: RuntimeKind) {
     let outside = TempDir::new(&format!("{}-outside", kind.name()));
     let manager = SandboxManager::new();
 
-    let runtime_cwd = workspace.path().join("runtime-cwd");
-    fs::create_dir_all(&runtime_cwd).expect("runtime cwd directory should be created");
+    let runtime_cwd_raw = workspace.path().join("runtime-cwd");
+    fs::create_dir_all(&runtime_cwd_raw).expect("runtime cwd directory should be created");
+    let runtime_cwd = normalize_path(&runtime_cwd_raw);
 
     let runtime = prepare_runtime_harness(kind, &runtime_cwd);
 
-    let ro_parent = workspace.path().join("readonly-parent");
-    let ro_child = ro_parent.join("child");
-    let rw_parent = workspace.path().join("readwrite-parent");
-    let rw_child = rw_parent.join("child");
-    fs::create_dir_all(&ro_child).expect("readonly child directory should be created");
-    fs::create_dir_all(&rw_child).expect("readwrite child directory should be created");
+    let ro_parent_raw = workspace.path().join("readonly-parent");
+    let ro_child_raw = ro_parent_raw.join("child");
+    let rw_parent_raw = workspace.path().join("readwrite-parent");
+    let rw_child_raw = rw_parent_raw.join("child");
+    fs::create_dir_all(&ro_child_raw).expect("readonly child directory should be created");
+    fs::create_dir_all(&rw_child_raw).expect("readwrite child directory should be created");
+
+    let ro_parent = normalize_path(&ro_parent_raw);
+    let ro_child = normalize_path(&ro_child_raw);
+    let rw_parent = normalize_path(&rw_parent_raw);
+    let rw_child = normalize_path(&rw_child_raw);
+    let outside_root = normalize_path(outside.path());
 
     let ro_parent_seed = ro_parent.join("seed-parent.txt");
     let ro_child_seed = ro_child.join("seed-child.txt");
@@ -421,9 +431,7 @@ fn run_runtime_matrix(kind: RuntimeKind) {
             kind.name()
         );
 
-        let outside_write = outside
-            .path()
-            .join(format!("{}-depth-{depth}-outside.txt", kind.name()));
+        let outside_write = outside_root.join(format!("{}-depth-{depth}-outside.txt", kind.name()));
         assert_case(
             &manager,
             &policy_rw_parent,
@@ -644,6 +652,23 @@ fn runtime_command(
 
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        fs::canonicalize(path).unwrap_or_else(|error| {
+            panic!(
+                "path should canonicalize on macOS ({}): {error}",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_path_buf()
+    }
 }
 
 fn sandbox_request(command: Vec<String>, cwd: &Path) -> SandboxCommandRequest {
