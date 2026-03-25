@@ -56,6 +56,64 @@ struct WriteScriptHarness {
     grandchild: PathBuf,
 }
 
+struct ReadScriptHarness {
+    direct: PathBuf,
+    child: PathBuf,
+    grandchild: PathBuf,
+}
+
+impl ReadScriptHarness {
+    fn new(base_dir: &Path) -> Self {
+        let direct = base_dir.join("read-direct.sh");
+        let child = base_dir.join("read-child.sh");
+        let grandchild = base_dir.join("read-grandchild.sh");
+
+        write_script(
+            &direct,
+            r#"
+cat -- "$1"
+"#,
+        );
+        write_script(
+            &child,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/read-direct.sh" "$1"
+"#,
+        );
+        write_script(
+            &grandchild,
+            r#"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /bin/sh "$dir/read-child.sh" "$1"
+"#,
+        );
+
+        Self {
+            direct,
+            child,
+            grandchild,
+        }
+    }
+
+    fn command_for_depth(&self, shell: &str, depth: usize, target: &Path) -> Vec<String> {
+        vec![
+            shell.to_string(),
+            self.script_for_depth(depth).to_string_lossy().to_string(),
+            target.to_string_lossy().to_string(),
+        ]
+    }
+
+    fn script_for_depth(&self, depth: usize) -> &Path {
+        match depth {
+            1 => &self.direct,
+            2 => &self.child,
+            3 => &self.grandchild,
+            _ => panic!("unsupported read depth: {depth}"),
+        }
+    }
+}
+
 impl WriteScriptHarness {
     fn new(base_dir: &Path) -> Self {
         let direct = base_dir.join("write-direct.sh");
@@ -690,6 +748,412 @@ fn write_permissions_hold_across_parent_child_and_grandchild_processes() {
 }
 
 #[test]
+fn readonly_and_readwrite_read_behavior_across_parent_child_and_grandchild() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("read-depth-workspace");
+    let script_dir = workspace.path().join("scripts");
+    let data_dir = workspace.path().join("data");
+    let child_dir = data_dir.join("child");
+    fs::create_dir_all(&script_dir).expect("script directory should exist");
+    fs::create_dir_all(&child_dir).expect("child data directory should exist");
+
+    let parent_file = data_dir.join("parent-read.txt");
+    let child_file = child_dir.join("child-read.txt");
+    fs::write(&parent_file, "parent-content").expect("parent read file should be written");
+    fs::write(&child_file, "child-content").expect("child read file should be written");
+
+    let harness = ReadScriptHarness::new(&script_dir);
+
+    for depth in [1_usize, 2, 3] {
+        let ro_parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &parent_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadOnly, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readonly read should execute");
+        assert_eq!(
+            ro_parent_output.exit_code, 0,
+            "readonly read should succeed at depth {depth}"
+        );
+        assert_eq!(
+            ro_parent_output.stdout, "parent-content",
+            "readonly read should preserve parent file output"
+        );
+
+        let rw_child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &child_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadWrite, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readwrite read should execute");
+        assert_eq!(
+            rw_child_output.exit_code, 0,
+            "readwrite read should succeed at depth {depth}"
+        );
+        assert_eq!(
+            rw_child_output.stdout, "child-content",
+            "readwrite read should preserve child file output"
+        );
+    }
+}
+
+#[test]
+fn noaccess_unlisted_paths_are_not_readable_across_depths() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("noaccess-workspace");
+    let outside = TempDir::new("noaccess-outside");
+    let script_dir = workspace.path().join("scripts");
+    fs::create_dir_all(&script_dir).expect("script directory should exist");
+
+    let allowed_file = workspace.path().join("allowed.txt");
+    let blocked_file = outside.path().join("blocked.txt");
+    fs::write(&allowed_file, "allowed-data").expect("allowed file should be written");
+    fs::write(&blocked_file, "blocked-data").expect("blocked file should be written");
+
+    let harness = ReadScriptHarness::new(&script_dir);
+    let policy = noaccess_policy_with_readable_paths(vec![
+        workspace.path().to_path_buf(),
+        script_dir.clone(),
+    ]);
+
+    for depth in [1_usize, 2, 3] {
+        let allowed_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &allowed_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy,
+                workspace.path(),
+            )
+            .expect("noaccess allowed read should execute");
+        assert_eq!(
+            allowed_output.exit_code, 0,
+            "allowlisted read should succeed at depth {depth}"
+        );
+        assert_eq!(
+            allowed_output.stdout, "allowed-data",
+            "allowlisted read should preserve expected content"
+        );
+
+        let blocked_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &blocked_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy,
+                workspace.path(),
+            )
+            .expect("noaccess blocked read should execute");
+
+        assert_ne!(
+            blocked_output.exit_code, 0,
+            "non-allowlisted read should fail under noaccess at depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn noaccess_child_allowlist_blocks_parent_reads_across_depths() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("noaccess-parent-child");
+    let script_dir = workspace.path().join("scripts");
+    let parent_dir = workspace.path().join("parent");
+    let child_dir = parent_dir.join("child");
+    fs::create_dir_all(&script_dir).expect("script directory should exist");
+    fs::create_dir_all(&child_dir).expect("child directory should exist");
+
+    let parent_file = parent_dir.join("parent.txt");
+    let child_file = child_dir.join("child.txt");
+    fs::write(&parent_file, "parent-data").expect("parent file should be written");
+    fs::write(&child_file, "child-data").expect("child file should be written");
+
+    let harness = ReadScriptHarness::new(&script_dir);
+    let policy = noaccess_policy_with_readable_paths(vec![script_dir.clone(), child_dir.clone()]);
+
+    for depth in [1_usize, 2, 3] {
+        let child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &child_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy,
+                workspace.path(),
+            )
+            .expect("child allowlisted read should execute");
+        assert_eq!(
+            child_output.exit_code, 0,
+            "allowlisted child read should succeed at depth {depth}"
+        );
+        assert_eq!(child_output.stdout, "child-data");
+
+        let parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(&shell, depth, &parent_file),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy,
+                workspace.path(),
+            )
+            .expect("parent non-allowlisted read should execute");
+        assert_ne!(
+            parent_output.exit_code, 0,
+            "parent path should remain unreadable at depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("write-parent-child");
+    let script_dir = workspace.path().join("scripts");
+    let parent_dir = workspace.path().join("parent");
+    let child_dir = parent_dir.join("child");
+    fs::create_dir_all(&script_dir).expect("script directory should exist");
+    fs::create_dir_all(&child_dir).expect("child directory should exist");
+
+    let harness = WriteScriptHarness::new(&script_dir);
+
+    for depth in [1_usize, 2, 3] {
+        let ro_parent_target = parent_dir.join(format!("ro-parent-depth-{depth}.txt"));
+        let ro_child_target = child_dir.join(format!("ro-child-depth-{depth}.txt"));
+        let rw_parent_target = parent_dir.join(format!("rw-parent-depth-{depth}.txt"));
+        let rw_child_target = child_dir.join(format!("rw-child-depth-{depth}.txt"));
+        let ro_rw_child_parent_target = parent_dir.join(format!("ro-rw-child-parent-{depth}.txt"));
+        let ro_rw_child_child_target = child_dir.join(format!("ro-rw-child-child-{depth}.txt"));
+        let ro_rw_parent_parent_target =
+            parent_dir.join(format!("ro-rw-parent-parent-{depth}.txt"));
+        let ro_rw_parent_child_target = child_dir.join(format!("ro-rw-parent-child-{depth}.txt"));
+
+        let ro_parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_parent_target,
+                        "ro-parent-blocked",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadOnly, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readonly parent write should execute");
+        assert_ne!(ro_parent_output.exit_code, 0);
+        assert!(!ro_parent_target.exists());
+
+        let ro_child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_child_target,
+                        "ro-child-blocked",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadOnly, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readonly child write should execute");
+        assert_ne!(ro_child_output.exit_code, 0);
+        assert!(!ro_child_target.exists());
+
+        let rw_parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &rw_parent_target,
+                        "rw-parent-ok",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadWrite, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readwrite parent write should execute");
+        assert_eq!(rw_parent_output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(&rw_parent_target).expect("rw parent target should exist"),
+            "rw-parent-ok"
+        );
+
+        let rw_child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &rw_child_target,
+                        "rw-child-ok",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(SandboxAccess::ReadWrite, true, vec![]),
+                workspace.path(),
+            )
+            .expect("readwrite child write should execute");
+        assert_eq!(rw_child_output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(&rw_child_target).expect("rw child target should exist"),
+            "rw-child-ok"
+        );
+
+        let ro_rw_child_parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_rw_child_parent_target,
+                        "ro-rw-child-parent",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(
+                    SandboxAccess::ReadOnly,
+                    true,
+                    vec![SandboxPathPermission::read_write(child_dir.clone())],
+                ),
+                workspace.path(),
+            )
+            .expect("readonly plus child-rw parent write should execute");
+        assert_ne!(
+            ro_rw_child_parent_output.exit_code, 0,
+            "parent should stay unwritable when only child is rw"
+        );
+        assert!(!ro_rw_child_parent_target.exists());
+
+        let ro_rw_child_child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_rw_child_child_target,
+                        "ro-rw-child-child",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(
+                    SandboxAccess::ReadOnly,
+                    true,
+                    vec![SandboxPathPermission::read_write(child_dir.clone())],
+                ),
+                workspace.path(),
+            )
+            .expect("readonly plus child-rw child write should execute");
+        assert_eq!(
+            ro_rw_child_child_output.exit_code, 0,
+            "child should be writable when explicitly granted"
+        );
+        assert_eq!(
+            fs::read_to_string(&ro_rw_child_child_target).expect("child rw target should exist"),
+            "ro-rw-child-child"
+        );
+
+        let ro_rw_parent_parent_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_rw_parent_parent_target,
+                        "ro-rw-parent-parent",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(
+                    SandboxAccess::ReadOnly,
+                    true,
+                    vec![SandboxPathPermission::read_write(parent_dir.clone())],
+                ),
+                workspace.path(),
+            )
+            .expect("readonly plus parent-rw parent write should execute");
+        assert_eq!(ro_rw_parent_parent_output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(&ro_rw_parent_parent_target).expect("parent rw target should exist"),
+            "ro-rw-parent-parent"
+        );
+
+        let ro_rw_parent_child_output = manager
+            .execute(
+                &SandboxCommandRequest {
+                    command: harness.command_for_depth(
+                        &shell,
+                        depth,
+                        &ro_rw_parent_child_target,
+                        "ro-rw-parent-child",
+                    ),
+                    cwd: script_dir.clone(),
+                    env: HashMap::new(),
+                    timeout_ms: Some(4_000),
+                },
+                &policy(
+                    SandboxAccess::ReadOnly,
+                    true,
+                    vec![SandboxPathPermission::read_write(parent_dir.clone())],
+                ),
+                workspace.path(),
+            )
+            .expect("readonly plus parent-rw child write should execute");
+        assert_eq!(ro_rw_parent_child_output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(&ro_rw_parent_child_target)
+                .expect("parent-rw child target should exist"),
+            "ro-rw-parent-child"
+        );
+    }
+}
+
+#[test]
 fn large_output_long_command_and_high_frequency_timeouts_are_stable() {
     let shell = linux_shell_path();
     let sleep_bin = linux_sleep_path();
@@ -1108,6 +1572,41 @@ fn create_deep_directory(base: &Path, depth: usize) -> PathBuf {
         )
     });
     path
+}
+
+fn noaccess_policy_with_readable_paths(extra_paths: Vec<PathBuf>) -> SandboxPolicy {
+    let mut permissions = runtime_readable_roots()
+        .into_iter()
+        .map(SandboxPathPermission::read_only)
+        .collect::<Vec<_>>();
+
+    permissions.extend(
+        extra_paths
+            .into_iter()
+            .map(SandboxPathPermission::read_only),
+    );
+    policy(SandboxAccess::NoAccess, true, permissions)
+}
+
+fn runtime_readable_roots() -> Vec<PathBuf> {
+    let candidates = [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/libexec",
+    ];
+
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            roots.push(path);
+        }
+    }
+    roots
 }
 
 fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {
