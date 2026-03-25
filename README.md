@@ -132,20 +132,21 @@ When `network_access == false`, a seccomp filter is installed in `pre_exec`:
 
 ---
 
-## Windows backend (AppContainer + ACL + environment hardening)
+## Windows backend (AppContainer + ACL + WFP network filtering)
 
 Implementation entry: `src/platform/windows/mod.rs`
 
 ### High-level execution flow
 
 1. Normalize selected environment defaults (`/dev/null`-like values -> `NUL`, non-interactive pager defaults).
-2. If `network_access == false`, apply network hardening environment mutations.
-3. Build allow/deny path plan from policy.
-4. Validate and sanitize allow/deny paths.
+2. Build allow/deny path plan from policy.
+3. Validate and sanitize allow/deny paths.
+4. Resolve the executable path.
 5. Create AppContainer context (SID/profile).
-6. Apply ACL access plan for the AppContainer SID.
-7. Launch process with AppContainer security capabilities.
-8. Capture output and enforce timeout.
+6. If `network_access == false`, install temporary WFP block filters for the executable + AppContainer SID.
+7. Apply ACL access plan for the AppContainer SID.
+8. Launch process with AppContainer security capabilities.
+9. Capture output and enforce timeout.
 
 ### Path safety validation implementation
 
@@ -188,14 +189,16 @@ Process launch uses AppContainer-capable `CreateProcessW` attribute lists:
 
 ### Network behavior on Windows backend
 
-When `network_access == false`, the backend applies environment-level hardening:
+When `network_access == false`, the backend installs Windows Filtering Platform (WFP) filters in a dynamic session:
 
-- proxy variables are forced to blackhole endpoints.
-- package/tool settings are forced offline where possible (pip/npm/cargo/git-related envs).
-- a temporary deny-bin directory with failing stubs (`ssh`, `scp`, `sftp`, `ftp`, `telnet`, `nc`, `ncat`) is prepended to `PATH`.
-- `PATHEXT` ordering is adjusted so stub scripts are favored.
+- Filters are added transactionally via FWPM APIs.
+- Filters target both:
+  - application id (`ALE_APP_ID`, derived from resolved executable path), and
+  - AppContainer package identity (`ALE_PACKAGE_ID`, sandbox SID).
+- Block action is applied on ALE layers for connect/accept/resource-assignment in IPv4 and IPv6.
+- Filters live only for the sandbox session lifetime and are removed when the engine session closes (dynamic session semantics).
 
-No separate syscall-level network filter is installed in this crate on Windows.
+If WFP setup fails (for example due to missing privileges), execution fails closed with an error.
 
 ---
 
@@ -235,9 +238,9 @@ The actual low-level sandboxing on macOS is therefore defined by the runner impl
 
 | Dimension | Linux | Windows | macOS |
 |---|---|---|---|
-| Primary backend | Landlock + seccomp in-process setup | AppContainer + ACL overlay + env hardening | External virtualization runner |
+| Primary backend | Landlock + seccomp in-process setup | AppContainer + ACL overlay + WFP filters | External virtualization runner |
 | Filesystem enforcement location | Kernel (Landlock) | OS isolation + ACL adjustments | Runner-defined |
-| Network enforcement location | seccomp syscall filtering | Env hardening (and AppContainer baseline isolation) | Runner-defined |
+| Network enforcement location | seccomp syscall filtering | WFP ALE-layer filter enforcement | Runner-defined |
 | Path pre-validation in this crate | Minimal path extraction; kernel decides enforcement | Strict path safety validation before ACL apply | Paths forwarded to runner arguments |
 | Process timeout handling | Process-group aware timeout kill | Explicit timeout with termination and job containment | Uses shared timeout runner wrapper |
 | Missing backend dependency behavior | N/A | N/A | Fails closed when runner missing |

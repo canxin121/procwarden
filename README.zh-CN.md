@@ -132,20 +132,21 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 
 ---
 
-## Windows 后端（AppContainer + ACL + 环境硬化）
+## Windows 后端（AppContainer + ACL + WFP 网络过滤）
 
 实现入口：`src/platform/windows/mod.rs`
 
 ### 高层执行流程
 
 1. 规范化部分环境默认值（如 `/dev/null` 风格值映射到 `NUL`、设置非交互 pager 默认值）。
-2. 若 `network_access == false`，执行网络相关环境硬化。
-3. 从 policy 构建 allow/deny 路径计划。
-4. 对 allow/deny 路径做校验和清洗。
+2. 从 policy 构建 allow/deny 路径计划。
+3. 对 allow/deny 路径做校验和清洗。
+4. 解析可执行文件路径。
 5. 创建 AppContainer 上下文（SID/profile）。
-6. 对 AppContainer SID 应用 ACL 访问计划。
-7. 以 AppContainer 安全能力启动目标进程。
-8. 捕获输出并处理超时。
+6. 若 `network_access == false`，按可执行文件 + AppContainer SID 安装临时 WFP 阻断过滤器。
+7. 对 AppContainer SID 应用 ACL 访问计划。
+8. 以 AppContainer 安全能力启动目标进程。
+9. 捕获输出并处理超时。
 
 ### 路径安全校验实现
 
@@ -188,14 +189,16 @@ policy 转换为 ACL 计划：
 
 ### Windows 的网络行为
 
-当 `network_access == false` 时，当前 crate 在 Windows 使用环境层硬化：
+当 `network_access == false` 时，后端会通过 WFP（Windows Filtering Platform）在动态会话中安装阻断规则：
 
-- 强制代理变量指向 blackhole。
-- 强制常见工具链离线配置（pip/npm/cargo/git 相关）。
-- 在临时 deny-bin 目录生成失败 stub（`ssh`、`scp`、`sftp`、`ftp`、`telnet`、`nc`、`ncat`），并前置到 `PATH`。
-- 调整 `PATHEXT` 顺序，优先命中 stub 脚本。
+- 使用 FWPM API 事务化添加过滤器。
+- 过滤条件同时包含：
+  - 应用标识（`ALE_APP_ID`，由可执行文件路径解析得到）
+  - AppContainer 包身份（`ALE_PACKAGE_ID`，对应沙盒 SID）
+- 在 IPv4/IPv6 的 connect/accept/resource-assignment 对应 ALE 层执行 block。
+- 过滤器随动态会话生命周期存在；会话关闭后自动清理。
 
-当前 crate 在 Windows 未额外安装独立 syscall 级网络过滤器。
+若 WFP 安装失败（例如权限不足），执行会 fail-closed 返回错误。
 
 ---
 
@@ -235,9 +238,9 @@ crate 会把 policy 转为命令行参数：
 
 | 维度 | Linux | Windows | macOS |
 |---|---|---|---|
-| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + 环境硬化 | 外部 virtualization runner |
+| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + WFP 过滤 | 外部 virtualization runner |
 | 文件系统约束位置 | 内核（Landlock） | OS 隔离 + ACL 调整 | 由 runner 决定 |
-| 网络约束位置 | seccomp syscall 过滤 | 环境层硬化（以及 AppContainer 基线隔离） | 由 runner 决定 |
+| 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | 由 runner 决定 |
 | 本 crate 的路径预校验 | 较少，更多由内核策略生效 | 先严格校验再应用 ACL | 路径作为参数传给 runner |
 | 超时处理 | 进程组感知的超时 kill | 显式超时终止 + job 约束 | 复用共享超时执行器 |
 | 后端依赖缺失行为 | N/A | N/A | runner 缺失时 fail-closed |

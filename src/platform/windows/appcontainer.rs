@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
 
-use super::{acl, process, token, util};
+use super::{acl, process, token, util, wfp};
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
@@ -28,6 +28,12 @@ pub(super) fn execute(
 
     let appcontainer = token::create_appcontainer_context()?;
     let sid = appcontainer.sid();
+
+    let _network_guard = if policy.network_access {
+        None
+    } else {
+        Some(wfp::install_block_all_network_filters(&executable, sid)?)
+    };
 
     let acl_plan = acl::AclAccessPlan {
         allow_paths,
