@@ -39,7 +39,7 @@ fn windows_auto_elevation_succeeds_when_user_confirms_uac() {
             SandboxPathPermission::read_only(workspace.clone()),
             SandboxPathPermission::read_write(workspace.clone()),
         ],
-        global_access: SandboxAccess::NoAccess,
+        default_access: SandboxAccess::NoAccess,
         network_access: false,
     };
 

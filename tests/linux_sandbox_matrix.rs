@@ -1412,7 +1412,7 @@ fn property_style_randomized_policy_combinations_match_write_expectations() {
     let mut rng = DeterministicRng::new(0x5eed_5eed_1234_5678);
 
     for case_index in 0..120_usize {
-        let global_access = if rng.next_bool() {
+        let default_access = if rng.next_bool() {
             SandboxAccess::ReadWrite
         } else {
             SandboxAccess::ReadOnly
@@ -1426,12 +1426,12 @@ fn property_style_randomized_policy_combinations_match_write_expectations() {
         let mut permissions = Vec::new();
         if grant_workspace_rw {
             permissions.push(SandboxPathPermission::read_write(workspace_path.clone()));
-        } else if rng.next_bool() {
+        } else if !matches!(default_access, SandboxAccess::ReadWrite) && rng.next_bool() {
             permissions.push(SandboxPathPermission::read_only(workspace_path.clone()));
         }
         if grant_outside_rw {
             permissions.push(SandboxPathPermission::read_write(outside_path.clone()));
-        } else if rng.next_bool() {
+        } else if !matches!(default_access, SandboxAccess::ReadWrite) && rng.next_bool() {
             permissions.push(SandboxPathPermission::read_only(outside_path.clone()));
         }
 
@@ -1450,11 +1450,11 @@ fn property_style_randomized_policy_combinations_match_write_expectations() {
                     env: HashMap::new(),
                     timeout_ms: Some(5_000),
                 },
-                &policy(global_access, network_access, permissions),
+                &policy(default_access, network_access, permissions),
             )
             .unwrap_or_else(|error| panic!("property case {case_index} should execute: {error:?}"));
 
-        let expect_success = matches!(global_access, SandboxAccess::ReadWrite)
+        let expect_success = matches!(default_access, SandboxAccess::ReadWrite)
             || (target_workspace && grant_workspace_rw)
             || (!target_workspace && grant_outside_rw);
 
@@ -1485,13 +1485,13 @@ fn property_style_randomized_policy_combinations_match_write_expectations() {
 }
 
 fn policy(
-    global_access: SandboxAccess,
+    default_access: SandboxAccess,
     network_access: bool,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
     SandboxPolicy {
         path_permissions,
-        global_access,
+        default_access,
         network_access,
     }
 }

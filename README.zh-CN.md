@@ -22,8 +22,10 @@
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
     - `SandboxPathPermission::deny(path)`
-- `global_access: SandboxAccess`
+- `default_access: SandboxAccess`
   - `NoAccess | ReadOnly | ReadWrite`
+  - 表示未命中 `path_permissions` 时的默认访问策略
+  - 具体路径规则（`read_only` / `read_write` / `deny`）会叠加覆盖默认策略
 - `network_access: bool`
 
 `SandboxCommandRequest` 包含：
@@ -36,7 +38,8 @@
 在进入平台后端前，manager 会先做：
 
 1. 请求校验（`command` 非空、可执行 token 非空、`cwd` 必须存在且为目录）。
-2. 环境变量净化（移除高风险加载/注入变量，如 `LD_PRELOAD`、`LD_*`、`DYLD_*`、`BASH_ENV`、`ENV`、`BASH_FUNC_*`）。
+2. 策略 allow 路径校验（`ReadOnly` / `ReadWrite` 路径必须非空且当前存在，否则返回 `SandboxError::InvalidRequest`）。
+3. 环境变量净化（移除高风险加载/注入变量，如 `LD_PRELOAD`、`LD_*`、`DYLD_*`、`BASH_ENV`、`ENV`、`BASH_FUNC_*`）。
 
 ---
 
@@ -56,7 +59,7 @@ let policy = SandboxPolicy {
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ],
-    global_access: SandboxAccess::NoAccess,
+    default_access: SandboxAccess::NoAccess,
     network_access: false,
 };
 
@@ -97,22 +100,23 @@ println!("exit = {}", output.exit_code);
 
 Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 
-- `global_access == ReadWrite`
-  - 跳过 Landlock 文件系统限制配置。
+- `default_access == ReadWrite`
+  - 若不存在 `ReadOnly` / `NoAccess` 覆盖路径，则跳过 Landlock 文件系统限制配置。
+  - 若存在 `ReadOnly` / `NoAccess` 覆盖路径，Linux 会返回 `SandboxError::InvalidRequest`（fail-closed），因为 Landlock 无法在“默认全可写”上安全表达减法覆盖规则。
 - 其他情况：
   - 创建并安装 Landlock ruleset。
   - 按策略推导出的读/写根路径授予权限。
 
 后端内部映射关系：
 
-- `full_disk_read_access = (global_access != NoAccess)`
-- `full_disk_write_access = (global_access == ReadWrite)`
+- `default_read_access = (default_access != NoAccess)`
+- `default_write_access = (default_access == ReadWrite)`
 - `readable_roots = path_permissions 中 access ∈ {ReadOnly, ReadWrite}`
 - `writable_roots = path_permissions 中 access == ReadWrite`
 
 规则细节：
 
-- 若 `full_disk_read_access` 为 true，则对 `"/"` 授予读权限。
+- 若 `default_read_access` 为 true，则对 `"/"` 授予读权限。
 - 否则仅对 `readable_roots` 授予读权限。
 - 始终对 `/dev/null` 授予读写权限（保证常见进程 I/O 兼容）。
 - 对 `writable_roots` 授予读写权限。
@@ -124,6 +128,7 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 - 拒绝核心网络 syscall（`connect`、`accept`、`bind`、`listen`、`send*`、`recv*`、`setsockopt` 等）。
 - 拒绝 `ptrace`。
 - `socket` / `socketpair` 仅允许 `AF_UNIX`。
+- 该模式是“全 IP 网络阻断”（不是只禁公网）：会阻断 loopback（`127.0.0.1` / `::1`）、内网网段与外网访问。
 
 ### Linux 后端说明
 
@@ -153,30 +158,23 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 Windows allow/deny 路径通过 `ensure_safe_allow_path` 校验：
 
 - 路径必须存在。
-- 拒绝危险命名空间（`\\.\`、`\??\`、`\\?\GLOBALROOT...`）。
-- 通过 Win32 handle API 解析最终路径。
-- 拒绝 reparse point。
-- 拒绝 symlink。
 - 进行 canonicalize 与大小写不敏感去重（ASCII case-insensitive）。
-
-路径安全默认行为（固定）：
-
-- allowlist 路径始终拒绝 reparse point。
-- allowlist 路径允许 UNC。
 
 ### ACL 计划实现
 
-policy 转换为 ACL 计划：
+policy 按“默认 + 覆盖”转换为 ACL 计划：
 
-- 若 `global_access == ReadWrite`：本层不额外附加 allow/deny ACL 覆盖。
-- 其他情况：
-  - `allow_paths = readable_paths`（ReadOnly + ReadWrite）
-  - `deny_paths = denied_paths`（NoAccess）
+- `allow_readonly_paths = read_only_paths`
+- `allow_readwrite_paths = read_write_paths`
+- `deny_readwrite_paths = denied_paths`（NoAccess）
+- 当 `default_access == ReadWrite` 时，`read_only_paths` 还会作为 deny-write 覆盖路径生效
 
 随后：
 
-- 对 `deny_paths` 增加 deny-write ACE。
-- 对 `allow_paths` 增加 allow ACE。
+- 对 `deny_readwrite_paths` 增加 deny read/write/execute ACE。
+- 对 `default_access == ReadWrite` 下的 read-only 覆盖路径增加 deny-write ACE。
+- 对 `allow_readonly_paths` 增加 allow read/execute ACE。
+- 对 `allow_readwrite_paths` 增加 allow read/write/execute ACE。
 - 用 rollback 对象跟踪并在结束时撤销。
 
 ### 进程创建与约束
@@ -197,6 +195,7 @@ policy 转换为 ACL 计划：
   - AppContainer 包身份（`ALE_PACKAGE_ID`，对应沙盒 SID）
 - 在 IPv4/IPv6 的 connect/accept/resource-assignment 对应 ALE 层执行 block。
 - 过滤器随动态会话生命周期存在；会话关闭后自动清理。
+- 效果上属于沙盒进程“全 IP 网络阻断”（loopback + 内网 + 外网），不是仅阻断公网。
 
 若 WFP 因权限/环境限制失败（`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`），后端会默认自动发起管理员提权（UAC），并通过提权 helper 安装临时防火墙阻断规则。
 
@@ -204,35 +203,37 @@ policy 转换为 ACL 计划：
 
 ---
 
-## macOS 后端（外部 virtualization runner）
+## macOS 后端（内置 Seatbelt：sandbox-exec）
 
 实现入口：`src/platform/macos.rs`
 
-macOS 后端将底层约束委托给外部 runner 二进制。
+macOS 后端通过系统自带的 `/usr/bin/sandbox-exec` 使用 Seatbelt 策略。
 
-### runner 解析
+### 运行时解析
 
-- 默认路径：`/usr/local/bin/procwarden-macos-runner`
-- 可通过环境变量覆盖：`PROCWARDEN_MACOS_RUNNER`
+- 默认 sandbox 可执行路径：`/usr/bin/sandbox-exec`
+- 可通过环境变量覆盖：`PROCWARDEN_MACOS_SANDBOX_EXEC`
 
-如果 runner 不存在，执行会 fail-closed，返回 `SandboxError::Unavailable`。
+如果 sandbox 可执行文件不存在，执行会 fail-closed，返回 `SandboxError::Unavailable`。
 
-### 策略序列化到 runner 参数
+### 策略映射到 SBPL profile
 
-crate 会把 policy 转为命令行参数：
+crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 
-- 网络：`--allow-network` / `--deny-network`
-- 全局权限：`--global-rw` / `--global-ro` / `--global-none`
-- 路径范围：
-  - `--ro-path <path>`
-  - `--rw-path <path>`
-  - `--deny-path <path>`
-- 执行参数：
-  - `--timeout-ms <n>`（若设置）
-  - `--cwd <path>`
-  - `--` 后接目标命令
+- `sandbox-exec -p <profile> -- <command...>`
 
-因此 macOS 上的低层沙盒强度取决于 runner 的实现细节。
+当前映射策略：
+
+- profile 以 `(version 1)` 和 `(allow default)` 开始
+- `network_access == false` 时添加 `(deny network*)`
+- 该 deny 覆盖本地与外部网络访问（例如 loopback 与远端地址）。
+- `deny` 路径先生成显式的 `file-read*` 与 `file-write*` deny 规则
+- 再映射默认权限：
+  - `ReadWrite`：默认可写，但受显式 read-only/deny 路径规则约束
+  - `ReadOnly`：先加入可写 carve-out，再追加 `(deny file-write*)`
+  - `NoAccess`：先加入可读/可写 carve-out，再追加 `(deny file-read*)` 与 `(deny file-write*)`
+
+每条路径规则会同时输出 `(literal "...")` 与 `(subpath "...")` 条件。
 
 ---
 
@@ -240,12 +241,12 @@ crate 会把 policy 转为命令行参数：
 
 | 维度 | Linux | Windows | macOS |
 |---|---|---|---|
-| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + WFP 过滤 | 外部 virtualization runner |
-| 文件系统约束位置 | 内核（Landlock） | OS 隔离 + ACL 调整 | 由 runner 决定 |
-| 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | 由 runner 决定 |
+| 主后端机制 | 进程内配置 Landlock + seccomp | AppContainer + ACL 覆盖 + WFP 过滤 | 系统 `sandbox-exec` + Seatbelt profile |
+| 文件系统约束位置 | 内核（Landlock） | OS 隔离 + ACL 调整 | Seatbelt 策略（sandbox-exec） |
+| 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | Seatbelt `network*` 规则过滤 |
 | 本 crate 的路径预校验 | 较少，更多由内核策略生效 | 先严格校验再应用 ACL | 路径作为参数传给 runner |
 | 超时处理 | 进程组感知的超时 kill | 显式超时终止 + job 约束 | 复用共享超时执行器 |
-| 后端依赖缺失行为 | N/A | N/A | runner 缺失时 fail-closed |
+| 后端依赖缺失行为 | N/A | N/A | `sandbox-exec` 缺失时 fail-closed |
 
 ---
 
@@ -259,9 +260,10 @@ crate 会把 policy 转为命令行参数：
 
 当前覆盖重点：
 
+- 全平台共享矩阵：`tests/cross_platform_unified_matrix.rs` 在所有 OS 目标运行同一套策略校验（CLI + Python + Node，深度 1/2/3 子进程链路、父/子路径作用域、loopback 联网允许/阻断）。
 - Linux：大量真实运行集成矩阵（策略组合、父/子/孙进程链路、联网开关、压力、超时、路径边界）。
-- Windows：围绕 AppContainer 策略与路径安全行为的编译 + 集成覆盖。
-- macOS：crate 内覆盖 runner 协议与 fail-closed 行为；更深层沙盒能力取决于 runner。
+- Windows：围绕 AppContainer 策略/路径安全的覆盖，并在“基线可连 loopback”条件下校验禁网阻断。
+- macOS：除 SBPL profile 编译与 fail-closed 外，在运行条件满足时增加 loopback 禁网集成校验。
 
 ---
 

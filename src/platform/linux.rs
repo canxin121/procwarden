@@ -44,20 +44,29 @@ pub(super) fn execute(
         .envs(request.env.clone());
     configure_piped_stdio(&mut command);
 
-    let full_disk_read_access = policy.full_disk_read_access();
-    let full_disk_write_access = policy.full_disk_write_access();
+    let default_read_access = policy.default_read_access();
+    let default_write_access = policy.default_write_access();
+    let read_only_paths = policy.read_only_paths();
+    let denied_paths = policy.denied_paths();
     let readable_roots = policy.readable_paths();
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
+
+    if default_write_access && (!read_only_paths.is_empty() || !denied_paths.is_empty()) {
+        return Err(SandboxError::InvalidRequest(
+            "linux backend does not support default_access=ReadWrite with ReadOnly/NoAccess path overrides; use default_access=ReadOnly or NoAccess with explicit read_write carve-outs"
+                .to_string(),
+        ));
+    }
 
     unsafe {
         command.pre_exec(move || {
             if !network_access {
                 install_network_seccomp_filter_on_current_thread()?;
             }
-            if !full_disk_write_access {
+            if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(
-                    full_disk_read_access,
+                    default_read_access,
                     &readable_roots,
                     &writable_roots,
                 )?;
@@ -70,7 +79,7 @@ pub(super) fn execute(
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(
-    full_disk_read_access: bool,
+    default_read_access: bool,
     readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
 ) -> io::Result<()> {
@@ -85,7 +94,7 @@ fn install_filesystem_landlock_rules_on_current_thread(
         .create()
         .map_err(to_io_error)?;
 
-    if full_disk_read_access {
+    if default_read_access {
         ruleset = ruleset
             .add_rules(landlock::path_beneath_rules(&["/"], access_ro))
             .map_err(to_io_error)?;

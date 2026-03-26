@@ -14,8 +14,10 @@ pub(super) fn execute(
     let start = Instant::now();
 
     let acl_plan = collect_acl_plan(policy);
-    let allow_paths = sanitize_policy_paths(acl_plan.allow_paths)?;
-    let deny_paths = sanitize_policy_paths(acl_plan.deny_paths)?;
+    let allow_readonly_paths = sanitize_policy_paths(acl_plan.allow_readonly_paths)?;
+    let allow_readwrite_paths = sanitize_policy_paths(acl_plan.allow_readwrite_paths)?;
+    let deny_write_paths = sanitize_policy_paths(acl_plan.deny_write_paths)?;
+    let deny_readwrite_paths = sanitize_policy_paths(acl_plan.deny_readwrite_paths)?;
 
     let executable = process::resolve_executable(&request.command[0], &request.cwd, env_map)
         .ok_or_else(|| {
@@ -36,8 +38,10 @@ pub(super) fn execute(
     };
 
     let acl_plan = acl::AclAccessPlan {
-        allow_paths,
-        deny_paths,
+        allow_readonly_paths,
+        allow_readwrite_paths,
+        deny_write_paths,
+        deny_readwrite_paths,
     };
     let acl_rollback = unsafe { acl::apply_access_plan(&acl_plan, sid)? };
 
@@ -63,24 +67,30 @@ pub(super) fn execute(
 }
 
 struct AclPlan {
-    allow_paths: Vec<PathBuf>,
-    deny_paths: Vec<PathBuf>,
+    allow_readonly_paths: Vec<PathBuf>,
+    allow_readwrite_paths: Vec<PathBuf>,
+    deny_write_paths: Vec<PathBuf>,
+    deny_readwrite_paths: Vec<PathBuf>,
 }
 
 fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
-    if policy.full_disk_write_access() {
-        return AclPlan {
-            allow_paths: Vec::new(),
-            deny_paths: Vec::new(),
-        };
-    }
+    let allow_readonly_paths = policy.read_only_paths();
+    let allow_readwrite_paths = policy.read_write_paths();
+    let deny_readwrite_paths = policy.denied_paths();
 
-    let allow_paths = policy.readable_paths();
-    let deny_paths = policy.denied_paths();
-
-    AclPlan {
-        allow_paths,
-        deny_paths,
+    match policy.default_access {
+        crate::SandboxAccess::ReadWrite => AclPlan {
+            deny_write_paths: allow_readonly_paths.clone(),
+            allow_readonly_paths,
+            allow_readwrite_paths,
+            deny_readwrite_paths,
+        },
+        crate::SandboxAccess::ReadOnly | crate::SandboxAccess::NoAccess => AclPlan {
+            allow_readonly_paths,
+            allow_readwrite_paths,
+            deny_write_paths: Vec::new(),
+            deny_readwrite_paths,
+        },
     }
 }
 

@@ -49,8 +49,10 @@ pub(super) struct AclRollback {
 
 #[derive(Debug, Clone)]
 pub(super) struct AclAccessPlan {
-    pub(super) allow_paths: Vec<PathBuf>,
-    pub(super) deny_paths: Vec<PathBuf>,
+    pub(super) allow_readonly_paths: Vec<PathBuf>,
+    pub(super) allow_readwrite_paths: Vec<PathBuf>,
+    pub(super) deny_write_paths: Vec<PathBuf>,
+    pub(super) deny_readwrite_paths: Vec<PathBuf>,
 }
 
 pub(super) unsafe fn apply_access_plan(
@@ -59,15 +61,29 @@ pub(super) unsafe fn apply_access_plan(
 ) -> Result<AclRollback, SandboxError> {
     let mut rollback = AclRollback::new(sid);
 
-    for path in &plan.deny_paths {
+    for path in &plan.deny_readwrite_paths {
+        let added = add_deny_read_write_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
+
+    for path in &plan.deny_write_paths {
         let added = add_deny_write_ace(path, sid)?;
         if added {
             rollback.track(path.clone());
         }
     }
 
-    for path in &plan.allow_paths {
-        let added = add_allow_ace(path, sid)?;
+    for path in &plan.allow_readonly_paths {
+        let added = add_allow_read_only_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
+
+    for path in &plan.allow_readwrite_paths {
+        let added = add_allow_read_write_ace(path, sid)?;
         if added {
             rollback.track(path.clone());
         }
@@ -88,11 +104,6 @@ impl AclRollback {
     pub(super) fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
     }
-
-    #[cfg(test)]
-    pub(super) fn tracked_len(&self) -> usize {
-        self.paths.len()
-    }
 }
 
 impl Drop for AclRollback {
@@ -105,7 +116,11 @@ impl Drop for AclRollback {
     }
 }
 
-pub(super) unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, sid: *mut c_void) -> bool {
+pub(super) unsafe fn dacl_has_access_allow_for_sid(
+    p_dacl: *mut ACL,
+    sid: *mut c_void,
+    access_mask: u32,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -140,7 +155,7 @@ pub(super) unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, sid: *mut c_
         let sid_ptr =
             (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
 
-        if EqualSid(sid_ptr, sid) != 0 && (ace.Mask & FILE_GENERIC_WRITE) != 0 {
+        if EqualSid(sid_ptr, sid) != 0 && (ace.Mask & access_mask) == access_mask {
             return true;
         }
     }
@@ -148,7 +163,29 @@ pub(super) unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, sid: *mut c_
     false
 }
 
-pub(super) unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, SandboxError> {
+pub(super) unsafe fn add_allow_read_write_ace(
+    path: &Path,
+    sid: *mut c_void,
+) -> Result<bool, SandboxError> {
+    add_allow_access_ace(
+        path,
+        sid,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+    )
+}
+
+pub(super) unsafe fn add_allow_read_only_ace(
+    path: &Path,
+    sid: *mut c_void,
+) -> Result<bool, SandboxError> {
+    add_allow_access_ace(path, sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
+}
+
+unsafe fn add_allow_access_ace(
+    path: &Path,
+    sid: *mut c_void,
+    access_mask: u32,
+) -> Result<bool, SandboxError> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -169,7 +206,7 @@ pub(super) unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool
     }
 
     let mut added = false;
-    if !dacl_has_write_allow_for_sid(p_dacl, sid) {
+    if !dacl_has_access_allow_for_sid(p_dacl, sid, access_mask) {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -179,8 +216,7 @@ pub(super) unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool
         };
 
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions =
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessPermissions = access_mask;
         explicit.grfAccessMode = 2;
         explicit.grfInheritance = windows_sys::Win32::Security::CONTAINER_INHERIT_ACE
             | windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
@@ -218,6 +254,25 @@ pub(super) unsafe fn add_deny_write_ace(
     path: &Path,
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
+    add_deny_access_ace(path, sid, FILE_GENERIC_WRITE)
+}
+
+pub(super) unsafe fn add_deny_read_write_ace(
+    path: &Path,
+    sid: *mut c_void,
+) -> Result<bool, SandboxError> {
+    add_deny_access_ace(
+        path,
+        sid,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+    )
+}
+
+unsafe fn add_deny_access_ace(
+    path: &Path,
+    sid: *mut c_void,
+    access_mask: u32,
+) -> Result<bool, SandboxError> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -246,7 +301,7 @@ pub(super) unsafe fn add_deny_write_ace(
         ptstrName: sid as *mut u16,
     };
     let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = FILE_GENERIC_WRITE;
+    explicit.grfAccessPermissions = access_mask;
     explicit.grfAccessMode = 3;
     explicit.grfInheritance = windows_sys::Win32::Security::CONTAINER_INHERIT_ACE
         | windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
@@ -398,19 +453,4 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
         LocalFree(p_sd as HLOCAL);
     }
     CloseHandle(handle);
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::AclRollback;
-
-    #[test]
-    fn rollback_tracks_paths_for_future_revoke() {
-        let mut rollback = AclRollback::new(std::ptr::null_mut());
-        rollback.track(PathBuf::from(r"C:\temp\one"));
-        rollback.track(PathBuf::from(r"C:\temp\two"));
-        assert_eq!(rollback.tracked_len(), 2);
-    }
 }
