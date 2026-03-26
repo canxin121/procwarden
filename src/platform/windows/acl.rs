@@ -8,11 +8,7 @@ use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
-use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
-use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
-use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
-use windows_sys::Win32::Security::AclSizeInformation;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
@@ -23,9 +19,6 @@ use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
-use windows_sys::Win32::Security::EqualSid;
-use windows_sys::Win32::Security::GetAce;
-use windows_sys::Win32::Security::GetAclInformation;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
@@ -40,7 +33,9 @@ use crate::SandboxError;
 use super::util::to_wide;
 
 const SE_KERNEL_OBJECT: u32 = 6;
-const INHERIT_ONLY_ACE: u8 = 0x08;
+const READ_ONLY_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+const READ_WRITE_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+const NO_ACCESS_DENY_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
 
 pub(super) struct AclRollback {
     sid: *mut c_void,
@@ -62,7 +57,7 @@ pub(super) unsafe fn apply_access_plan(
     let mut rollback = AclRollback::new(sid);
 
     for path in &plan.deny_readwrite_paths {
-        let added = add_deny_read_write_ace(path, sid)?;
+        let added = add_deny_no_access_ace(path, sid)?;
         if added {
             rollback.track(path.clone());
         }
@@ -93,6 +88,21 @@ pub(super) unsafe fn apply_access_plan(
     Ok(rollback)
 }
 
+pub(super) unsafe fn apply_optional_readonly_paths(
+    paths: &[PathBuf],
+    sid: *mut c_void,
+) -> AclRollback {
+    let mut rollback = AclRollback::new(sid);
+
+    for path in paths {
+        if let Ok(true) = add_allow_read_only_ace(path, sid) {
+            rollback.track(path.clone());
+        }
+    }
+
+    rollback
+}
+
 impl AclRollback {
     pub(super) fn new(sid: *mut c_void) -> Self {
         Self {
@@ -116,69 +126,18 @@ impl Drop for AclRollback {
     }
 }
 
-pub(super) unsafe fn dacl_has_access_allow_for_sid(
-    p_dacl: *mut ACL,
-    sid: *mut c_void,
-    access_mask: u32,
-) -> bool {
-    if p_dacl.is_null() {
-        return false;
-    }
-
-    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-    let ok = GetAclInformation(
-        p_dacl as *const ACL,
-        &mut info as *mut _ as *mut c_void,
-        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-        AclSizeInformation,
-    );
-    if ok == 0 {
-        return false;
-    }
-
-    for index in 0..(info.AceCount as usize) {
-        let mut p_ace: *mut c_void = std::ptr::null_mut();
-        if GetAce(p_dacl as *const ACL, index as u32, &mut p_ace) == 0 {
-            continue;
-        }
-
-        let header = &*(p_ace as *const ACE_HEADER);
-        if header.AceType != 0 {
-            continue;
-        }
-        if (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
-            continue;
-        }
-
-        let ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
-        let base = p_ace as usize;
-        let sid_ptr =
-            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-
-        if EqualSid(sid_ptr, sid) != 0 && (ace.Mask & access_mask) == access_mask {
-            return true;
-        }
-    }
-
-    false
-}
-
 pub(super) unsafe fn add_allow_read_write_ace(
     path: &Path,
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
-    add_allow_access_ace(
-        path,
-        sid,
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-    )
+    add_allow_access_ace(path, sid, READ_WRITE_ALLOW_MASK)
 }
 
 pub(super) unsafe fn add_allow_read_only_ace(
     path: &Path,
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
-    add_allow_access_ace(path, sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
+    add_allow_access_ace(path, sid, READ_ONLY_ALLOW_MASK)
 }
 
 unsafe fn add_allow_access_ace(
@@ -205,49 +164,59 @@ unsafe fn add_allow_access_ace(
         )));
     }
 
-    let mut added = false;
-    if !dacl_has_access_allow_for_sid(p_dacl, sid, access_mask) {
-        let trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid as *mut u16,
-        };
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
 
-        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions = access_mask;
-        explicit.grfAccessMode = 2;
-        explicit.grfInheritance = windows_sys::Win32::Security::CONTAINER_INHERIT_ACE
-            | windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
-        explicit.Trustee = trustee;
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = access_mask;
+    explicit.grfAccessMode = 2;
+    explicit.grfInheritance = windows_sys::Win32::Security::CONTAINER_INHERIT_ACE
+        | windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
+    explicit.Trustee = trustee;
 
-        let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-        if code2 == ERROR_SUCCESS {
-            let code3 = SetNamedSecurityInfoW(
-                to_wide(path).as_ptr() as *mut u16,
-                1,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                p_new_dacl,
-                std::ptr::null_mut(),
-            );
-            if code3 == ERROR_SUCCESS {
-                added = true;
-            }
-
-            if !p_new_dacl.is_null() {
-                LocalFree(p_new_dacl as HLOCAL);
-            }
+    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
+    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
+    if code2 != ERROR_SUCCESS {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
         }
+        return Err(SandboxError::Windows(format!(
+            "SetEntriesInAclW failed with code {code2} for {}",
+            path.display()
+        )));
+    }
+
+    let code3 = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        p_new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
+    }
+    if code3 != ERROR_SUCCESS {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
+        }
+        return Err(SandboxError::Windows(format!(
+            "SetNamedSecurityInfoW failed with code {code3} for {}",
+            path.display()
+        )));
     }
 
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    Ok(added)
+    Ok(true)
 }
 
 pub(super) unsafe fn add_deny_write_ace(
@@ -257,15 +226,11 @@ pub(super) unsafe fn add_deny_write_ace(
     add_deny_access_ace(path, sid, FILE_GENERIC_WRITE)
 }
 
-pub(super) unsafe fn add_deny_read_write_ace(
+pub(super) unsafe fn add_deny_no_access_ace(
     path: &Path,
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
-    add_deny_access_ace(
-        path,
-        sid,
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-    )
+    add_deny_access_ace(path, sid, NO_ACCESS_DENY_MASK)
 }
 
 unsafe fn add_deny_access_ace(
@@ -292,7 +257,6 @@ unsafe fn add_deny_access_ace(
         )));
     }
 
-    let mut added = false;
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
         MultipleTrusteeOperation: 0,
@@ -309,29 +273,42 @@ unsafe fn add_deny_access_ace(
 
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-    if code2 == ERROR_SUCCESS {
-        let code3 = SetNamedSecurityInfoW(
-            to_wide(path).as_ptr() as *mut u16,
-            1,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            p_new_dacl,
-            std::ptr::null_mut(),
-        );
-        if code3 == ERROR_SUCCESS {
-            added = true;
+    if code2 != ERROR_SUCCESS {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
         }
+        return Err(SandboxError::Windows(format!(
+            "SetEntriesInAclW failed with code {code2} for {}",
+            path.display()
+        )));
+    }
 
-        if !p_new_dacl.is_null() {
-            LocalFree(p_new_dacl as HLOCAL);
+    let code3 = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        p_new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
+    }
+    if code3 != ERROR_SUCCESS {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
         }
+        return Err(SandboxError::Windows(format!(
+            "SetNamedSecurityInfoW failed with code {code3} for {}",
+            path.display()
+        )));
     }
 
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    Ok(added)
+    Ok(true)
 }
 
 pub(super) unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
@@ -453,4 +430,36 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
         LocalFree(p_sd as HLOCAL);
     }
     CloseHandle(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+
+    use super::{NO_ACCESS_DENY_MASK, READ_ONLY_ALLOW_MASK, READ_WRITE_ALLOW_MASK};
+
+    #[test]
+    fn read_only_allow_mask_does_not_include_write() {
+        assert_eq!(
+            READ_ONLY_ALLOW_MASK,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+        );
+        assert_ne!(READ_ONLY_ALLOW_MASK, READ_WRITE_ALLOW_MASK);
+    }
+
+    #[test]
+    fn no_access_deny_mask_blocks_read_write_and_execute() {
+        assert_eq!(NO_ACCESS_DENY_MASK & FILE_GENERIC_READ, FILE_GENERIC_READ);
+        assert_eq!(NO_ACCESS_DENY_MASK & FILE_GENERIC_WRITE, FILE_GENERIC_WRITE);
+        assert_eq!(
+            NO_ACCESS_DENY_MASK & FILE_GENERIC_EXECUTE,
+            FILE_GENERIC_EXECUTE
+        );
+        assert_eq!(
+            READ_WRITE_ALLOW_MASK,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE
+        );
+    }
 }

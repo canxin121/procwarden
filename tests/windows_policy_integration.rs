@@ -32,9 +32,19 @@ fn base_request(cwd: &Path) -> SandboxCommandRequest {
     }
 }
 
-fn command_request(cwd: &Path, script: String) -> SandboxCommandRequest {
+fn powershell_set_content_request(cwd: &Path, target: &Path, value: &str) -> SandboxCommandRequest {
+    let escaped_target = target.to_string_lossy().replace('\'', "''");
+    let escaped_value = value.replace('\'', "''");
     SandboxCommandRequest {
-        command: vec!["cmd".to_string(), "/C".to_string(), script],
+        command: vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ [System.IO.File]::WriteAllText('{escaped_target}', '{escaped_value}'); exit 0 }} catch {{ exit 1 }}"
+            ),
+        ],
         cwd: cwd.to_path_buf(),
         env: HashMap::new(),
         timeout_ms: Some(10_000),
@@ -112,12 +122,6 @@ fn windows_executes_with_explicit_allowlists() {
             let _ = std::fs::remove_dir_all(&workspace);
             return;
         }
-        Err(procwarden::SandboxError::Windows(message))
-            if message.contains("CreateProcessW(AppContainer) failed: 87") =>
-        {
-            let _ = std::fs::remove_dir_all(&workspace);
-            return;
-        }
         Err(other) => panic!("unexpected execution error: {other:?}"),
     };
 
@@ -146,10 +150,7 @@ fn windows_read_only_paths_reject_writes_while_read_write_paths_allow_them() {
     };
 
     let readonly_target = readonly_dir.join("blocked.txt");
-    let readonly_request = command_request(
-        &workspace,
-        format!("echo blocked>\"{}\"", readonly_target.to_string_lossy()),
-    );
+    let readonly_request = powershell_set_content_request(&workspace, &readonly_target, "blocked");
 
     let readonly_output = match manager.execute(&readonly_request, &policy) {
         Ok(value) => value,
@@ -172,17 +173,17 @@ fn windows_read_only_paths_reject_writes_while_read_write_paths_allow_them() {
     );
 
     let readwrite_target = readwrite_dir.join("allowed.txt");
-    let readwrite_request = command_request(
-        &workspace,
-        format!("echo allowed>\"{}\"", readwrite_target.to_string_lossy()),
-    );
-    let readwrite_output = manager
-        .execute(&readwrite_request, &policy)
-        .expect("read-write path write should execute");
+    let readwrite_request =
+        powershell_set_content_request(&workspace, &readwrite_target, "allowed");
+    let readwrite_output = match manager.execute(&readwrite_request, &policy) {
+        Ok(value) => value,
+        Err(other) => panic!("unexpected readwrite execution error: {other:?}"),
+    };
 
     assert_eq!(
         readwrite_output.exit_code, 0,
-        "read-write path should allow write"
+        "read-write path should allow write; stdout: {}; stderr: {}",
+        readwrite_output.stdout, readwrite_output.stderr
     );
     assert!(
         readwrite_target.exists(),
@@ -208,6 +209,69 @@ fn windows_nonexistent_allow_path_is_blocked() {
 
     let result = manager.execute(&request, &policy);
     assert!(result.is_err(), "nonexistent allow path should be blocked");
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn windows_readwrite_default_respects_readonly_overlay_for_writes() {
+    let workspace = temp_workspace("rw-default-readonly-overlay");
+    let readonly_dir = workspace.join("readonly-overlay");
+    let readwrite_dir = workspace.join("readwrite-overlay");
+    std::fs::create_dir_all(&readonly_dir).expect("readonly overlay directory should be created");
+    std::fs::create_dir_all(&readwrite_dir).expect("readwrite overlay directory should be created");
+
+    let manager = SandboxManager::new();
+    let policy = SandboxPolicy {
+        path_permissions: vec![
+            SandboxPathPermission::read_only(readonly_dir.clone()),
+            SandboxPathPermission::read_write(readwrite_dir.clone()),
+        ],
+        default_access: SandboxAccess::ReadWrite,
+        network_access: true,
+    };
+
+    let readonly_target = readonly_dir.join("blocked-rw-default.txt");
+    let readonly_output = match manager.execute(
+        &powershell_set_content_request(&workspace, &readonly_target, "blocked"),
+        &policy,
+    ) {
+        Ok(value) => value,
+        Err(procwarden::SandboxError::Windows(message))
+            if message.contains("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)") =>
+        {
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+        Err(other) => panic!("unexpected readonly-overlay execution error: {other:?}"),
+    };
+
+    assert_ne!(
+        readonly_output.exit_code, 0,
+        "read-only overlay must deny writes under default_access=ReadWrite"
+    );
+    assert!(
+        !readonly_target.exists(),
+        "readonly overlay target should not be created"
+    );
+
+    let readwrite_target = readwrite_dir.join("allowed-rw-default.txt");
+    let readwrite_output = manager
+        .execute(
+            &powershell_set_content_request(&workspace, &readwrite_target, "allowed"),
+            &policy,
+        )
+        .expect("readwrite overlay should allow write under default_access=ReadWrite");
+
+    assert_eq!(
+        readwrite_output.exit_code, 0,
+        "readwrite overlay write should succeed; stdout: {}; stderr: {}",
+        readwrite_output.stdout, readwrite_output.stderr
+    );
+    assert!(
+        readwrite_target.exists(),
+        "readwrite overlay target should be created"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }

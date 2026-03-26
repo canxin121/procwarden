@@ -89,6 +89,7 @@ println!("exit = {}", output.exit_code);
   - `aggregated_output`
   - `duration`
   - `timed_out`
+  - `degraded_mode_reason`（`Option<String>`，当后端以显式降级约束模式运行时返回原因）
 
 ---
 
@@ -148,10 +149,11 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 3. 对 allow/deny 路径做校验和清洗。
 4. 解析可执行文件路径。
 5. 创建 AppContainer 上下文（SID/profile）。
-6. 若 `network_access == false`，按可执行文件 + AppContainer SID 安装临时 WFP 阻断过滤器；遇到权限限制时自动发起管理员提权。
-7. 对 AppContainer SID 应用 ACL 访问计划。
-8. 以 AppContainer 安全能力启动目标进程。
-9. 捕获输出并处理超时。
+6. 当当前进程非管理员时，请求一次 UAC 提权，并启动一个统一提权 helper 管理 ACL + 可选网络阻断生命周期。
+7. 若当前已是管理员，则在当前进程内走原生 ACL/WFP 设置路径。
+8. 对 AppContainer SID 应用 ACL 访问计划（原生路径或统一提权 helper 路径）。
+9. 以 AppContainer 安全能力启动目标进程。
+10. 捕获输出并处理超时。
 
 ### 路径安全校验实现
 
@@ -176,6 +178,8 @@ policy 按“默认 + 覆盖”转换为 ACL 计划：
 - 对 `allow_readonly_paths` 增加 allow read/execute ACE。
 - 对 `allow_readwrite_paths` 增加 allow read/write/execute ACE。
 - 用 rollback 对象跟踪并在结束时撤销。
+
+当调用方非管理员时，ACL 与可选网络阻断的设置/清理会委托给单个提权 helper 进程（每次 sandbox 执行仅一次 UAC）。
 
 ### 进程创建与约束
 

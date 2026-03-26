@@ -1,5 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+
+use windows_sys::Win32::Foundation::{GetLastError, HLOCAL, LocalFree};
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 
 use crate::{SandboxError, cap_fs};
 
@@ -44,4 +48,31 @@ pub(super) fn ensure_safe_allow_path(path: &Path) -> Result<PathBuf, SandboxErro
     }
 
     cap_fs::canonicalize_path(path).map_err(SandboxError::Io)
+}
+
+pub(super) fn sid_to_string(sid: *mut c_void) -> Result<String, SandboxError> {
+    if sid.is_null() {
+        return Err(SandboxError::Windows(
+            "unable to convert null sid to string".to_string(),
+        ));
+    }
+
+    unsafe {
+        let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut sid_string_ptr) == 0 {
+            let code = GetLastError() as i32;
+            return Err(SandboxError::Windows(format!(
+                "ConvertSidToStringSidW failed: {code} ({})",
+                format_last_error(code)
+            )));
+        }
+
+        let mut len = 0;
+        while *sid_string_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let sid_string = String::from_utf16_lossy(std::slice::from_raw_parts(sid_string_ptr, len));
+        LocalFree(sid_string_ptr as HLOCAL);
+        Ok(sid_string)
+    }
 }

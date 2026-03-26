@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 use rand::random;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_SUPPORTED, HANDLE};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
-    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
-    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
+    FWP_ACTION_BLOCK, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
+    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SID, FWP_VALUE0, FWPM_ACTION0,
+    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_FILTER_CONDITION0, FWPM_FILTER0,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
     FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
-    FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4, FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6, FWPM_SESSION0,
-    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER_UNIVERSAL, FWP_ACTION_BLOCK, FWP_BYTE_BLOB,
-    FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL,
-    FWP_SID, FWP_VALUE0,
+    FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4, FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6,
+    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER_UNIVERSAL, FwpmEngineClose0,
+    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::SID;
 
@@ -541,7 +541,7 @@ mod tests {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_SUPPORTED};
 
     use super::{
-        elevated_powershell_parameters, ElevatedFirewallGuard, WfpStatusError, BLOCK_LAYERS,
+        BLOCK_LAYERS, ElevatedFirewallGuard, WfpStatusError, elevated_powershell_parameters,
     };
 
     #[test]

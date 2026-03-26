@@ -8,6 +8,7 @@ pub struct SandboxExecOutput {
     pub aggregated_output: String,
     pub duration: Duration,
     pub timed_out: bool,
+    pub degraded_mode_reason: Option<String>,
 }
 
 impl SandboxExecOutput {
@@ -34,6 +35,7 @@ impl SandboxExecOutput {
             aggregated_output,
             duration,
             timed_out,
+            degraded_mode_reason: None,
         }
     }
 
@@ -51,5 +53,48 @@ impl SandboxExecOutput {
             duration,
             timed_out,
         )
+    }
+
+    pub(crate) fn with_degraded_mode_reason(mut self, reason: Option<String>) -> Self {
+        self.degraded_mode_reason = reason;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::SandboxExecOutput;
+
+    #[test]
+    fn output_defaults_to_non_degraded_mode() {
+        let output = SandboxExecOutput::from_text_output(
+            0,
+            "stdout".to_string(),
+            "stderr".to_string(),
+            Duration::from_millis(5),
+            false,
+        );
+
+        assert!(output.degraded_mode_reason.is_none());
+    }
+
+    #[test]
+    fn output_can_carry_degraded_mode_reason() {
+        let reason = "child policy unavailable".to_string();
+        let output = SandboxExecOutput::from_text_output(
+            0,
+            String::new(),
+            String::new(),
+            Duration::from_millis(1),
+            false,
+        )
+        .with_degraded_mode_reason(Some(reason.clone()));
+
+        assert_eq!(
+            output.degraded_mode_reason.as_deref(),
+            Some(reason.as_str())
+        );
     }
 }

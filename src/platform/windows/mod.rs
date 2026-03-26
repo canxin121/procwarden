@@ -1,5 +1,6 @@
 mod acl;
 mod appcontainer;
+mod elevated_ops;
 mod elevation;
 mod process;
 mod token;

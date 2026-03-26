@@ -6,42 +6,41 @@ use std::path::{Path, PathBuf};
 
 use which::which_in;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::GetLastError;
-use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Foundation::ERROR_BAD_LENGTH;
 use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
 use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
-use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessW;
 use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
-use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-use windows_sys::Win32::System::Threading::InitializeProcThreadAttributeList;
-use windows_sys::Win32::System::Threading::TerminateProcess;
-use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
-use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
+use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::System::Threading::InitializeProcThreadAttributeList;
 use windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST;
-use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY;
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST;
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES;
+use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
-use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+use windows_sys::Win32::System::Threading::TerminateProcess;
+use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-use crate::{cap_fs, SandboxError};
+use crate::{SandboxError, cap_fs};
 
 use super::util::{format_last_error, to_wide};
 
@@ -50,6 +49,7 @@ pub(super) struct CaptureResult {
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
     pub(super) timed_out: bool,
+    pub(super) degraded_mode_reason: Option<String>,
 }
 
 type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
@@ -57,6 +57,14 @@ type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
 struct ProcThreadAttributes {
     _buffer: Vec<u8>,
     list: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+struct PreparedAttributes {
+    attrs: ProcThreadAttributes,
+    security_capabilities: Box<SECURITY_CAPABILITIES>,
+    child_policy: Option<Box<u32>>,
+    job_list: Box<[HANDLE; 1]>,
+    degraded_mode_reason: Option<String>,
 }
 
 impl ProcThreadAttributes {
@@ -163,7 +171,7 @@ pub(super) fn run_process_in_appcontainer(
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
 
         let job_handle = create_job_kill_on_close()?;
-        let mut attrs =
+        let mut prepared =
             match prepare_appcontainer_child_job_attributes(appcontainer_sid, job_handle) {
                 Ok(value) => value,
                 Err(error) => {
@@ -178,9 +186,7 @@ pub(super) fn run_process_in_appcontainer(
         startup_info_ex.StartupInfo.hStdInput = in_r;
         startup_info_ex.StartupInfo.hStdOutput = out_w;
         startup_info_ex.StartupInfo.hStdError = err_w;
-        let desktop = to_wide("Winsta0\\Default");
-        startup_info_ex.StartupInfo.lpDesktop = desktop.as_ptr() as *mut u16;
-        startup_info_ex.lpAttributeList = attrs.as_mut_ptr();
+        startup_info_ex.lpAttributeList = prepared.attrs.as_mut_ptr();
 
         let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
         let command_line_string = command
@@ -189,7 +195,7 @@ pub(super) fn run_process_in_appcontainer(
             .collect::<Vec<_>>()
             .join(" ");
         let mut command_line = to_wide(&command_line_string);
-        let env_block = make_env_block(env_map);
+        let env_block = environment_block_for_create_process(env_map);
         let app_name = to_wide(application_name.as_os_str());
         let cwd_wide = to_wide(cwd);
 
@@ -201,7 +207,9 @@ pub(super) fn run_process_in_appcontainer(
             std::ptr::null_mut(),
             1,
             flags,
-            env_block.as_ptr() as *mut c_void,
+            env_block
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |block| block.as_ptr() as *mut c_void),
             cwd_wide.as_ptr(),
             &startup_info_ex.StartupInfo,
             &mut process_info,
@@ -243,6 +251,7 @@ pub(super) fn run_process_in_appcontainer(
             stdout,
             stderr,
             timed_out,
+            degraded_mode_reason: prepared.degraded_mode_reason.take(),
         })
     }
 }
@@ -276,19 +285,32 @@ unsafe fn read_pipe_to_end(handle: HANDLE) -> Vec<u8> {
 unsafe fn prepare_appcontainer_child_job_attributes(
     appcontainer_sid: *mut c_void,
     job_handle: HANDLE,
-) -> Result<ProcThreadAttributes, SandboxError> {
-    let mut attrs = ProcThreadAttributes::new(3)?;
-    set_security_capabilities_attr(&mut attrs, appcontainer_sid)?;
+) -> Result<PreparedAttributes, SandboxError> {
+    let mut prepared = PreparedAttributes {
+        attrs: ProcThreadAttributes::new(3)?,
+        security_capabilities: security_capabilities_for_sid(appcontainer_sid),
+        child_policy: Some(Box::new(0x0000_0001_u32)),
+        job_list: Box::new([job_handle]),
+        degraded_mode_reason: None,
+    };
+    set_security_capabilities_attr(&mut prepared)?;
 
-    match set_child_process_policy_attr(&mut attrs) {
+    match set_child_process_policy_attr(&mut prepared) {
         Ok(()) => {
-            set_job_list_attr(&mut attrs, job_handle)?;
-            Ok(attrs)
+            set_job_list_attr(&mut prepared)?;
+            Ok(prepared)
         }
         Err(code) if child_policy_degrade_allowed(code) => {
-            let mut fallback_attrs = ProcThreadAttributes::new(1)?;
-            set_security_capabilities_attr(&mut fallback_attrs, appcontainer_sid)?;
-            Ok(fallback_attrs)
+            let mut fallback = PreparedAttributes {
+                attrs: ProcThreadAttributes::new(2)?,
+                security_capabilities: security_capabilities_for_sid(appcontainer_sid),
+                child_policy: None,
+                job_list: Box::new([job_handle]),
+                degraded_mode_reason: Some(child_policy_degraded_reason(code)),
+            };
+            set_security_capabilities_attr(&mut fallback)?;
+            set_job_list_attr(&mut fallback)?;
+            Ok(fallback)
         }
         Err(code) => Err(windows_error(
             "UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)",
@@ -297,21 +319,23 @@ unsafe fn prepare_appcontainer_child_job_attributes(
     }
 }
 
-unsafe fn set_security_capabilities_attr(
-    attrs: &mut ProcThreadAttributes,
-    appcontainer_sid: *mut c_void,
-) -> Result<(), SandboxError> {
-    let mut security_capabilities = SECURITY_CAPABILITIES {
+fn security_capabilities_for_sid(appcontainer_sid: *mut c_void) -> Box<SECURITY_CAPABILITIES> {
+    Box::new(SECURITY_CAPABILITIES {
         AppContainerSid: appcontainer_sid,
         Capabilities: std::ptr::null_mut(),
         CapabilityCount: 0,
         Reserved: 0,
-    };
+    })
+}
+
+unsafe fn set_security_capabilities_attr(
+    prepared: &mut PreparedAttributes,
+) -> Result<(), SandboxError> {
     if UpdateProcThreadAttribute(
-        attrs.as_mut_ptr(),
+        prepared.attrs.as_mut_ptr(),
         0,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-        &mut security_capabilities as *mut _ as *mut c_void,
+        prepared.security_capabilities.as_mut() as *mut _ as *mut c_void,
         std::mem::size_of::<SECURITY_CAPABILITIES>(),
         std::ptr::null_mut(),
         std::ptr::null(),
@@ -324,14 +348,17 @@ unsafe fn set_security_capabilities_attr(
     Ok(())
 }
 
-unsafe fn set_child_process_policy_attr(attrs: &mut ProcThreadAttributes) -> Result<(), i32> {
-    let mut child_policy: u64 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED as u64;
+unsafe fn set_child_process_policy_attr(prepared: &mut PreparedAttributes) -> Result<(), i32> {
+    let child_policy = prepared
+        .child_policy
+        .as_mut()
+        .expect("child policy backing store should exist in primary path");
     if UpdateProcThreadAttribute(
-        attrs.as_mut_ptr(),
+        prepared.attrs.as_mut_ptr(),
         0,
         PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
-        &mut child_policy as *mut _ as *mut c_void,
-        std::mem::size_of::<u64>(),
+        child_policy.as_mut() as *mut _ as *mut c_void,
+        std::mem::size_of::<u32>(),
         std::ptr::null_mut(),
         std::ptr::null(),
     ) == 0
@@ -341,16 +368,12 @@ unsafe fn set_child_process_policy_attr(attrs: &mut ProcThreadAttributes) -> Res
     Ok(())
 }
 
-unsafe fn set_job_list_attr(
-    attrs: &mut ProcThreadAttributes,
-    job_handle: HANDLE,
-) -> Result<(), SandboxError> {
-    let mut job = job_handle;
+unsafe fn set_job_list_attr(prepared: &mut PreparedAttributes) -> Result<(), SandboxError> {
     if UpdateProcThreadAttribute(
-        attrs.as_mut_ptr(),
+        prepared.attrs.as_mut_ptr(),
         0,
         PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        &mut job as *mut _ as *mut c_void,
+        prepared.job_list.as_mut_ptr() as *mut c_void,
         std::mem::size_of::<HANDLE>(),
         std::ptr::null_mut(),
         std::ptr::null(),
@@ -447,7 +470,44 @@ fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
         out.push(0);
     }
     out.push(0);
+    if out.len() == 1 {
+        out.push(0);
+    }
     out
+}
+
+fn environment_block_for_create_process(env: &HashMap<String, String>) -> Option<Vec<u16>> {
+    let mut merged = env.clone();
+    for required in [
+        "SystemRoot",
+        "WINDIR",
+        "PATH",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ] {
+        if has_env_key_case_insensitive(&merged, required) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(required) {
+            merged.insert(required.to_string(), value);
+        }
+    }
+
+    if merged.is_empty() {
+        return None;
+    }
+
+    Some(make_env_block(&merged))
+}
+
+fn has_env_key_case_insensitive(env: &HashMap<String, String>, key: &str) -> bool {
+    env.keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
 }
 
 fn quote_windows_arg(arg: &str) -> String {
@@ -508,6 +568,14 @@ fn child_policy_degrade_allowed(code: i32) -> bool {
     )
 }
 
+fn child_policy_degraded_reason(code: i32) -> String {
+    format!(
+        "windows sandbox degraded mode: child-process restriction policy unavailable ({}: {}); job containment remains active",
+        code,
+        format_last_error(code)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -518,7 +586,11 @@ mod tests {
         ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
     };
 
-    use super::{child_policy_degrade_allowed, quote_windows_arg, resolve_executable};
+    use super::{
+        child_policy_degrade_allowed, child_policy_degraded_reason,
+        environment_block_for_create_process, make_env_block, quote_windows_arg,
+        resolve_executable,
+    };
 
     #[test]
     fn resolve_executable_honors_custom_path_and_pathext() {
@@ -584,5 +656,28 @@ mod tests {
         assert!(child_policy_degrade_allowed(ERROR_INVALID_PARAMETER as i32));
         assert!(child_policy_degrade_allowed(ERROR_NOT_SUPPORTED as i32));
         assert!(!child_policy_degrade_allowed(123_456));
+    }
+
+    #[test]
+    fn child_policy_degraded_reason_mentions_active_job_containment() {
+        let reason = child_policy_degraded_reason(ERROR_NOT_SUPPORTED as i32);
+        assert!(reason.contains("degraded mode"));
+        assert!(reason.contains("job containment remains active"));
+    }
+
+    #[test]
+    fn make_env_block_empty_map_is_double_null_terminated() {
+        let block = make_env_block(&HashMap::new());
+        assert_eq!(block, vec![0, 0]);
+    }
+
+    #[test]
+    fn environment_block_adds_windows_runtime_baseline_when_available() {
+        let block = environment_block_for_create_process(&HashMap::new());
+        if let Some(block) = block {
+            assert!(block.len() >= 2);
+            assert_eq!(block[block.len() - 1], 0);
+            assert_eq!(block[block.len() - 2], 0);
+        }
     }
 }

@@ -89,6 +89,7 @@ println!("exit = {}", output.exit_code);
   - `aggregated_output`
   - `duration`
   - `timed_out`
+  - `degraded_mode_reason` (`Option<String>`, populated when backend must run in an explicitly-degraded enforcement mode)
 
 ---
 
@@ -148,10 +149,11 @@ Implementation entry: `src/platform/windows/mod.rs`
 3. Validate and sanitize allow/deny paths.
 4. Resolve the executable path.
 5. Create AppContainer context (SID/profile).
-6. If `network_access == false`, install temporary WFP block filters for the executable + AppContainer SID.
-7. Apply ACL access plan for the AppContainer SID.
-8. Launch process with AppContainer security capabilities.
-9. Capture output and enforce timeout.
+6. If the process is not elevated, request a single UAC elevation and start one elevated helper for ACL + optional network block lifecycle.
+7. If already elevated, use native ACL/WFP setup in-process.
+8. Apply ACL access plan for the AppContainer SID (native path or elevated helper path).
+9. Launch process with AppContainer security capabilities.
+10. Capture output and enforce timeout.
 
 ### Path safety validation implementation
 
@@ -176,6 +178,8 @@ Then the backend:
 - adds allow read/execute ACEs for `allow_readonly_paths`.
 - adds allow read/write/execute ACEs for `allow_readwrite_paths`.
 - tracks changes and revokes them on drop (rollback object).
+
+When the caller is not elevated, ACL and optional network block setup/cleanup are delegated to a single elevated helper process (one UAC prompt per sandbox execution).
 
 ### Process creation and containment
 
