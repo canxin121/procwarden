@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -52,15 +52,18 @@ pub(super) fn execute(
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
 
-    if default_write_access && (!read_only_paths.is_empty() || !denied_paths.is_empty()) {
-        return Err(SandboxError::InvalidRequest(
-            "linux backend does not support default_access=ReadWrite with ReadOnly/NoAccess path overrides; use default_access=ReadOnly or NoAccess with explicit read_write carve-outs"
-                .to_string(),
-        ));
-    }
+    validate_linux_policy_shape(
+        default_read_access,
+        default_write_access,
+        &read_only_paths,
+        &denied_paths,
+        &readable_roots,
+        &writable_roots,
+    )?;
 
     unsafe {
         command.pre_exec(move || {
+            close_non_stdio_fds_on_current_process()?;
             if !network_access {
                 install_network_seccomp_filter_on_current_thread()?;
             }
@@ -76,6 +79,167 @@ pub(super) fn execute(
     }
 
     run_command_with_timeout(&mut command, request.timeout_ms, start)
+}
+
+fn validate_linux_policy_shape(
+    default_read_access: bool,
+    default_write_access: bool,
+    read_only_paths: &[PathBuf],
+    denied_paths: &[PathBuf],
+    readable_roots: &[PathBuf],
+    writable_roots: &[PathBuf],
+) -> Result<(), SandboxError> {
+    if default_write_access && (!read_only_paths.is_empty() || !denied_paths.is_empty()) {
+        return Err(SandboxError::InvalidRequest(
+            "linux backend does not support default_access=ReadWrite with ReadOnly/NoAccess path overrides; use default_access=ReadOnly or NoAccess with explicit read_write carve-outs"
+                .to_string(),
+        ));
+    }
+
+    if denied_paths.is_empty() {
+        return Ok(());
+    }
+
+    if default_read_access {
+        return Err(SandboxError::InvalidRequest(
+            "linux backend does not support NoAccess path overrides when default_access grants read access; use default_access=NoAccess with explicit allow paths"
+                .to_string(),
+        ));
+    }
+
+    let mut allow_roots = Vec::with_capacity(readable_roots.len() + writable_roots.len());
+    allow_roots.extend(readable_roots.iter().cloned());
+    allow_roots.extend(writable_roots.iter().cloned());
+
+    if denied_overlaps_any_allowed_root(denied_paths, &allow_roots)? {
+        return Err(SandboxError::InvalidRequest(
+            "linux backend does not support overlapping allow and NoAccess path overrides under default_access=NoAccess; Landlock cannot express subtractive deny rules"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn denied_overlaps_any_allowed_root(
+    denied_paths: &[PathBuf],
+    allow_roots: &[PathBuf],
+) -> Result<bool, SandboxError> {
+    if denied_paths.is_empty() || allow_roots.is_empty() {
+        return Ok(false);
+    }
+
+    let normalized_denied = denied_paths
+        .iter()
+        .map(|path| normalize_scope_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let normalized_allowed = allow_roots
+        .iter()
+        .map(|path| normalize_scope_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(normalized_denied.iter().any(|denied| {
+        normalized_allowed
+            .iter()
+            .any(|allowed| paths_overlap(denied, allowed))
+    }))
+}
+
+fn normalize_scope_path(path: &Path) -> Result<PathBuf, SandboxError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    match absolute.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => Ok(lexically_normalize_path(&absolute)),
+    }
+}
+
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn close_non_stdio_fds_on_current_process() -> io::Result<()> {
+    let open_fds = match collect_open_fds_from_proc() {
+        Ok(fds) => fds,
+        Err(_) => collect_fd_range_from_rlimit()?,
+    };
+
+    for fd in open_fds {
+        if fd <= 2 {
+            continue;
+        }
+
+        close_fd_ignore_ebadf(fd)?;
+    }
+
+    Ok(())
+}
+
+fn collect_open_fds_from_proc() -> io::Result<Vec<i32>> {
+    let mut fds = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(value) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        fds.push(value);
+    }
+    Ok(fds)
+}
+
+fn collect_fd_range_from_rlimit() -> io::Result<Vec<i32>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let cap = if limit.rlim_cur == libc::RLIM_INFINITY {
+        1_048_576_u64
+    } else {
+        limit.rlim_cur.min(1_048_576)
+    };
+
+    Ok((3..cap as i32).collect())
+}
+
+fn close_fd_ignore_ebadf(fd: i32) -> io::Result<()> {
+    if unsafe { libc::close(fd) } == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(

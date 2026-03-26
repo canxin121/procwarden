@@ -26,6 +26,7 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
   - `NoAccess | ReadOnly | ReadWrite`
   - interpreted as a default rule for paths not explicitly listed in `path_permissions`
   - explicit path rules (`read_only` / `read_write` / `deny`) are overlays on top of this default
+  - when a backend cannot safely represent a subtractive overlay shape, it rejects the request fail-closed (`SandboxError::InvalidRequest`) instead of silently weakening policy
 - `network_access: bool`
 
 `SandboxCommandRequest` contains:
@@ -103,6 +104,12 @@ Linux filesystem restrictions are applied in `pre_exec` using Landlock:
 - `default_access == ReadWrite`
   - if no `ReadOnly`/`NoAccess` overlays are present, skips Landlock filesystem restriction setup.
   - if `ReadOnly`/`NoAccess` overlays are present, Linux returns `SandboxError::InvalidRequest` (fail-closed) because Landlock cannot safely express these subtractive overrides over a full-write default.
+- `default_access == ReadOnly` with any `NoAccess` (`deny`) overlay:
+  - Linux returns `SandboxError::InvalidRequest` (fail-closed).
+  - reason: Landlock is allowlist-oriented and cannot subtract a denied subtree from a global read grant.
+- `default_access == NoAccess` with overlapping `allow` + `deny` scopes:
+  - Linux returns `SandboxError::InvalidRequest` (fail-closed).
+  - non-overlapping `deny` entries remain accepted (they are effectively redundant because the default is already deny).
 - otherwise:
   - installs a Landlock ruleset.
   - grants read scopes and write scopes based on policy-derived roots.
