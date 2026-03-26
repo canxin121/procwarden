@@ -184,7 +184,7 @@ Then the backend:
 Process launch uses AppContainer-capable `CreateProcessW` attribute lists:
 
 - `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` (AppContainer SID)
-- `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricted child-process policy)
+- `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricted child-process policy; unsupported/restricted hosts are handled with compatibility fallback)
 - `PROC_THREAD_ATTRIBUTE_JOB_LIST` (job object with kill-on-close)
 
 ### Network behavior on Windows backend
@@ -198,7 +198,9 @@ When `network_access == false`, the backend installs Windows Filtering Platform 
 - Block action is applied on ALE layers for connect/accept/resource-assignment in IPv4 and IPv6.
 - Filters live only for the sandbox session lifetime and are removed when the engine session closes (dynamic session semantics).
 
-If WFP setup fails (for example due to missing privileges), execution fails closed with an error.
+If WFP setup fails with privilege/support limitations (`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`), the backend automatically requests administrator elevation (UAC) and installs temporary firewall block rules via an elevated helper.
+
+If automatic elevation fails (for example user cancellation), execution fails closed with an explicit error.
 
 ---
 

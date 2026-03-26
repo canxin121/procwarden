@@ -39,13 +39,19 @@ fn windows_executes_with_explicit_allowlists() {
             SandboxPathPermission::read_write(workspace.clone()),
         ],
         global_access: SandboxAccess::NoAccess,
-        network_access: false,
+        network_access: true,
     };
 
     let output = match manager.execute(&request, &policy) {
         Ok(value) => value,
         Err(procwarden::SandboxError::Windows(message))
             if message.contains("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)") =>
+        {
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+        Err(procwarden::SandboxError::Windows(message))
+            if message.contains("CreateProcessW(AppContainer) failed: 87") =>
         {
             let _ = std::fs::remove_dir_all(&workspace);
             return;

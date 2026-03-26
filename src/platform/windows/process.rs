@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use which::which_in;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+use windows_sys::Win32::Foundation::ERROR_BAD_LENGTH;
+use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
@@ -274,7 +278,29 @@ unsafe fn prepare_appcontainer_child_job_attributes(
     job_handle: HANDLE,
 ) -> Result<ProcThreadAttributes, SandboxError> {
     let mut attrs = ProcThreadAttributes::new(3)?;
+    set_security_capabilities_attr(&mut attrs, appcontainer_sid)?;
 
+    match set_child_process_policy_attr(&mut attrs) {
+        Ok(()) => {
+            set_job_list_attr(&mut attrs, job_handle)?;
+            Ok(attrs)
+        }
+        Err(code) if child_policy_degrade_allowed(code) => {
+            let mut fallback_attrs = ProcThreadAttributes::new(1)?;
+            set_security_capabilities_attr(&mut fallback_attrs, appcontainer_sid)?;
+            Ok(fallback_attrs)
+        }
+        Err(code) => Err(windows_error(
+            "UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)",
+            code,
+        )),
+    }
+}
+
+unsafe fn set_security_capabilities_attr(
+    attrs: &mut ProcThreadAttributes,
+    appcontainer_sid: *mut c_void,
+) -> Result<(), SandboxError> {
     let mut security_capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: appcontainer_sid,
         Capabilities: std::ptr::null_mut(),
@@ -295,7 +321,10 @@ unsafe fn prepare_appcontainer_child_job_attributes(
             "UpdateProcThreadAttribute(SECURITY_CAPABILITIES)",
         ));
     }
+    Ok(())
+}
 
+unsafe fn set_child_process_policy_attr(attrs: &mut ProcThreadAttributes) -> Result<(), i32> {
     let mut child_policy: u64 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED as u64;
     if UpdateProcThreadAttribute(
         attrs.as_mut_ptr(),
@@ -307,11 +336,15 @@ unsafe fn prepare_appcontainer_child_job_attributes(
         std::ptr::null(),
     ) == 0
     {
-        return Err(last_error(
-            "UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)",
-        ));
+        return Err(GetLastError() as i32);
     }
+    Ok(())
+}
 
+unsafe fn set_job_list_attr(
+    attrs: &mut ProcThreadAttributes,
+    job_handle: HANDLE,
+) -> Result<(), SandboxError> {
     let mut job = job_handle;
     if UpdateProcThreadAttribute(
         attrs.as_mut_ptr(),
@@ -325,8 +358,7 @@ unsafe fn prepare_appcontainer_child_job_attributes(
     {
         return Err(last_error("UpdateProcThreadAttribute(JOB_LIST)"));
     }
-
-    Ok(attrs)
+    Ok(())
 }
 
 unsafe fn setup_stdio_pipes() -> Result<PipeHandles, SandboxError> {
@@ -459,11 +491,22 @@ fn quote_windows_arg(arg: &str) -> String {
 
 fn last_error(context: &str) -> SandboxError {
     let code = unsafe { GetLastError() } as i32;
+    windows_error(context, code)
+}
+
+fn windows_error(context: &str, code: i32) -> SandboxError {
     SandboxError::Windows(format!(
         "{context} failed: {} ({})",
         code,
         format_last_error(code)
     ))
+}
+
+fn child_policy_degrade_allowed(code: i32) -> bool {
+    matches!(
+        code as u32,
+        ERROR_ACCESS_DENIED | ERROR_BAD_LENGTH | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED
+    )
 }
 
 #[cfg(test)]
@@ -472,7 +515,11 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{quote_windows_arg, resolve_executable};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+
+    use super::{child_policy_degrade_allowed, quote_windows_arg, resolve_executable};
 
     #[test]
     fn resolve_executable_honors_custom_path_and_pathext() {
@@ -529,5 +576,14 @@ mod tests {
             r#""path with tail\\\\""#,
             "trailing backslashes must be doubled inside quoted arg"
         );
+    }
+
+    #[test]
+    fn child_policy_degrade_whitelist_is_explicit() {
+        assert!(child_policy_degrade_allowed(ERROR_ACCESS_DENIED as i32));
+        assert!(child_policy_degrade_allowed(ERROR_BAD_LENGTH as i32));
+        assert!(child_policy_degrade_allowed(ERROR_INVALID_PARAMETER as i32));
+        assert!(child_policy_degrade_allowed(ERROR_NOT_SUPPORTED as i32));
+        assert!(!child_policy_degrade_allowed(123_456));
     }
 }

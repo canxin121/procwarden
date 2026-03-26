@@ -143,7 +143,7 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 3. 对 allow/deny 路径做校验和清洗。
 4. 解析可执行文件路径。
 5. 创建 AppContainer 上下文（SID/profile）。
-6. 若 `network_access == false`，按可执行文件 + AppContainer SID 安装临时 WFP 阻断过滤器。
+6. 若 `network_access == false`，按可执行文件 + AppContainer SID 安装临时 WFP 阻断过滤器；遇到权限限制时自动发起管理员提权。
 7. 对 AppContainer SID 应用 ACL 访问计划。
 8. 以 AppContainer 安全能力启动目标进程。
 9. 捕获输出并处理超时。
@@ -184,7 +184,7 @@ policy 转换为 ACL 计划：
 通过 AppContainer 相关属性创建进程（`CreateProcessW` 属性列表）：
 
 - `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`（AppContainer SID）
-- `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`（限制子进程策略）
+- `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`（限制子进程策略；在不支持/受限宿主上使用兼容回退）
 - `PROC_THREAD_ATTRIBUTE_JOB_LIST`（job 对象 + kill-on-close）
 
 ### Windows 的网络行为
@@ -198,7 +198,9 @@ policy 转换为 ACL 计划：
 - 在 IPv4/IPv6 的 connect/accept/resource-assignment 对应 ALE 层执行 block。
 - 过滤器随动态会话生命周期存在；会话关闭后自动清理。
 
-若 WFP 安装失败（例如权限不足），执行会 fail-closed 返回错误。
+若 WFP 因权限/环境限制失败（`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`），后端会默认自动发起管理员提权（UAC），并通过提权 helper 安装临时防火墙阻断规则。
+
+若自动提权失败（例如用户取消），执行会以明确错误 fail-closed。
 
 ---
 

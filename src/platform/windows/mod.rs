@@ -1,5 +1,6 @@
 mod acl;
 mod appcontainer;
+mod elevation;
 mod process;
 mod token;
 mod util;
