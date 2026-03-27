@@ -55,6 +55,7 @@ impl SandboxExecOutput {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_degraded_mode_reason(mut self, reason: Option<String>) -> Self {
         self.degraded_mode_reason = reason;
         self
