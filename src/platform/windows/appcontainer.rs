@@ -39,7 +39,7 @@ pub(super) fn execute(
     let sid = appcontainer.sid();
 
     let optional_bootstrap_paths =
-        sanitize_policy_paths(runtime_bootstrap_readonly_paths(request, &executable))?;
+        sanitize_optional_existing_paths(runtime_bootstrap_readonly_paths(request, &executable))?;
     let use_elevated_ops = !elevation::current_process_is_elevated()?;
 
     let mut elevated_ops_guard = None;
@@ -145,6 +145,15 @@ fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
 fn sanitize_policy_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SandboxError> {
     cap_fs::PathPolicy::ascii_case_insensitive()
         .validate_and_dedupe(paths, util::ensure_safe_allow_path)
+}
+
+fn sanitize_optional_existing_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SandboxError> {
+    sanitize_policy_paths(
+        paths
+            .into_iter()
+            .filter(|path| cap_fs::path_exists(path))
+            .collect(),
+    )
 }
 
 fn runtime_bootstrap_readonly_paths(
