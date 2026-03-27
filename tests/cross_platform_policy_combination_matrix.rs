@@ -889,6 +889,7 @@ fn is_skippable_environment_error(error: &SandboxError) -> bool {
         SandboxError::Unavailable(_) => true,
         SandboxError::Windows(message) => {
             message.contains("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)")
+                || message.contains("FwpmEngineOpen0 failed")
         }
         _ => false,
     }
