@@ -269,6 +269,7 @@ impl Drop for ElevatedOpsGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn elevated_powershell_parameters(
     script_path: &Path,
     spec_path: &Path,

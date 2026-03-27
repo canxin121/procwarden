@@ -181,36 +181,20 @@ fn runtime_bootstrap_readonly_paths(
 
 fn resolve_acl_conflicts(mut plan: AclPlan) -> AclPlan {
     let deny_readwrite_keys = build_casefolded_path_set(&plan.deny_readwrite_paths);
-    plan.allow_readonly_paths = plan
-        .allow_readonly_paths
-        .into_iter()
-        .filter(|path| !deny_readwrite_keys.contains(&casefolded_path(path)))
-        .collect();
-    plan.allow_readwrite_paths = plan
-        .allow_readwrite_paths
-        .into_iter()
-        .filter(|path| !deny_readwrite_keys.contains(&casefolded_path(path)))
-        .collect();
-    plan.deny_write_paths = plan
-        .deny_write_paths
-        .into_iter()
-        .filter(|path| !deny_readwrite_keys.contains(&casefolded_path(path)))
-        .collect();
+    plan.allow_readonly_paths
+        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
+    plan.allow_readwrite_paths
+        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
+    plan.deny_write_paths
+        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
 
     let readwrite_keys = build_casefolded_path_set(&plan.allow_readwrite_paths);
-    plan.allow_readonly_paths = plan
-        .allow_readonly_paths
-        .into_iter()
-        .filter(|path| !readwrite_keys.contains(&casefolded_path(path)))
-        .collect();
-    plan.deny_write_paths = plan
-        .deny_write_paths
-        .into_iter()
-        .filter(|path| {
-            let key = casefolded_path(path);
-            !deny_readwrite_keys.contains(&key) && !readwrite_keys.contains(&key)
-        })
-        .collect();
+    plan.allow_readonly_paths
+        .retain(|path| !readwrite_keys.contains(&casefolded_path(path)));
+    plan.deny_write_paths.retain(|path| {
+        let key = casefolded_path(path);
+        !deny_readwrite_keys.contains(&key) && !readwrite_keys.contains(&key)
+    });
 
     plan
 }
