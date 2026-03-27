@@ -26,6 +26,7 @@
   - `NoAccess | ReadOnly | ReadWrite`
   - 表示未命中 `path_permissions` 时的默认访问策略
   - 具体路径规则（`read_only` / `read_write` / `deny`）会叠加覆盖默认策略
+  - 若后端无法安全表达某些“减法覆盖”组合，会 fail-closed 返回 `SandboxError::InvalidRequest`，不会静默弱化策略
 - `network_access: bool`
 
 `SandboxCommandRequest` 包含：
@@ -104,6 +105,12 @@ Linux 文件系统限制在 `pre_exec` 中通过 Landlock 设置：
 - `default_access == ReadWrite`
   - 若不存在 `ReadOnly` / `NoAccess` 覆盖路径，则跳过 Landlock 文件系统限制配置。
   - 若存在 `ReadOnly` / `NoAccess` 覆盖路径，Linux 会返回 `SandboxError::InvalidRequest`（fail-closed），因为 Landlock 无法在“默认全可写”上安全表达减法覆盖规则。
+- `default_access == ReadOnly` 且存在任意 `NoAccess`（`deny`）覆盖路径：
+  - Linux 会返回 `SandboxError::InvalidRequest`（fail-closed）。
+  - 原因：Landlock 是 allowlist 模型，无法从“全局可读”中减去某个被拒绝子树。
+- `default_access == NoAccess` 但存在重叠的 `allow` 与 `deny` 路径范围：
+  - Linux 会返回 `SandboxError::InvalidRequest`（fail-closed）。
+  - 非重叠 `deny` 仍可接受（在默认拒绝下本质是冗余规则）。
 - 其他情况：
   - 创建并安装 Landlock ruleset。
   - 按策略推导出的读/写根路径授予权限。

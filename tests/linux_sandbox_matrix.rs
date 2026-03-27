@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
-use std::net::TcpListener;
+use std::io::{self, Read};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    SandboxAccess, SandboxCommandRequest, SandboxManager, SandboxPathPermission, SandboxPolicy,
+    SandboxAccess, SandboxCommandRequest, SandboxError, SandboxManager, SandboxPathPermission,
+    SandboxPolicy,
 };
 
 struct TempDir {
@@ -523,6 +525,117 @@ fn network_disabled_blocks_loopback_connect_via_bash_dev_tcp() {
 }
 
 #[test]
+fn network_disabled_rejects_inherited_connected_socket_fd_writes() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("network-inherited-fd");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let port = listener
+        .local_addr()
+        .expect("listener addr should resolve")
+        .port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| {
+            let (mut accepted, _) = listener.accept()?;
+            accepted.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut buf = [0_u8; 4];
+            accepted.read_exact(&mut buf)?;
+            Ok::<String, io::Error>(String::from_utf8_lossy(&buf).to_string())
+        })();
+        let _ = tx.send(result);
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("stream should connect");
+    let inherited_fd = dup_inheritable_fd(stream.as_raw_fd());
+
+    let request = SandboxCommandRequest {
+        command: vec![
+            shell,
+            "-c".to_string(),
+            format!("printf 'PING' >&{inherited_fd}"),
+        ],
+        cwd: workspace.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout_ms: Some(4_000),
+    };
+
+    let output = manager
+        .execute(&request, &policy(SandboxAccess::ReadWrite, false, vec![]))
+        .expect("network inherited-fd case should execute");
+
+    unsafe {
+        libc::close(inherited_fd);
+    }
+    drop(stream);
+
+    assert_ne!(
+        output.exit_code, 0,
+        "inherited connected socket fd should be closed before exec"
+    );
+
+    let observation = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("listener thread should report read outcome");
+    if let Ok(payload) = observation {
+        panic!("inherited socket fd should not deliver payload, got {payload}");
+    }
+}
+
+#[test]
+fn readonly_blocks_writes_via_inherited_writable_file_fd() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("readonly-inherited-file-fd");
+
+    let target = workspace.path().join("target.txt");
+    fs::write(&target, "seed").expect("seed file should exist");
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target)
+        .expect("seed file should open for inherited fd setup");
+    assert!(
+        unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) } >= 0,
+        "lseek should succeed before inherited write probe"
+    );
+    let inherited_fd = dup_inheritable_fd(file.as_raw_fd());
+
+    let request = SandboxCommandRequest {
+        command: vec![
+            shell,
+            "-c".to_string(),
+            format!("printf 'PWN!' >&{inherited_fd}"),
+        ],
+        cwd: workspace.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout_ms: Some(4_000),
+    };
+
+    let output = manager
+        .execute(&request, &policy(SandboxAccess::ReadOnly, true, vec![]))
+        .expect("readonly inherited-fd case should execute");
+
+    unsafe {
+        libc::close(inherited_fd);
+    }
+    drop(file);
+
+    assert_ne!(
+        output.exit_code, 0,
+        "inherited writable file fd should be closed before exec"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("target should remain readable"),
+        "seed",
+        "readonly policy should not be bypassable via inherited file fd"
+    );
+}
+
+#[test]
 fn concurrent_stress_matrix_parallel_10_to_50_execs() {
     let shell = linux_shell_path();
     let manager = SandboxManager::new();
@@ -900,6 +1013,135 @@ fn noaccess_child_allowlist_blocks_parent_reads_across_depths() {
             "parent path should remain unreadable at depth {depth}"
         );
     }
+}
+
+#[test]
+fn readonly_default_with_deny_overlay_is_rejected_fail_closed() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("readonly-deny-unsupported");
+    let denied_dir = workspace.path().join("deny-scope");
+    fs::create_dir_all(&denied_dir).expect("deny scope should exist");
+
+    let denied_file = denied_dir.join("secret.txt");
+    fs::write(&denied_file, "secret-data").expect("deny seed file should exist");
+
+    let request = SandboxCommandRequest {
+        command: vec![
+            shell,
+            "-c".to_string(),
+            "cat -- \"$1\"".to_string(),
+            "procwarden-read".to_string(),
+            denied_file.to_string_lossy().to_string(),
+        ],
+        cwd: workspace.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout_ms: Some(4_000),
+    };
+
+    let policy = policy(
+        SandboxAccess::ReadOnly,
+        true,
+        vec![SandboxPathPermission::deny(denied_dir)],
+    );
+
+    let error = manager
+        .execute(&request, &policy)
+        .expect_err("readonly+deny should fail closed on linux backend");
+
+    match error {
+        SandboxError::InvalidRequest(message) => {
+            assert!(
+                message.contains("NoAccess path overrides"),
+                "unexpected readonly+deny rejection message: {message}"
+            );
+        }
+        other => panic!("expected InvalidRequest for readonly+deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn noaccess_with_overlapping_allow_and_deny_is_rejected_fail_closed() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("noaccess-overlap-deny");
+    let allowed_parent = workspace.path().join("allowed-parent");
+    let denied_child = allowed_parent.join("denied-child");
+    fs::create_dir_all(&denied_child).expect("deny child should exist");
+
+    let denied_file = denied_child.join("blocked.txt");
+    fs::write(&denied_file, "deny-me").expect("blocked seed should be written");
+
+    let request = SandboxCommandRequest {
+        command: vec![
+            shell,
+            "-c".to_string(),
+            "cat -- \"$1\"".to_string(),
+            "procwarden-read".to_string(),
+            denied_file.to_string_lossy().to_string(),
+        ],
+        cwd: workspace.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout_ms: Some(4_000),
+    };
+
+    let mut policy = noaccess_policy_with_readable_paths(vec![allowed_parent]);
+    policy
+        .path_permissions
+        .push(SandboxPathPermission::deny(denied_child));
+
+    let error = manager
+        .execute(&request, &policy)
+        .expect_err("noaccess with overlapping allow+deny should fail closed on linux");
+
+    match error {
+        SandboxError::InvalidRequest(message) => {
+            assert!(
+                message.contains("overlapping allow and NoAccess path overrides"),
+                "unexpected overlap rejection message: {message}"
+            );
+        }
+        other => panic!("expected InvalidRequest for overlapping allow+deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn noaccess_with_non_overlapping_deny_keeps_supported_behavior() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("noaccess-nonoverlap-deny");
+    let outside = TempDir::new("noaccess-nonoverlap-outside");
+
+    let allowed_file = workspace.path().join("allowed.txt");
+    fs::write(&allowed_file, "allowed-content").expect("allowlisted file should be written");
+
+    let request = SandboxCommandRequest {
+        command: vec![
+            shell,
+            "-c".to_string(),
+            "cat -- \"$1\"".to_string(),
+            "procwarden-read".to_string(),
+            allowed_file.to_string_lossy().to_string(),
+        ],
+        cwd: workspace.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout_ms: Some(4_000),
+    };
+
+    let mut policy = noaccess_policy_with_readable_paths(vec![workspace.path().to_path_buf()]);
+    policy
+        .path_permissions
+        .push(SandboxPathPermission::deny(outside.path().to_path_buf()));
+
+    let output = manager
+        .execute(&request, &policy)
+        .expect("non-overlapping deny should remain executable under noaccess");
+
+    assert_eq!(output.exit_code, 0, "allowlisted read should still succeed");
+    assert_eq!(
+        output.stdout, "allowed-content",
+        "allowlisted output should remain intact"
+    );
 }
 
 #[test]
@@ -1560,6 +1802,18 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+fn dup_inheritable_fd(fd: i32) -> i32 {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD, 200) };
+    assert!(duplicated >= 0, "duplicating fd should succeed");
+
+    let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFD) };
+    assert!(flags >= 0, "querying fd flags should succeed");
+    let set_rc = unsafe { libc::fcntl(duplicated, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    assert_eq!(set_rc, 0, "clearing close-on-exec should succeed");
+
+    duplicated
 }
 
 fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {

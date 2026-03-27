@@ -475,6 +475,67 @@ fn run_policy_combination_matrix(kind: RuntimeKind) {
             ),
         );
 
+        let readonly_with_deny = SandboxPolicy {
+            path_permissions: vec![
+                SandboxPathPermission::read_write(runtime_cwd.clone()),
+                SandboxPathPermission::read_only(ro_scope.clone()),
+                SandboxPathPermission::deny(deny_scope.clone()),
+            ],
+            default_access: SandboxAccess::ReadOnly,
+            network_access: true,
+        };
+        let readonly_deny_read = manager.execute(
+            &sandbox_request(
+                runtime_command(&runtime, "read", depth, vec![path_arg(&deny_seed)]),
+                &runtime_cwd,
+            ),
+            &readonly_with_deny,
+        );
+
+        let readonly_deny_supported = match readonly_deny_read {
+            Ok(output) => {
+                assert_ne!(
+                    output.exit_code,
+                    0,
+                    "{} depth {depth} readonly default must deny reads in denied override",
+                    kind.name()
+                );
+                true
+            }
+            Err(SandboxError::InvalidRequest(message))
+                if message.contains("NoAccess path overrides") =>
+            {
+                false
+            }
+            Err(error) if is_skippable_environment_error(&error) => {
+                eprintln!(
+                    "skipping remaining {} matrix checks due to environment limitation: {error:?}",
+                    kind.name()
+                );
+                return;
+            }
+            Err(error) => panic!(
+                "unexpected {} depth {depth} readonly+deny manager error: {error:?}",
+                kind.name()
+            ),
+        };
+
+        if readonly_deny_supported {
+            assert_case(
+                &manager,
+                &readonly_with_deny,
+                &sandbox_request(
+                    runtime_command(&runtime, "read", depth, vec![path_arg(&ro_seed)]),
+                    &runtime_cwd,
+                ),
+                true,
+                &format!(
+                    "{} depth {depth} readonly+deny keeps non-denied read paths accessible",
+                    kind.name()
+                ),
+            );
+        }
+
         let readwrite_with_overrides = SandboxPolicy {
             path_permissions: vec![
                 SandboxPathPermission::read_write(runtime_cwd.clone()),
