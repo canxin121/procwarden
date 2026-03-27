@@ -566,21 +566,8 @@ fn run_policy_combination_matrix(kind: RuntimeKind) {
             &readwrite_with_overrides,
         );
 
-        let overrides_supported = match readwrite_override_ro {
-            Ok(output) => {
-                assert_ne!(
-                    output.exit_code,
-                    0,
-                    "{} depth {depth} readwrite default must not write into read-only override",
-                    kind.name()
-                );
-                true
-            }
-            Err(SandboxError::InvalidRequest(message))
-                if message.contains("default_access=ReadWrite with ReadOnly/NoAccess") =>
-            {
-                false
-            }
+        let readwrite_override_ro = match readwrite_override_ro {
+            Ok(output) => output,
             Err(error) if is_skippable_environment_error(&error) => {
                 eprintln!(
                     "skipping remaining {} matrix checks due to environment limitation: {error:?}",
@@ -593,53 +580,57 @@ fn run_policy_combination_matrix(kind: RuntimeKind) {
                 kind.name()
             ),
         };
+        assert_ne!(
+            readwrite_override_ro.exit_code,
+            0,
+            "{} depth {depth} readwrite default must not write into read-only override",
+            kind.name()
+        );
         assert!(
             !readwrite_override_ro_write.exists(),
             "{} depth {depth} readwrite override ro write must not create file",
             kind.name()
         );
 
-        if overrides_supported {
-            assert_case(
-                &manager,
-                &readwrite_with_overrides,
-                &sandbox_request(
-                    runtime_command(&runtime, "read", depth, vec![path_arg(&deny_seed)]),
-                    &runtime_cwd,
-                ),
-                false,
-                &format!(
-                    "{} depth {depth} readwrite default must deny reads in denied override",
-                    kind.name()
-                ),
-            );
-
-            let readwrite_override_outside = outside_scope.join(format!(
-                "{}-depth-{depth}-readwrite-override-outside.txt",
+        assert_case(
+            &manager,
+            &readwrite_with_overrides,
+            &sandbox_request(
+                runtime_command(&runtime, "read", depth, vec![path_arg(&deny_seed)]),
+                &runtime_cwd,
+            ),
+            false,
+            &format!(
+                "{} depth {depth} readwrite default must deny reads in denied override",
                 kind.name()
-            ));
-            assert_case(
-                &manager,
-                &readwrite_with_overrides,
-                &sandbox_request(
-                    runtime_command(
-                        &runtime,
-                        "write",
-                        depth,
-                        vec![
-                            path_arg(&readwrite_override_outside),
-                            format!("allow-rw-override-outside-{depth}"),
-                        ],
-                    ),
-                    &runtime_cwd,
+            ),
+        );
+
+        let readwrite_override_outside = outside_scope.join(format!(
+            "{}-depth-{depth}-readwrite-override-outside.txt",
+            kind.name()
+        ));
+        assert_case(
+            &manager,
+            &readwrite_with_overrides,
+            &sandbox_request(
+                runtime_command(
+                    &runtime,
+                    "write",
+                    depth,
+                    vec![
+                        path_arg(&readwrite_override_outside),
+                        format!("allow-rw-override-outside-{depth}"),
+                    ],
                 ),
-                supports_global_readwrite_write,
-                &format!(
-                    "{} depth {depth} readwrite default still allows writes outside overrides",
-                    kind.name()
-                ),
-            );
-        }
+                &runtime_cwd,
+            ),
+            supports_global_readwrite_write,
+            &format!(
+                "{} depth {depth} readwrite default still allows writes outside overrides",
+                kind.name()
+            ),
+        );
 
         let readwrite_policy = SandboxPolicy {
             path_permissions: Vec::new(),

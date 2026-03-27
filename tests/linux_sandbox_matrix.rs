@@ -1145,6 +1145,99 @@ fn noaccess_with_non_overlapping_deny_keeps_supported_behavior() {
 }
 
 #[test]
+fn readwrite_default_enforces_readonly_and_deny_overrides() {
+    let shell = linux_shell_path();
+    let manager = SandboxManager::new();
+    let workspace = TempDir::new("readwrite-overrides-workspace");
+    let outside = TempDir::new("readwrite-overrides-outside");
+
+    let readonly_dir = workspace.path().join("readonly-scope");
+    let deny_dir = workspace.path().join("deny-scope");
+    fs::create_dir_all(&readonly_dir).expect("readonly scope should exist");
+    fs::create_dir_all(&deny_dir).expect("deny scope should exist");
+
+    let denied_file = deny_dir.join("secret.txt");
+    fs::write(&denied_file, "secret-data").expect("deny seed file should exist");
+
+    let policy = policy(
+        SandboxAccess::ReadWrite,
+        true,
+        vec![
+            SandboxPathPermission::read_only(readonly_dir.clone()),
+            SandboxPathPermission::deny(deny_dir.clone()),
+        ],
+    );
+
+    let readonly_target = readonly_dir.join("blocked-write.txt");
+    let readonly_write_output = match manager.execute(
+        &SandboxCommandRequest {
+            command: write_file_command(&shell, &readonly_target, "blocked-write"),
+            cwd: workspace.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout_ms: Some(4_000),
+        },
+        &policy,
+    ) {
+        Ok(output) => output,
+        Err(SandboxError::Unavailable(_)) => return,
+        Err(error) => panic!("readwrite+readonly overlay write probe should execute: {error:?}"),
+    };
+    assert_ne!(
+        readonly_write_output.exit_code, 0,
+        "readwrite default should not allow writes inside readonly overlay"
+    );
+    assert!(
+        !readonly_target.exists(),
+        "readonly overlay should prevent creating new files"
+    );
+
+    let denied_read_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: vec![
+                    shell.clone(),
+                    "-c".to_string(),
+                    "cat -- \"$1\"".to_string(),
+                    "procwarden-read".to_string(),
+                    denied_file.to_string_lossy().to_string(),
+                ],
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy,
+        )
+        .expect("readwrite+deny overlay read probe should execute");
+    assert_ne!(
+        denied_read_output.exit_code, 0,
+        "readwrite default should deny reads inside deny overlay"
+    );
+
+    let outside_target = outside.path().join("outside-write.txt");
+    let outside_write_output = manager
+        .execute(
+            &SandboxCommandRequest {
+                command: write_file_command(&shell, &outside_target, "outside-ok"),
+                cwd: workspace.path().to_path_buf(),
+                env: HashMap::new(),
+                timeout_ms: Some(4_000),
+            },
+            &policy,
+        )
+        .expect("readwrite+overrides outside write probe should execute");
+    assert_eq!(
+        outside_write_output.exit_code, 0,
+        "readwrite default should still allow writes outside readonly/deny overlays, stderr: {}",
+        outside_write_output.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(&outside_target).expect("outside target should stay readable"),
+        "outside-ok",
+        "outside write should persist when not covered by overlays"
+    );
+}
+
+#[test]
 fn readonly_and_readwrite_write_behavior_for_parent_and_subpaths_across_depths() {
     let shell = linux_shell_path();
     let manager = SandboxManager::new();

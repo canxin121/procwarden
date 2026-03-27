@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -52,10 +56,19 @@ pub(super) fn execute(
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
 
+    let readwrite_overlay_entries = if default_write_access {
+        let normalized_read_only_overlays =
+            normalize_existing_overlay_paths(&read_only_paths, "read_only")?;
+        let normalized_deny_overlays = normalize_existing_overlay_paths(&denied_paths, "deny")?;
+        collect_readwrite_overlay_entries(&normalized_read_only_overlays, &normalized_deny_overlays)
+    } else {
+        Vec::new()
+    };
+    let should_install_readwrite_overlays = !readwrite_overlay_entries.is_empty();
+
     validate_linux_policy_shape(
         default_read_access,
         default_write_access,
-        &read_only_paths,
         &denied_paths,
         &readable_roots,
         &writable_roots,
@@ -63,48 +76,59 @@ pub(super) fn execute(
 
     unsafe {
         command.pre_exec(move || {
-            close_non_stdio_fds_on_current_process()?;
             if !network_access {
                 install_network_seccomp_filter_on_current_thread()?;
             }
-            if !default_write_access {
+            if should_install_readwrite_overlays {
+                install_readwrite_mount_overlays_on_current_process(&readwrite_overlay_entries)?;
+            } else if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(
                     default_read_access,
                     &readable_roots,
                     &writable_roots,
                 )?;
             }
+            close_non_stdio_fds_on_current_process()?;
             Ok(())
         });
     }
 
-    run_command_with_timeout(&mut command, request.timeout_ms, start)
+    let execution = run_command_with_timeout(&mut command, request.timeout_ms, start);
+    if should_install_readwrite_overlays {
+        match execution {
+            Err(SandboxError::Io(error)) if is_overlay_namespace_unavailable_error(&error) => {
+                Err(SandboxError::Unavailable(
+                    "linux readwrite path overlays require mount-namespace support (CLONE_NEWUSER/CLONE_NEWNS or CAP_SYS_ADMIN)"
+                        .to_string(),
+                ))
+            }
+            other => other,
+        }
+    } else {
+        execution
+    }
 }
 
 fn validate_linux_policy_shape(
     default_read_access: bool,
     default_write_access: bool,
-    read_only_paths: &[PathBuf],
     denied_paths: &[PathBuf],
     readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
 ) -> Result<(), SandboxError> {
-    if default_write_access && (!read_only_paths.is_empty() || !denied_paths.is_empty()) {
-        return Err(SandboxError::InvalidRequest(
-            "linux backend does not support default_access=ReadWrite with ReadOnly/NoAccess path overrides; use default_access=ReadOnly or NoAccess with explicit read_write carve-outs"
-                .to_string(),
-        ));
-    }
-
     if denied_paths.is_empty() {
         return Ok(());
     }
 
-    if default_read_access {
+    if default_read_access && !default_write_access {
         return Err(SandboxError::InvalidRequest(
             "linux backend does not support NoAccess path overrides when default_access grants read access; use default_access=NoAccess with explicit allow paths"
                 .to_string(),
         ));
+    }
+
+    if default_write_access {
+        return Ok(());
     }
 
     let mut allow_roots = Vec::with_capacity(readable_roots.len() + writable_roots.len());
@@ -240,6 +264,269 @@ fn close_fd_ignore_ebadf(fd: i32) -> io::Result<()> {
     } else {
         Err(error)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadWriteOverlayKind {
+    ReadOnly,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadWriteOverlayEntry {
+    path: PathBuf,
+    kind: ReadWriteOverlayKind,
+}
+
+fn normalize_existing_overlay_paths(
+    paths: &[PathBuf],
+    label: &str,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        let resolved = normalize_scope_path(path)?;
+        if !resolved.exists() {
+            return Err(SandboxError::InvalidRequest(format!(
+                "linux backend requires existing {label} path overlays when default_access=ReadWrite: {}",
+                path.display()
+            )));
+        }
+        normalized.push(resolved);
+    }
+    Ok(normalized)
+}
+
+fn collect_readwrite_overlay_entries(
+    read_only_paths: &[PathBuf],
+    denied_paths: &[PathBuf],
+) -> Vec<ReadWriteOverlayEntry> {
+    let mut merged = BTreeMap::new();
+    for path in read_only_paths {
+        merged.insert(path.clone(), ReadWriteOverlayKind::ReadOnly);
+    }
+    for path in denied_paths {
+        merged.insert(path.clone(), ReadWriteOverlayKind::Deny);
+    }
+
+    let mut entries = merged
+        .into_iter()
+        .map(|(path, kind)| ReadWriteOverlayEntry { path, kind })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        path_depth(&right.path)
+            .cmp(&path_depth(&left.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
+fn install_readwrite_mount_overlays_on_current_process(
+    overlays: &[ReadWriteOverlayEntry],
+) -> io::Result<()> {
+    if overlays.is_empty() {
+        return Ok(());
+    }
+
+    enter_overlay_mount_namespace()?;
+
+    let scratch_root = create_overlay_scratch_root()?;
+    for (index, overlay) in overlays.iter().enumerate() {
+        match overlay.kind {
+            ReadWriteOverlayKind::ReadOnly => {
+                apply_readonly_bind_mount(&overlay.path)?;
+            }
+            ReadWriteOverlayKind::Deny => {
+                apply_deny_bind_mount(&overlay.path, &scratch_root, index)?;
+            }
+        }
+    }
+
+    let _ = fs::remove_dir(&scratch_root);
+    Ok(())
+}
+
+fn is_overlay_namespace_unavailable_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == libc::EPERM
+                || code == libc::EOPNOTSUPP
+                || code == libc::EINVAL
+                || code == libc::ENOSYS
+    )
+}
+
+fn enter_overlay_mount_namespace() -> io::Result<()> {
+    let userns_result = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if userns_result == 0 {
+        configure_current_process_user_namespace_mapping()?;
+    } else {
+        let error = io::Error::last_os_error();
+        let code = error.raw_os_error();
+        if code != Some(libc::EPERM) && code != Some(libc::EINVAL) {
+            return Err(error);
+        }
+    }
+
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    mark_mount_tree_private()
+}
+
+fn configure_current_process_user_namespace_mapping() -> io::Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+
+    match fs::write("/proc/self/setgroups", "deny\n") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+
+    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn mark_mount_tree_private() -> io::Result<()> {
+    let root = c_path(Path::new("/"))?;
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn create_overlay_scratch_root() -> io::Result<PathBuf> {
+    let mut scratch = std::env::temp_dir();
+    let pid = unsafe { libc::getpid() };
+    scratch.push(format!("procwarden-linux-overlay-{pid}"));
+    if scratch.exists() {
+        let _ = fs::remove_dir_all(&scratch);
+    }
+    fs::create_dir_all(&scratch)?;
+    Ok(scratch)
+}
+
+fn apply_readonly_bind_mount(target: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(target)?;
+    let recursive = metadata.is_dir();
+    bind_mount(target, target, recursive)?;
+    remount_bind_readonly(target, recursive)
+}
+
+fn apply_deny_bind_mount(target: &Path, scratch_root: &Path, index: usize) -> io::Result<()> {
+    let metadata = fs::metadata(target)?;
+    let recursive = metadata.is_dir();
+
+    let placeholder = if recursive {
+        let dir = scratch_root.join(format!("deny-dir-{index}"));
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000))?;
+        dir
+    } else {
+        let file = scratch_root.join(format!("deny-file-{index}"));
+        fs::File::create(&file)?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000))?;
+        file
+    };
+
+    bind_mount(&placeholder, target, recursive)?;
+    remount_bind_readonly(target, recursive)?;
+
+    if recursive {
+        let _ = fs::remove_dir(&placeholder);
+    } else {
+        let _ = fs::remove_file(&placeholder);
+    }
+
+    Ok(())
+}
+
+fn bind_mount(source: &Path, target: &Path, recursive: bool) -> io::Result<()> {
+    let source_c = c_path(source)?;
+    let target_c = c_path(target)?;
+    let mut flags = libc::MS_BIND as libc::c_ulong;
+    if recursive {
+        flags |= libc::MS_REC as libc::c_ulong;
+    }
+
+    if unsafe {
+        libc::mount(
+            source_c.as_ptr(),
+            target_c.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn remount_bind_readonly(target: &Path, recursive: bool) -> io::Result<()> {
+    let target_c = c_path(target)?;
+    let mut flags = (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong;
+    if recursive {
+        flags |= libc::MS_REC as libc::c_ulong;
+    }
+
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target_c.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL bytes: {}", path.display()),
+        )
+    })
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(
