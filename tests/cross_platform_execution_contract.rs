@@ -348,6 +348,11 @@ fn is_skippable_runtime_baseline_failure(kind: RuntimeKind, output: &SandboxExec
                 .stderr
                 .contains("Fatal Python error: init_fs_encoding"))
         || (cfg!(windows)
+            && matches!(kind, RuntimeKind::Python)
+            && output
+                .stderr
+                .contains("Fatal Python error: Failed to import encodings module"))
+        || (cfg!(windows)
             && matches!(kind, RuntimeKind::Node)
             && output.stderr.contains("EPERM: operation not permitted")
             && output.stderr.contains("lstat 'C:\\'"))
