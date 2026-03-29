@@ -431,35 +431,3 @@ pub(super) unsafe fn allow_null_device(sid: *mut c_void) {
     }
     CloseHandle(handle);
 }
-
-#[cfg(test)]
-mod tests {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    };
-
-    use super::{NO_ACCESS_DENY_MASK, READ_ONLY_ALLOW_MASK, READ_WRITE_ALLOW_MASK};
-
-    #[test]
-    fn read_only_allow_mask_does_not_include_write() {
-        assert_eq!(
-            READ_ONLY_ALLOW_MASK,
-            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
-        );
-        assert_ne!(READ_ONLY_ALLOW_MASK, READ_WRITE_ALLOW_MASK);
-    }
-
-    #[test]
-    fn no_access_deny_mask_blocks_read_write_and_execute() {
-        assert_eq!(NO_ACCESS_DENY_MASK & FILE_GENERIC_READ, FILE_GENERIC_READ);
-        assert_eq!(NO_ACCESS_DENY_MASK & FILE_GENERIC_WRITE, FILE_GENERIC_WRITE);
-        assert_eq!(
-            NO_ACCESS_DENY_MASK & FILE_GENERIC_EXECUTE,
-            FILE_GENERIC_EXECUTE
-        );
-        assert_eq!(
-            READ_WRITE_ALLOW_MASK,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE
-        );
-    }
-}

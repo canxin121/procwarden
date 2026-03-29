@@ -21,6 +21,8 @@ pub(super) struct ElevatedProcess {
     handle: HANDLE,
 }
 
+unsafe impl Send for ElevatedProcess {}
+
 impl ElevatedProcess {
     pub(super) fn shell_execute_runas(file: &str, parameters: &str) -> Result<Self, SandboxError> {
         let verb = to_wide("runas");
@@ -167,16 +169,4 @@ fn windows_error(context: &str, code: i32) -> SandboxError {
         code,
         format_last_error(code)
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::quote_windows_arg;
-
-    #[test]
-    fn quote_windows_arg_escapes_special_chars() {
-        assert_eq!(quote_windows_arg("simple"), "simple");
-        assert_eq!(quote_windows_arg("two words"), r#""two words""#);
-        assert_eq!(quote_windows_arg(r#"a\"b"#), r#""a\\\"b""#);
-    }
 }

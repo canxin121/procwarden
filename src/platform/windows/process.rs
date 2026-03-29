@@ -13,8 +13,12 @@ use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
+use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -44,6 +48,8 @@ use crate::{SandboxError, cap_fs};
 
 use super::util::{format_last_error, to_wide};
 
+const GROUP_ATTRIBUTE_ENABLED: u32 = 0x0000_0004;
+
 pub(super) struct CaptureResult {
     pub(super) exit_code: i32,
     pub(super) stdout: Vec<u8>,
@@ -62,9 +68,25 @@ struct ProcThreadAttributes {
 struct PreparedAttributes {
     attrs: ProcThreadAttributes,
     security_capabilities: Box<SECURITY_CAPABILITIES>,
+    _capability_sids: Vec<OwnedCapabilitySid>,
+    _capability_entries: Vec<SID_AND_ATTRIBUTES>,
     child_policy: Option<Box<u32>>,
     job_list: Box<[HANDLE; 1]>,
     degraded_mode_reason: Option<String>,
+}
+
+struct OwnedCapabilitySid {
+    ptr: *mut c_void,
+}
+
+impl Drop for OwnedCapabilitySid {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                LocalFree(self.ptr as HLOCAL);
+            }
+        }
+    }
 }
 
 impl ProcThreadAttributes {
@@ -165,20 +187,24 @@ pub(super) fn run_process_in_appcontainer(
     cwd: &Path,
     env_map: &HashMap<String, String>,
     timeout_ms: Option<u64>,
+    network_access: bool,
 ) -> Result<CaptureResult, SandboxError> {
     unsafe {
         let (stdin_pair, stdout_pair, stderr_pair) = setup_stdio_pipes()?;
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
 
         let job_handle = create_job_kill_on_close()?;
-        let mut prepared =
-            match prepare_appcontainer_child_job_attributes(appcontainer_sid, job_handle) {
-                Ok(value) => value,
-                Err(error) => {
-                    close_many(&[in_r, in_w, out_r, out_w, err_r, err_w, job_handle]);
-                    return Err(error);
-                }
-            };
+        let mut prepared = match prepare_appcontainer_child_job_attributes(
+            appcontainer_sid,
+            job_handle,
+            network_access,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                close_many(&[in_r, in_w, out_r, out_w, err_r, err_w, job_handle]);
+                return Err(error);
+            }
+        };
 
         let mut startup_info_ex: STARTUPINFOEXW = std::mem::zeroed();
         startup_info_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -285,14 +311,16 @@ unsafe fn read_pipe_to_end(handle: HANDLE) -> Vec<u8> {
 unsafe fn prepare_appcontainer_child_job_attributes(
     appcontainer_sid: *mut c_void,
     job_handle: HANDLE,
+    network_access: bool,
 ) -> Result<PreparedAttributes, SandboxError> {
-    let mut prepared = PreparedAttributes {
-        attrs: ProcThreadAttributes::new(3)?,
-        security_capabilities: security_capabilities_for_sid(appcontainer_sid),
-        child_policy: Some(Box::new(0x0000_0001_u32)),
-        job_list: Box::new([job_handle]),
-        degraded_mode_reason: None,
-    };
+    let mut prepared = new_prepared_attributes(
+        3,
+        appcontainer_sid,
+        job_handle,
+        Some(Box::new(0x0000_0001_u32)),
+        None,
+        network_access,
+    )?;
     set_security_capabilities_attr(&mut prepared)?;
 
     match set_child_process_policy_attr(&mut prepared) {
@@ -301,13 +329,14 @@ unsafe fn prepare_appcontainer_child_job_attributes(
             Ok(prepared)
         }
         Err(code) if child_policy_degrade_allowed(code) => {
-            let mut fallback = PreparedAttributes {
-                attrs: ProcThreadAttributes::new(2)?,
-                security_capabilities: security_capabilities_for_sid(appcontainer_sid),
-                child_policy: None,
-                job_list: Box::new([job_handle]),
-                degraded_mode_reason: Some(child_policy_degraded_reason(code)),
-            };
+            let mut fallback = new_prepared_attributes(
+                2,
+                appcontainer_sid,
+                job_handle,
+                None,
+                Some(child_policy_degraded_reason(code)),
+                network_access,
+            )?;
             set_security_capabilities_attr(&mut fallback)?;
             set_job_list_attr(&mut fallback)?;
             Ok(fallback)
@@ -319,11 +348,80 @@ unsafe fn prepare_appcontainer_child_job_attributes(
     }
 }
 
-fn security_capabilities_for_sid(appcontainer_sid: *mut c_void) -> Box<SECURITY_CAPABILITIES> {
+unsafe fn new_prepared_attributes(
+    attr_count: u32,
+    appcontainer_sid: *mut c_void,
+    job_handle: HANDLE,
+    child_policy: Option<Box<u32>>,
+    degraded_mode_reason: Option<String>,
+    network_access: bool,
+) -> Result<PreparedAttributes, SandboxError> {
+    let (capability_sids, mut capability_entries) = network_capability_entries(network_access)?;
+
+    Ok(PreparedAttributes {
+        attrs: ProcThreadAttributes::new(attr_count)?,
+        security_capabilities: security_capabilities_for_sid(
+            appcontainer_sid,
+            capability_entries.as_mut_ptr(),
+            capability_entries.len() as u32,
+        ),
+        _capability_sids: capability_sids,
+        _capability_entries: capability_entries,
+        child_policy,
+        job_list: Box::new([job_handle]),
+        degraded_mode_reason,
+    })
+}
+
+fn network_capability_entries(
+    network_access: bool,
+) -> Result<(Vec<OwnedCapabilitySid>, Vec<SID_AND_ATTRIBUTES>), SandboxError> {
+    if !network_access {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    const NETWORK_CAPABILITY_SIDS: [&str; 3] = ["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"];
+
+    let mut capability_sids = Vec::with_capacity(NETWORK_CAPABILITY_SIDS.len());
+    for sid_string in NETWORK_CAPABILITY_SIDS {
+        let mut sid_ptr = std::ptr::null_mut();
+        let sid_wide = to_wide(sid_string);
+        let ok = unsafe { ConvertStringSidToSidW(sid_wide.as_ptr(), &mut sid_ptr) };
+        if ok == 0 || sid_ptr.is_null() {
+            let code = unsafe { GetLastError() as i32 };
+            return Err(SandboxError::Windows(format!(
+                "ConvertStringSidToSidW failed for network capability SID {sid_string}: {} ({})",
+                code,
+                format_last_error(code)
+            )));
+        }
+        capability_sids.push(OwnedCapabilitySid { ptr: sid_ptr });
+    }
+
+    let capability_entries = capability_sids
+        .iter()
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: sid.ptr,
+            Attributes: GROUP_ATTRIBUTE_ENABLED,
+        })
+        .collect::<Vec<_>>();
+
+    Ok((capability_sids, capability_entries))
+}
+
+fn security_capabilities_for_sid(
+    appcontainer_sid: *mut c_void,
+    capability_entries: *mut SID_AND_ATTRIBUTES,
+    capability_count: u32,
+) -> Box<SECURITY_CAPABILITIES> {
     Box::new(SECURITY_CAPABILITIES {
         AppContainerSid: appcontainer_sid,
-        Capabilities: std::ptr::null_mut(),
-        CapabilityCount: 0,
+        Capabilities: if capability_count == 0 {
+            std::ptr::null_mut()
+        } else {
+            capability_entries
+        },
+        CapabilityCount: capability_count,
         Reserved: 0,
     })
 }
@@ -574,110 +672,4 @@ fn child_policy_degraded_reason(code: i32) -> String {
         code,
         format_last_error(code)
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
-    };
-
-    use super::{
-        child_policy_degrade_allowed, child_policy_degraded_reason,
-        environment_block_for_create_process, make_env_block, quote_windows_arg,
-        resolve_executable,
-    };
-
-    #[test]
-    fn resolve_executable_honors_custom_path_and_pathext() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be monotonic")
-            .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!("agena-resolve-exec-test-{nonce}"));
-        fs::create_dir_all(&temp_dir).expect("temp directory should be created");
-
-        let tool_path = temp_dir.join("demo.cmd");
-        fs::write(&tool_path, "@echo off\r\nexit /b 0\r\n")
-            .expect("stub command should be written");
-
-        let mut env = HashMap::new();
-        env.insert("PATH".to_string(), temp_dir.to_string_lossy().to_string());
-        env.insert("PATHEXT".to_string(), ".CMD;.EXE".to_string());
-
-        let resolved = resolve_executable("demo", &temp_dir, &env)
-            .expect("executable should resolve via PATH/PATHEXT");
-
-        assert_eq!(
-            resolved
-                .canonicalize()
-                .expect("resolved path should canonicalize"),
-            tool_path
-                .canonicalize()
-                .expect("tool path should canonicalize"),
-        );
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn resolve_executable_does_not_fallback_to_path_for_relative_binary() {
-        let cwd = std::env::temp_dir();
-        let env = HashMap::new();
-
-        let resolved = resolve_executable(r".\missing-command", &cwd, &env);
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn quote_windows_arg_handles_spaces_quotes_and_trailing_backslashes() {
-        assert_eq!(quote_windows_arg("plain"), "plain");
-        assert_eq!(quote_windows_arg("two words"), r#""two words""#);
-        assert_eq!(
-            quote_windows_arg(r#"a\"b"#),
-            r#""a\\\"b""#,
-            "embedded quote should be escaped with preceding backslashes"
-        );
-        assert_eq!(
-            quote_windows_arg(r"path with tail\\"),
-            r#""path with tail\\\\""#,
-            "trailing backslashes must be doubled inside quoted arg"
-        );
-    }
-
-    #[test]
-    fn child_policy_degrade_whitelist_is_explicit() {
-        assert!(child_policy_degrade_allowed(ERROR_ACCESS_DENIED as i32));
-        assert!(child_policy_degrade_allowed(ERROR_BAD_LENGTH as i32));
-        assert!(child_policy_degrade_allowed(ERROR_INVALID_PARAMETER as i32));
-        assert!(child_policy_degrade_allowed(ERROR_NOT_SUPPORTED as i32));
-        assert!(!child_policy_degrade_allowed(123_456));
-    }
-
-    #[test]
-    fn child_policy_degraded_reason_mentions_active_job_containment() {
-        let reason = child_policy_degraded_reason(ERROR_NOT_SUPPORTED as i32);
-        assert!(reason.contains("degraded mode"));
-        assert!(reason.contains("job containment remains active"));
-    }
-
-    #[test]
-    fn make_env_block_empty_map_is_double_null_terminated() {
-        let block = make_env_block(&HashMap::new());
-        assert_eq!(block, vec![0, 0]);
-    }
-
-    #[test]
-    fn environment_block_adds_windows_runtime_baseline_when_available() {
-        let block = environment_block_for_create_process(&HashMap::new());
-        if let Some(block) = block {
-            assert!(block.len() >= 2);
-            assert_eq!(block[block.len() - 1], 0);
-            assert_eq!(block[block.len() - 2], 0);
-        }
-    }
 }

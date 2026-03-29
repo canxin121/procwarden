@@ -48,5 +48,8 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Run policy combination matrix tests
+        run: cargo test --test policy_combination_matrix -- --nocapture
+
       - name: Run tests
         run: cargo test --workspace --all-targets -- --nocapture

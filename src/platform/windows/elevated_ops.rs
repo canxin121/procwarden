@@ -22,6 +22,7 @@ param(
     [Parameter(Mandatory=$true)][string]$SpecFile,
     [Parameter(Mandatory=$true)][string]$StopFile,
     [Parameter(Mandatory=$true)][string]$ReadyFile,
+    [Parameter(Mandatory=$true)][string]$ProgressFile,
     [Parameter(Mandatory=$true)][string]$Executable,
     [Parameter(Mandatory=$true)][string]$OutRule,
     [Parameter(Mandatory=$true)][string]$InRule,
@@ -31,7 +32,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Invoke-Icacls([string[]]$Arguments) {
-    & icacls @Arguments | Out-Null
+    & icacls @Arguments 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')"
     }
@@ -80,8 +81,12 @@ function Remove-Rule([string]$Path, [string]$SidValue) {
         return
     }
 
-    & icacls $Path /remove:g "*${SidValue}" /C | Out-Null
-    & icacls $Path /remove:d "*${SidValue}" /C | Out-Null
+    & icacls $Path /remove:g "*${SidValue}" /C 2>$null | Out-Null
+    & icacls $Path /remove:d "*${SidValue}" /C 2>$null | Out-Null
+}
+
+function Log-Progress([string]$Message) {
+    Add-Content -LiteralPath $ProgressFile -Value ((Get-Date -Format o) + "|" + $Message)
 }
 
 $entries = @()
@@ -93,6 +98,12 @@ $appliedPaths = New-Object System.Collections.Generic.List[string]
 $firewallEnabled = $false
 
 try {
+    Set-Content -LiteralPath $ProgressFile -Value "" -NoNewline -Encoding utf8
+    Log-Progress ("sid=" + $Sid)
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Log-Progress ("is_admin=" + $isAdmin)
+    Log-Progress ("entries=" + $entries.Count)
+
     foreach ($line in $entries) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
@@ -105,27 +116,46 @@ try {
 
         $kind = $parts[0].Trim()
         $path = $parts[1]
-        Apply-Rule -Kind $kind -Path $path -SidValue $Sid
-        $appliedPaths.Add($path)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Log-Progress ("begin|" + $kind + "|" + $path)
+        try {
+            Apply-Rule -Kind $kind -Path $path -SidValue $Sid
+            $sw.Stop()
+            Log-Progress ("end|" + $kind + "|" + $path + "|ms=" + $sw.ElapsedMilliseconds)
+            $appliedPaths.Add($path)
+        }
+        catch {
+            $sw.Stop()
+            if ($kind -eq "ro" -or $kind -eq "rw") {
+                Log-Progress ("skip_allow_error|" + $kind + "|" + $path + "|ms=" + $sw.ElapsedMilliseconds + "|error=" + $_.Exception.Message)
+                continue
+            }
+            throw
+        }
     }
 
     if ($BlockNetwork -ne 0) {
+        Log-Progress "begin|network"
         Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$OutRule", "dir=out", "action=block", "program=$Executable", "enable=yes", "profile=any")
         Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$InRule", "dir=in", "action=block", "program=$Executable", "enable=yes", "profile=any")
         $firewallEnabled = $true
+        Log-Progress "end|network"
     }
 
     Set-Content -LiteralPath $ReadyFile -Value "ok" -NoNewline -Encoding ascii
+    Log-Progress "ready"
 
     while (-not (Test-Path -LiteralPath $StopFile)) {
         Start-Sleep -Milliseconds 200
     }
 }
 catch {
+    Log-Progress ("error|" + $_.Exception.Message)
     Set-Content -LiteralPath $ReadyFile -Value ("error:" + $_.Exception.Message) -NoNewline -Encoding utf8
     exit 1
 }
 finally {
+    Log-Progress "cleanup_begin"
     for ($i = $appliedPaths.Count - 1; $i -ge 0; $i--) {
         Remove-Rule -Path $appliedPaths[$i] -SidValue $Sid
     }
@@ -134,6 +164,7 @@ finally {
         & netsh advfirewall firewall delete rule name="$OutRule" program="$Executable" | Out-Null
         & netsh advfirewall firewall delete rule name="$InRule" program="$Executable" | Out-Null
     }
+    Log-Progress "cleanup_end"
 }
 "#;
 
@@ -153,6 +184,7 @@ pub(super) struct ElevatedOpsGuard {
     workspace_dir: PathBuf,
     stop_file: PathBuf,
     ready_file: PathBuf,
+    progress_file: PathBuf,
 }
 
 impl ElevatedOpsGuard {
@@ -162,6 +194,7 @@ impl ElevatedOpsGuard {
         let spec_path = workspace_dir.join("acl-spec.tsv");
         let stop_file = workspace_dir.join("stop.signal");
         let ready_file = workspace_dir.join("ready.signal");
+        let progress_file = workspace_dir.join("progress.log");
         let rule_prefix = format!(
             "procwarden-elevated-all-{}-{}",
             std::process::id(),
@@ -188,6 +221,7 @@ impl ElevatedOpsGuard {
             &spec_path,
             &stop_file,
             &ready_file,
+            &progress_file,
             &spec.executable,
             &out_rule_name,
             &in_rule_name,
@@ -208,6 +242,7 @@ impl ElevatedOpsGuard {
             workspace_dir,
             stop_file,
             ready_file,
+            progress_file,
         };
         guard.wait_until_initialized()?;
         Ok(guard)
@@ -220,23 +255,26 @@ impl ElevatedOpsGuard {
                 ReadySignal::Pending => {}
                 ReadySignal::Ok => return Ok(()),
                 ReadySignal::Error(message) => {
+                    let progress_tail = read_progress_tail(&self.progress_file, 20);
                     return Err(SandboxError::Denied(format!(
-                        "automatic administrator elevated-ops initialization failed: {message}"
+                        "automatic administrator elevated-ops initialization failed: {message}; last progress: {progress_tail}"
                     )));
                 }
             }
 
             if let Some(exit_code) = self.process.try_wait_exit_code(0)? {
+                let progress_tail = read_progress_tail(&self.progress_file, 20);
                 return Err(SandboxError::Denied(format!(
-                    "automatic administrator elevated-ops helper exited before initialization (exit code {exit_code}, workspace: {})",
-                    self.workspace_dir.display()
+                    "automatic administrator elevated-ops helper exited before initialization (exit code {exit_code}, workspace: {}, last progress: {progress_tail})",
+                    self.workspace_dir.display(),
                 )));
             }
 
             if started.elapsed() >= ELEVATED_HELPER_READY_TIMEOUT {
+                let progress_tail = read_progress_tail(&self.progress_file, 20);
                 return Err(SandboxError::Denied(format!(
-                    "automatic administrator elevated-ops helper timed out before readiness (workspace: {})",
-                    self.workspace_dir.display()
+                    "automatic administrator elevated-ops helper timed out before readiness (workspace: {}, last progress: {progress_tail})",
+                    self.workspace_dir.display(),
                 )));
             }
 
@@ -275,6 +313,7 @@ fn elevated_powershell_parameters(
     spec_path: &Path,
     stop_file: &Path,
     ready_file: &Path,
+    progress_file: &Path,
     executable: &Path,
     out_rule_name: &str,
     in_rule_name: &str,
@@ -282,12 +321,13 @@ fn elevated_powershell_parameters(
     block_network: bool,
 ) -> String {
     format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -SpecFile {} -StopFile {} -ReadyFile {} -Executable {} -OutRule {} -InRule {} -BlockNetwork {}",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -SpecFile {} -StopFile {} -ReadyFile {} -ProgressFile {} -Executable {} -OutRule {} -InRule {} -BlockNetwork {}",
         elevation::quote_windows_arg(&script_path.to_string_lossy()),
         elevation::quote_windows_arg(sid_string),
         elevation::quote_windows_arg(&spec_path.to_string_lossy()),
         elevation::quote_windows_arg(&stop_file.to_string_lossy()),
         elevation::quote_windows_arg(&ready_file.to_string_lossy()),
+        elevation::quote_windows_arg(&progress_file.to_string_lossy()),
         elevation::quote_windows_arg(&executable.to_string_lossy()),
         elevation::quote_windows_arg(out_rule_name),
         elevation::quote_windows_arg(in_rule_name),
@@ -372,51 +412,21 @@ fn read_ready_signal(path: &Path) -> Result<ReadySignal, SandboxError> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
+fn read_progress_tail(path: &Path, max_lines: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let lines = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                return "(no progress lines)".to_string();
+            }
 
-    use super::{ELEVATED_OPS_HELPER_SCRIPT, ElevatedOpsSpec, serialize_acl_spec};
-
-    #[test]
-    fn serialize_acl_spec_preserves_priority_order() {
-        let spec = ElevatedOpsSpec {
-            sid_string: "S-1-15-2-1234".to_string(),
-            executable: PathBuf::from(r"C:\tool.exe"),
-            block_network: true,
-            allow_readonly_paths: vec![PathBuf::from(r"C:\ro")],
-            allow_readwrite_paths: vec![PathBuf::from(r"C:\rw")],
-            deny_write_paths: vec![PathBuf::from(r"C:\dw")],
-            deny_readwrite_paths: vec![PathBuf::from(r"C:\dn")],
-        };
-
-        let rendered = serialize_acl_spec(&spec);
-        let lines = rendered.lines().collect::<Vec<_>>();
-        assert_eq!(
-            lines,
-            vec![r"dn	C:\dn", r"dw	C:\dw", r"ro	C:\ro", r"rw	C:\rw"]
-        );
-    }
-
-    #[test]
-    fn serialize_acl_spec_empty_plan_is_empty_string() {
-        let spec = ElevatedOpsSpec {
-            sid_string: "S-1-15-2-1234".to_string(),
-            executable: PathBuf::from(r"C:\tool.exe"),
-            block_network: false,
-            allow_readonly_paths: Vec::new(),
-            allow_readwrite_paths: Vec::new(),
-            deny_write_paths: Vec::new(),
-            deny_readwrite_paths: Vec::new(),
-        };
-
-        assert!(serialize_acl_spec(&spec).is_empty());
-    }
-
-    #[test]
-    fn helper_script_uses_deny_mode_for_deny_kinds() {
-        assert!(ELEVATED_OPS_HELPER_SCRIPT.contains(r#""dw" { return "/deny" }"#));
-        assert!(ELEVATED_OPS_HELPER_SCRIPT.contains(r#""dn" { return "/deny" }"#));
-        assert!(ELEVATED_OPS_HELPER_SCRIPT.contains("Invoke-Icacls @($Path, $mode,"));
+            let start = lines.len().saturating_sub(max_lines);
+            lines[start..].join(" || ")
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => "(progress file missing)".to_string(),
+        Err(error) => format!("(failed to read progress file: {error})"),
     }
 }

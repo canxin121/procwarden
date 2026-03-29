@@ -1,0 +1,336 @@
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::io::Write;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use procwarden::{
+    SandboxAccess, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxManager,
+    SandboxPathPermission, SandboxPolicy,
+};
+
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub fn new(prefix: &str) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("procwarden-tests-{prefix}-{nonce}"));
+        fs::create_dir_all(&path).expect("temp directory should be created");
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub struct Fixture {
+    _workspace: TempDir,
+    _outside: TempDir,
+    pub runtime_cwd: PathBuf,
+    pub ro_dir: PathBuf,
+    pub rw_dir: PathBuf,
+    pub deny_dir: PathBuf,
+    pub outside_dir: PathBuf,
+    pub ro_seed: PathBuf,
+    pub deny_seed: PathBuf,
+    pub outside_seed: PathBuf,
+}
+
+impl Fixture {
+    pub fn new(prefix: &str) -> Self {
+        let workspace = TempDir::new(&format!("{prefix}-workspace"));
+        let outside = TempDir::new(&format!("{prefix}-outside"));
+
+        let runtime_cwd = workspace.path().join("runtime-cwd");
+        let ro_dir = workspace.path().join("readonly");
+        let rw_dir = workspace.path().join("readwrite");
+        let deny_dir = workspace.path().join("deny");
+        let outside_dir = outside.path().join("outside");
+
+        for dir in [&runtime_cwd, &ro_dir, &rw_dir, &deny_dir, &outside_dir] {
+            fs::create_dir_all(dir).expect("fixture directory should be created");
+        }
+
+        let ro_seed = ro_dir.join("seed-ro.txt");
+        let deny_seed = deny_dir.join("seed-deny.txt");
+        let outside_seed = outside_dir.join("seed-outside.txt");
+        fs::write(&ro_seed, "readonly-seed").expect("readonly seed should be created");
+        fs::write(&deny_seed, "deny-seed").expect("deny seed should be created");
+        fs::write(&outside_seed, "outside-seed").expect("outside seed should be created");
+
+        Self {
+            _workspace: workspace,
+            _outside: outside,
+            runtime_cwd,
+            ro_dir,
+            rw_dir,
+            deny_dir,
+            outside_dir,
+            ro_seed,
+            deny_seed,
+            outside_seed,
+        }
+    }
+}
+
+pub fn policy(
+    default_access: SandboxAccess,
+    network_access: bool,
+    path_permissions: Vec<SandboxPathPermission>,
+) -> SandboxPolicy {
+    SandboxPolicy {
+        path_permissions,
+        default_access,
+        network_access,
+    }
+}
+
+pub fn sandbox_request(command: Vec<String>, cwd: &Path, timeout_ms: u64) -> SandboxCommandRequest {
+    SandboxCommandRequest {
+        command,
+        cwd: cwd.to_path_buf(),
+        env: sandbox_env(),
+        timeout_ms: Some(timeout_ms),
+    }
+}
+
+pub fn sandbox_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "HOME",
+        "USERPROFILE",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
+    env
+}
+
+pub fn read_command(target: &Path) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let escaped_target = escape_powershell_single_quoted(target);
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ [System.IO.File]::ReadAllText('{escaped_target}') | Out-Null; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cat \"$1\" > /dev/null".to_string(),
+            "sh".to_string(),
+            path_arg(target),
+        ]
+    }
+}
+
+pub fn write_command(target: &Path, payload: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let escaped_target = escape_powershell_single_quoted(target);
+        let escaped_payload = payload.replace('\'', "''");
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ [System.IO.File]::WriteAllText('{escaped_target}', '{escaped_payload}'); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$2\" > \"$1\"".to_string(),
+            "sh".to_string(),
+            path_arg(target),
+            payload.to_string(),
+        ]
+    }
+}
+
+pub fn connect_command(host: &str, port: u16, timeout_ms: u64) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let connect_timeout_s = u64::max(1, timeout_ms.div_ceil(1_000));
+        let max_time_s = connect_timeout_s.saturating_add(2);
+        let scheme = if port == 443 { "https" } else { "http" };
+        let mut command = vec![
+            "curl.exe".to_string(),
+            "--silent".to_string(),
+            "--show-error".to_string(),
+            "--output".to_string(),
+            "NUL".to_string(),
+            "--connect-timeout".to_string(),
+            connect_timeout_s.to_string(),
+            "--max-time".to_string(),
+            max_time_s.to_string(),
+        ];
+        if scheme == "https" {
+            command.push("--insecure".to_string());
+        }
+        command.push(format!("{scheme}://{host}:{port}/"));
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script = r#"import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(float(sys.argv[3]) / 1000.0)
+try:
+    sock.connect((sys.argv[1], int(sys.argv[2])))
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    sock.close()
+"#;
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            host.to_string(),
+            port.to_string(),
+            timeout_ms.to_string(),
+        ]
+    }
+}
+
+pub fn execute_case(
+    manager: &SandboxManager,
+    request: &SandboxCommandRequest,
+    policy: &SandboxPolicy,
+    context: &str,
+) -> SandboxExecOutput {
+    manager
+        .execute(request, policy)
+        .unwrap_or_else(|error| panic!("{context}: manager execution failed: {error:?}"))
+}
+
+pub fn assert_denied_or_failed(
+    manager: &SandboxManager,
+    request: &SandboxCommandRequest,
+    policy: &SandboxPolicy,
+    context: &str,
+) {
+    match manager.execute(request, policy) {
+        Ok(output) => assert_failure(&output, context),
+        Err(SandboxError::Denied(_)) | Err(SandboxError::InvalidRequest(_)) => {}
+        Err(error) => panic!("{context}: unexpected manager error: {error:?}"),
+    }
+}
+
+pub fn assert_success(output: &SandboxExecOutput, context: &str) {
+    assert_eq!(
+        output.exit_code, 0,
+        "{context}: expected success, stdout: {}, stderr: {}",
+        output.stdout, output.stderr
+    );
+}
+
+pub fn assert_failure(output: &SandboxExecOutput, context: &str) {
+    assert_ne!(
+        output.exit_code, 0,
+        "{context}: expected failure but command succeeded"
+    );
+}
+
+pub fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn escape_powershell_single_quoted(path: &Path) -> String {
+    path_arg(path).replace('\'', "''")
+}
+
+pub fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        let start = Instant::now();
+        let mut accepted = false;
+        while start.elapsed() < timeout {
+            match listener.accept() {
+                Ok((_stream, _addr)) => {
+                    accepted = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(accepted);
+    });
+    rx
+}
+
+pub fn spawn_http_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        let start = Instant::now();
+        let mut accepted = false;
+        while start.elapsed() < timeout {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                    let _ = stream.flush();
+                    accepted = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(accepted);
+    });
+    rx
+}

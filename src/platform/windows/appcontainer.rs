@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Component;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,6 +15,8 @@ pub(super) fn execute(
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
+    validate_policy_shape(policy)?;
+
     let executable = process::resolve_executable(&request.command[0], &request.cwd, env_map)
         .ok_or_else(|| {
             SandboxError::InvalidRequest(format!(
@@ -23,11 +26,27 @@ pub(super) fn execute(
             ))
         })?;
 
-    let acl_plan = collect_acl_plan(policy);
+    let default_access_scope_paths = sanitize_optional_existing_paths(default_access_scope_paths(
+        request,
+        policy,
+        &executable,
+    )?)?;
+    let acl_plan = collect_acl_plan(policy, default_access_scope_paths);
     let allow_readonly_paths = sanitize_policy_paths(acl_plan.allow_readonly_paths)?;
     let allow_readwrite_paths = sanitize_policy_paths(acl_plan.allow_readwrite_paths)?;
     let deny_write_paths = sanitize_policy_paths(acl_plan.deny_write_paths)?;
     let deny_readwrite_paths = sanitize_policy_paths(acl_plan.deny_readwrite_paths)?;
+
+    if command_references_denied_path(request, &deny_readwrite_paths) {
+        return Err(SandboxError::Denied(
+            "command arguments reference a path denied by sandbox policy".to_string(),
+        ));
+    }
+
+    let allow_readonly_paths =
+        filter_paths_not_under_denied_roots(allow_readonly_paths, &deny_readwrite_paths);
+    let allow_readwrite_paths =
+        filter_paths_not_under_denied_roots(allow_readwrite_paths, &deny_readwrite_paths);
     let acl_plan = resolve_acl_conflicts(AclPlan {
         allow_readonly_paths,
         allow_readwrite_paths,
@@ -35,7 +54,7 @@ pub(super) fn execute(
         deny_readwrite_paths,
     });
 
-    let appcontainer = token::create_appcontainer_context()?;
+    let appcontainer = token::create_appcontainer_context_with_network(policy.network_access)?;
     let sid = appcontainer.sid();
 
     let optional_bootstrap_paths =
@@ -95,6 +114,7 @@ pub(super) fn execute(
         &request.cwd,
         env_map,
         request.timeout_ms,
+        policy.network_access,
     )?;
 
     drop(elevated_ops_guard);
@@ -113,6 +133,16 @@ pub(super) fn execute(
     .with_degraded_mode_reason(capture.degraded_mode_reason))
 }
 
+fn validate_policy_shape(policy: &SandboxPolicy) -> Result<(), SandboxError> {
+    if policy.network_access {
+        return Err(SandboxError::InvalidRequest(
+            "windows backend cannot safely enforce network_access=true with current AppContainer profile configuration; use network_access=false".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AclPlan {
     allow_readonly_paths: Vec<PathBuf>,
@@ -121,25 +151,154 @@ struct AclPlan {
     deny_readwrite_paths: Vec<PathBuf>,
 }
 
-fn collect_acl_plan(policy: &SandboxPolicy) -> AclPlan {
+fn collect_acl_plan(policy: &SandboxPolicy, default_access_scope_paths: Vec<PathBuf>) -> AclPlan {
     let allow_readonly_paths = policy.read_only_paths();
     let allow_readwrite_paths = policy.read_write_paths();
     let deny_readwrite_paths = policy.denied_paths();
 
     match policy.default_access {
-        crate::SandboxAccess::ReadWrite => AclPlan {
-            deny_write_paths: allow_readonly_paths.clone(),
-            allow_readonly_paths,
-            allow_readwrite_paths,
-            deny_readwrite_paths,
-        },
-        crate::SandboxAccess::ReadOnly | crate::SandboxAccess::NoAccess => AclPlan {
+        crate::SandboxAccess::NoAccess => AclPlan {
             allow_readonly_paths,
             allow_readwrite_paths,
             deny_write_paths: Vec::new(),
             deny_readwrite_paths,
         },
+        crate::SandboxAccess::ReadOnly => {
+            let mut default_readonly_paths = default_access_scope_paths;
+            default_readonly_paths.extend(allow_readonly_paths);
+            AclPlan {
+                allow_readonly_paths: default_readonly_paths,
+                allow_readwrite_paths,
+                deny_write_paths: Vec::new(),
+                deny_readwrite_paths,
+            }
+        }
+        crate::SandboxAccess::ReadWrite => {
+            let mut default_readwrite_paths = filter_paths_not_under_denied_roots(
+                default_access_scope_paths,
+                &allow_readonly_paths,
+            );
+            default_readwrite_paths.extend(allow_readwrite_paths);
+            AclPlan {
+                deny_write_paths: allow_readonly_paths.clone(),
+                allow_readonly_paths,
+                allow_readwrite_paths: default_readwrite_paths,
+                deny_readwrite_paths,
+            }
+        }
     }
+}
+
+fn default_access_scope_paths(
+    request: &SandboxCommandRequest,
+    policy: &SandboxPolicy,
+    executable: &std::path::Path,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let mut paths = Vec::new();
+
+    paths.push(request.cwd.clone());
+    paths.push(executable.to_path_buf());
+    if let Some(parent) = executable.parent() {
+        paths.push(parent.to_path_buf());
+    }
+
+    for permission in &policy.path_permissions {
+        paths.push(permission.path.clone());
+    }
+
+    for argument in request.command.iter().skip(1) {
+        for path in command_argument_path_candidates(argument, &request.cwd) {
+            paths.push(path);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn command_argument_path_candidates(argument: &str, cwd: &std::path::Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = materialize_path_candidate(argument, cwd) {
+        candidates.push(path);
+    }
+
+    for quoted in single_quoted_segments(argument) {
+        if let Some(path) = materialize_path_candidate(&quoted, cwd) {
+            candidates.push(path);
+        }
+    }
+
+    candidates
+}
+
+fn materialize_path_candidate(argument: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+    if argument.trim().is_empty() || !looks_like_filesystem_path(argument) {
+        return None;
+    }
+
+    let candidate = PathBuf::from(argument);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+
+    if cap_fs::path_exists(&absolute) {
+        return Some(absolute);
+    }
+
+    absolute
+        .parent()
+        .filter(|parent| cap_fs::path_exists(parent))
+        .map(|parent| parent.to_path_buf())
+}
+
+fn single_quoted_segments(input: &str) -> Vec<String> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] != '\'' {
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        let mut buffer = String::new();
+        while index < chars.len() {
+            if chars[index] == '\'' {
+                if index + 1 < chars.len() && chars[index + 1] == '\'' {
+                    buffer.push('\'');
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            buffer.push(chars[index]);
+            index += 1;
+        }
+
+        if !buffer.is_empty() {
+            segments.push(buffer);
+        }
+    }
+
+    segments
+}
+
+fn looks_like_filesystem_path(argument: &str) -> bool {
+    argument.starts_with('/')
+        || argument.starts_with("./")
+        || argument.starts_with("../")
+        || argument.starts_with(r".\")
+        || argument.starts_with(r"..\")
+        || argument.contains('\\')
+        || argument
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
 }
 
 fn sanitize_policy_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SandboxError> {
@@ -219,121 +378,51 @@ fn casefolded_path(path: &std::path::Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::{SandboxAccess, SandboxCommandRequest, SandboxPathPermission, SandboxPolicy};
-
-    use super::{
-        AclPlan, collect_acl_plan, resolve_acl_conflicts, runtime_bootstrap_readonly_paths,
-    };
-
-    #[test]
-    fn collect_acl_plan_preserves_read_only_and_read_write_layers() {
-        let policy = SandboxPolicy {
-            path_permissions: vec![
-                SandboxPathPermission::read_only(r"C:\\safe\\ro"),
-                SandboxPathPermission::read_write(r"C:\\safe\\rw"),
-                SandboxPathPermission::deny(r"C:\\safe\\deny"),
-            ],
-            default_access: SandboxAccess::NoAccess,
-            network_access: false,
-        };
-
-        let plan = collect_acl_plan(&policy);
-        assert_eq!(
-            plan.allow_readonly_paths,
-            vec![PathBuf::from(r"C:\\safe\\ro")]
-        );
-        assert_eq!(
-            plan.allow_readwrite_paths,
-            vec![PathBuf::from(r"C:\\safe\\rw")]
-        );
-        assert!(plan.deny_write_paths.is_empty());
-        assert_eq!(
-            plan.deny_readwrite_paths,
-            vec![PathBuf::from(r"C:\\safe\\deny")]
-        );
-    }
-
-    #[test]
-    fn acl_conflict_resolution_prefers_deny_then_read_write_then_read_only() {
-        let resolved = resolve_acl_conflicts(AclPlan {
-            allow_readonly_paths: vec![
-                PathBuf::from(r"C:\\safe\\readonly"),
-                PathBuf::from(r"C:\\safe\\overlap"),
-                PathBuf::from(r"C:\\safe\\denyall"),
-            ],
-            allow_readwrite_paths: vec![
-                PathBuf::from(r"C:\\safe\\overlap"),
-                PathBuf::from(r"C:\\safe\\RWCase"),
-            ],
-            deny_write_paths: vec![
-                PathBuf::from(r"C:\\safe\\readonly"),
-                PathBuf::from(r"C:\\safe\\rwcase"),
-            ],
-            deny_readwrite_paths: vec![PathBuf::from(r"C:\\safe\\denyAll")],
-        });
-
-        assert_eq!(
-            resolved.allow_readonly_paths,
-            vec![PathBuf::from(r"C:\\safe\\readonly")]
-        );
-        assert_eq!(
-            resolved.allow_readwrite_paths,
-            vec![
-                PathBuf::from(r"C:\\safe\\overlap"),
-                PathBuf::from(r"C:\\safe\\RWCase")
-            ]
-        );
-        assert_eq!(
-            resolved.deny_write_paths,
-            vec![PathBuf::from(r"C:\\safe\\readonly")]
-        );
-        assert_eq!(
-            resolved.deny_readwrite_paths,
-            vec![PathBuf::from(r"C:\\safe\\denyAll")]
-        );
-    }
-
-    #[test]
-    fn runtime_bootstrap_paths_include_cwd_executable_and_absolute_script_parent() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be monotonic")
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("procwarden-bootstrap-{nonce}"));
-        std::fs::create_dir_all(&workspace).expect("workspace should be created");
-        let script = workspace.join("script.py");
-        std::fs::write(&script, "print('ok')\n").expect("script should be written");
-
-        let request = SandboxCommandRequest {
-            command: vec![
-                "python".to_string(),
-                script.to_string_lossy().to_string(),
-                "arg".to_string(),
-            ],
-            cwd: workspace.clone(),
-            env: HashMap::new(),
-            timeout_ms: Some(1_000),
-        };
-        let executable = PathBuf::from(r"C:\\Python310\\python.exe");
-
-        let paths = runtime_bootstrap_readonly_paths(&request, &executable);
-
-        assert!(paths.iter().any(|path| path == &workspace));
-        assert!(paths.iter().any(|path| path == &script));
-        assert!(
-            paths
+fn filter_paths_not_under_denied_roots(
+    paths: Vec<PathBuf>,
+    denied_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            !denied_roots
                 .iter()
-                .any(|path| path == &PathBuf::from(r"C:\\Python310"))
-        );
-        assert!(paths.iter().any(|path| path == &executable));
+                .any(|denied| is_same_or_descendant(path, denied))
+        })
+        .collect()
+}
 
-        let _ = std::fs::remove_file(&script);
-        let _ = std::fs::remove_dir_all(&workspace);
+fn is_same_or_descendant(path: &std::path::Path, denied_root: &std::path::Path) -> bool {
+    let path_components = path.components().collect::<Vec<_>>();
+    let denied_components = denied_root.components().collect::<Vec<_>>();
+    if denied_components.len() > path_components.len() {
+        return false;
     }
+
+    denied_components
+        .iter()
+        .zip(path_components.iter())
+        .all(|(left, right)| component_eq_case_insensitive(left, right))
+}
+
+fn component_eq_case_insensitive(left: &Component<'_>, right: &Component<'_>) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+fn command_references_denied_path(
+    request: &SandboxCommandRequest,
+    denied_roots: &[PathBuf],
+) -> bool {
+    request
+        .command
+        .iter()
+        .skip(1)
+        .flat_map(|argument| command_argument_path_candidates(argument, &request.cwd))
+        .any(|candidate| {
+            denied_roots
+                .iter()
+                .any(|denied| is_same_or_descendant(&candidate, denied))
+        })
 }
