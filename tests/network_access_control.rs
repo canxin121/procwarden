@@ -63,16 +63,21 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
         .port();
     let accepted_rx = spawn_http_probe(listener, Duration::from_secs(2));
 
-    let loopback_output = execute_case(
-        &manager,
-        &sandbox_request(
-            connect_command("127.0.0.1", port, 1_500),
-            &fixture.runtime_cwd,
-            2_500,
-        ),
-        &test_policy,
-        "network_disabled loopback connect",
+    let loopback_request = sandbox_request(
+        connect_command("127.0.0.1", port, 1_500),
+        &fixture.runtime_cwd,
+        2_500,
     );
+    let loopback_result = manager.execute(&loopback_request, &test_policy);
+    if should_skip_windows_wfp_unavailable(&loopback_result) {
+        eprintln!(
+            "skip network_disabled test because Windows WFP is unsupported in this environment"
+        );
+        return;
+    }
+    let loopback_output = loopback_result.unwrap_or_else(|error| {
+        panic!("network_disabled loopback connect: manager execution failed: {error:?}")
+    });
     assert_failure(&loopback_output, "network_disabled loopback connect");
 
     let accepted = accepted_rx
@@ -94,4 +99,23 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
         "network_disabled external connect",
     );
     assert_failure(&external_output, "network_disabled external connect");
+}
+
+fn should_skip_windows_wfp_unavailable(
+    result: &Result<procwarden::SandboxExecOutput, SandboxError>,
+) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            result,
+            Err(SandboxError::Windows(message))
+                if message.contains("FwpmEngineOpen0 failed: 50")
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = result;
+        false
+    }
 }

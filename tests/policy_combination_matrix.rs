@@ -290,6 +290,9 @@ fn macos_read_only_default_can_combine_read_write_and_deny() {
 }
 
 fn expected_for_current_platform(case: &CombinationCase) -> Expectation {
+    let _ = case.linux_expectation;
+    let _ = case.macos_expectation;
+
     #[cfg(target_os = "linux")]
     {
         case.linux_expectation
