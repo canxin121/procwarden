@@ -5,8 +5,8 @@ mod common;
 use procwarden::{SandboxAccess, SandboxError, SandboxManager, SandboxPathPermission};
 
 use common::{
-    assert_failure, assert_success, execute_case, policy, read_command, sandbox_request,
-    write_command, Fixture,
+    Fixture, assert_failure, assert_success, execute_case, policy, read_command, sandbox_request,
+    write_command,
 };
 
 #[derive(Clone, Copy)]
