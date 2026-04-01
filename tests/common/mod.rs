@@ -365,8 +365,16 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
     let candidates = {
         let mut roots = vec![
             PathBuf::from("/bin"),
+            PathBuf::from("/dev"),
+            PathBuf::from("/etc"),
+            PathBuf::from("/private/etc"),
+            PathBuf::from("/private/var/db/timezone"),
             PathBuf::from("/usr/bin"),
             PathBuf::from("/usr/lib"),
+            PathBuf::from("/usr/share"),
+            PathBuf::from("/usr/share/icu"),
+            PathBuf::from("/usr/share/zoneinfo"),
+            PathBuf::from("/usr/share/zoneinfo.default"),
             PathBuf::from("/System"),
             PathBuf::from("/System/Library"),
         ];
@@ -380,6 +388,14 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
                 && let Some(parent) = canonical.parent()
             {
                 roots.push(parent.to_path_buf());
+
+                if let Some(usr_root) = parent.parent() {
+                    roots.push(usr_root.join("lib"));
+
+                    if let Some(runtime_root) = usr_root.parent() {
+                        roots.push(runtime_root.join("System/Library"));
+                    }
+                }
             }
         }
 
