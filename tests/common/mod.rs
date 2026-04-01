@@ -272,11 +272,14 @@ pub fn assert_denied_or_failed(
 }
 
 pub fn assert_success(output: &SandboxExecOutput, context: &str) {
-    assert_eq!(
-        output.exit_code, 0,
-        "{context}: expected success, stdout: {}, stderr: {}",
-        output.stdout, output.stderr
-    );
+    if output.exit_code != 0 {
+        let sandbox_excerpt = macos_recent_sandbox_log_excerpt();
+        assert_eq!(
+            output.exit_code, 0,
+            "{context}: expected success, stdout: {}, stderr: {}, sandbox_log: {}",
+            output.stdout, output.stderr, sandbox_excerpt
+        );
+    }
 }
 
 pub fn assert_failure(output: &SandboxExecOutput, context: &str) {
@@ -330,10 +333,7 @@ pub fn no_access_policy_with_runtime_roots(
     network_access: bool,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
-    let mut permissions = runtime_readable_roots()
-        .into_iter()
-        .map(SandboxPathPermission::read_only)
-        .collect::<Vec<_>>();
+    let mut permissions = runtime_bootstrap_permissions();
     permissions.extend(path_permissions);
 
     let mut deduped = Vec::new();
@@ -347,6 +347,31 @@ pub fn no_access_policy_with_runtime_roots(
     }
 
     policy(SandboxAccess::NoAccess, network_access, deduped)
+}
+
+fn runtime_bootstrap_permissions() -> Vec<SandboxPathPermission> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut permissions = runtime_readable_roots()
+            .into_iter()
+            .map(SandboxPathPermission::read_only)
+            .collect::<Vec<_>>();
+        for device_path in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] {
+            let path = PathBuf::from(device_path);
+            if path.exists() {
+                permissions.push(SandboxPathPermission::read_write(path));
+            }
+        }
+        permissions
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime_readable_roots()
+            .into_iter()
+            .map(SandboxPathPermission::read_only)
+            .collect::<Vec<_>>()
+    }
 }
 
 fn runtime_readable_roots() -> Vec<PathBuf> {
@@ -365,8 +390,16 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
     let candidates = {
         let mut roots = vec![
             PathBuf::from("/bin"),
+            PathBuf::from("/dev"),
+            PathBuf::from("/etc"),
+            PathBuf::from("/private/etc"),
+            PathBuf::from("/private/var/db/timezone"),
             PathBuf::from("/usr/bin"),
             PathBuf::from("/usr/lib"),
+            PathBuf::from("/usr/share"),
+            PathBuf::from("/usr/share/icu"),
+            PathBuf::from("/usr/share/zoneinfo"),
+            PathBuf::from("/usr/share/zoneinfo.default"),
             PathBuf::from("/System"),
             PathBuf::from("/System/Library"),
         ];
@@ -380,6 +413,14 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
                 && let Some(parent) = canonical.parent()
             {
                 roots.push(parent.to_path_buf());
+
+                if let Some(usr_root) = parent.parent() {
+                    roots.push(usr_root.join("lib"));
+
+                    if let Some(runtime_root) = usr_root.parent() {
+                        roots.push(runtime_root.join("System/Library"));
+                    }
+                }
             }
         }
 
@@ -406,6 +447,53 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
 
 fn escape_powershell_single_quoted(path: &Path) -> String {
     path_arg(path).replace('\'', "''")
+}
+
+fn macos_recent_sandbox_log_excerpt() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("log")
+            .args([
+                "show",
+                "--style",
+                "compact",
+                "--last",
+                "2m",
+                "--predicate",
+                r#"subsystem == "com.apple.sandbox" OR eventMessage CONTAINS[c] "deny""#,
+            ])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let lines = text
+                    .lines()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    "<no macOS sandbox log entries>".to_string()
+                } else {
+                    lines.join(" | ")
+                }
+            }
+            Ok(output) => format!(
+                "<log show failed: status={:?}, stderr={}>",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("<log show unavailable: {error}>"),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        String::new()
+    }
 }
 
 pub fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {

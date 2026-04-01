@@ -43,6 +43,10 @@ pub(super) fn execute(
 
 fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
     let mut lines = vec!["(version 1)".to_string(), "(allow default)".to_string()];
+    let read_only_paths = dedupe_paths(policy.read_only_paths());
+    let read_write_paths = dedupe_paths(policy.read_write_paths());
+    let readable_paths = dedupe_paths(policy.readable_paths());
+    let denied_paths = dedupe_paths(policy.denied_paths());
 
     if !policy.network_access {
         lines.push("(deny network*)".to_string());
@@ -50,20 +54,20 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
 
     match policy.default_access {
         SandboxAccess::ReadWrite => {
-            for read_only in dedupe_paths(policy.read_only_paths()) {
+            for read_only in read_only_paths {
                 push_path_rule(&mut lines, "deny", "file-write*", &read_only);
             }
-            for denied in dedupe_paths(policy.denied_paths()) {
+            for denied in denied_paths {
                 push_path_rule(&mut lines, "deny", "file-read*", &denied);
                 push_path_rule(&mut lines, "deny", "file-write*", &denied);
             }
         }
         SandboxAccess::ReadOnly => {
             lines.push("(deny file-write*)".to_string());
-            for writable in dedupe_paths(policy.read_write_paths()) {
+            for writable in read_write_paths {
                 push_path_rule(&mut lines, "allow", "file-write*", &writable);
             }
-            for denied in dedupe_paths(policy.denied_paths()) {
+            for denied in denied_paths {
                 push_path_rule(&mut lines, "deny", "file-read*", &denied);
                 push_path_rule(&mut lines, "deny", "file-write*", &denied);
             }
@@ -71,13 +75,20 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
         SandboxAccess::NoAccess => {
             lines.push("(deny file-read*)".to_string());
             lines.push("(deny file-write*)".to_string());
-            for readable in dedupe_paths(policy.readable_paths()) {
+
+            // Traversing an allowlisted path under a global file-read deny still needs literal
+            // reads of each ancestor directory, including `/`.
+            for ancestor in readable_path_ancestors(&readable_paths) {
+                push_literal_rule(&mut lines, "allow", "file-read*", &ancestor);
+            }
+
+            for readable in readable_paths {
                 push_path_rule(&mut lines, "allow", "file-read*", &readable);
             }
-            for writable in dedupe_paths(policy.read_write_paths()) {
+            for writable in read_write_paths {
                 push_path_rule(&mut lines, "allow", "file-write*", &writable);
             }
-            for denied in dedupe_paths(policy.denied_paths()) {
+            for denied in denied_paths {
                 push_path_rule(&mut lines, "deny", "file-read*", &denied);
                 push_path_rule(&mut lines, "deny", "file-write*", &denied);
             }
@@ -91,6 +102,11 @@ fn push_path_rule(lines: &mut Vec<String>, action: &str, operation: &str, path: 
     let path = quote_sbpl_string(path);
     lines.push(format!("({action} {operation} (literal {path}))"));
     lines.push(format!("({action} {operation} (subpath {path}))"));
+}
+
+fn push_literal_rule(lines: &mut Vec<String>, action: &str, operation: &str, path: &Path) {
+    let path = quote_sbpl_string(path);
+    lines.push(format!("({action} {operation} (literal {path}))"));
 }
 
 fn quote_sbpl_string(path: &Path) -> String {
@@ -118,6 +134,23 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     }
 
     deduped
+}
+
+fn readable_path_ancestors(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ancestors = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths {
+        for ancestor in path.ancestors().skip(1) {
+            let ancestor = ancestor.to_path_buf();
+            let key = ancestor.to_string_lossy().to_string();
+            if seen.insert(key) {
+                ancestors.push(ancestor);
+            }
+        }
+    }
+
+    ancestors
 }
 
 fn execute_command(
@@ -196,6 +229,11 @@ mod tests {
         assert_line_before(
             &profile,
             "(deny file-read*)",
+            "(allow file-read* (literal \"/\"))",
+        );
+        assert_line_before(
+            &profile,
+            "(allow file-read* (literal \"/private\"))",
             &format!("(allow file-read* (literal \"{}\"))", readable.display()),
         );
         assert_line_before(

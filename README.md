@@ -312,17 +312,18 @@ Linux-specific caveats:
 | `ReadOnly` | `read_write + deny` | Accepted | Usable with canonicalized, non-overlapping paths | Writable carve-out plus denied path; explicit deny rules are emitted after carve-outs |
 | `ReadOnly` | `read_only + read_write + deny` | Accepted | Usable with canonicalized, non-overlapping paths | Same caveat as above |
 | `NoAccess` | none | Accepted | Usually not usable for normal commands | Command/runtime bootstrap paths are also denied |
-| `NoAccess` | `read_only` only | Accepted | Accepted shape only; verify the exact target command on the exact target macOS | On GitHub Actions `macos-15-arm64`, even canonicalized runtime roots did not make ordinary `/bin/sh` or `/bin/cat` bootstrap cleanly under `NoAccess` |
-| `NoAccess` | `read_write` only | Accepted | Accepted shape only; verify the exact target command on the exact target macOS | Same observed bootstrap caveat on current macOS CI |
-| `NoAccess` | `read_only + read_write` | Accepted | Accepted shape only; verify the exact target command on the exact target macOS | The backend accepts the allowlist shape, but generic dynamically linked commands are not proven runnable on current macOS CI |
-| `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Accepted shape only; verify the exact target command on the exact target macOS | Usually redundant because the default is already deny; current macOS CI still does not show generic command bootstrap under `NoAccess` |
-| `NoAccess` | overlapping allow + `deny` | Accepted | Accepted shape only; verify on the exact target macOS | The backend emits explicit deny rules after allowlist rules, but current macOS CI does not justify claiming generic runnable overlap behavior under `NoAccess` |
+| `NoAccess` | `read_only` only | Accepted | Conditional | Usable on current `macos-15-arm64` CI when the allowlist also includes canonicalized runtime roots and required bootstrap device nodes |
+| `NoAccess` | `read_write` only | Accepted | Conditional | Same bootstrap caveat: include runtime roots plus required macOS device nodes |
+| `NoAccess` | `read_only + read_write` | Accepted | Conditional | Runnable on current CI with the bootstrap allowlist; typical strict-allowlist mode |
+| `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Conditional | Runnable on current CI with the same bootstrap prerequisites; `deny` is usually redundant because the default is already deny |
+| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional, verify deny precedence on the target macOS | The policy shape is runnable on current CI; explicit deny is still emitted after allowlist rules, but overlap precedence should still be validated on the macOS version you target |
 
 macOS-specific caveats:
 
 - Path-based policies are only reliable when the policy paths match the canonical paths seen by Seatbelt, for example `/private/var/...` instead of an unresolved `/var/...` alias.
-- `NoAccess` is materially less predictable than the Linux backend in current CI practice: on GitHub Actions `macos-15-arm64`, even canonicalized runtime-root allowlists still did not let ordinary `/bin/sh` or `/bin/cat` commands bootstrap cleanly.
-- Treat macOS `NoAccess` as a backend-accepted policy shape, then validate the exact target command and macOS version you care about before documenting it as runnable.
+- `NoAccess` profiles now emit literal read allowances for every ancestor of each allowlisted readable path. Without those ancestor literals, Seatbelt could deny path traversal before the allowlisted subtree was ever reached.
+- In practice, runnable macOS `NoAccess` policies still need bootstrap paths beyond the target data subtree. Current CI coverage on `macos-15-arm64` uses canonicalized runtime roots plus read-write device nodes such as `/dev/null`, `/dev/tty`, and `/dev/dtracehelper`.
+- Treat macOS `NoAccess` as conditionally runnable rather than universally runnable: validate the exact command, runtime roots, and device-node requirements on the macOS version you ship against.
 
 ---
 
@@ -349,8 +350,8 @@ macOS-specific caveats:
 
 Current automated coverage emphasis:
 
-- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` / `NoAccess + overlapping deny` cases, Linux runnable `NoAccess` allowlist coverage, and macOS `NoAccess` shape-acceptance coverage.
-- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including Linux `NoAccess` bootstrap regression coverage and macOS `ReadOnly + read_write + deny` behavior when run on macOS CI.
+- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` / `NoAccess + overlapping deny` cases and runnable `NoAccess` allowlist coverage on both Linux and macOS CI.
+- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including Linux `NoAccess` bootstrap regression coverage and macOS `NoAccess` / `ReadOnly + read_write + deny` behavior when run on macOS CI.
 - `tests/network_access_control.rs`: loopback and external TCP deny checks when `network_access == false`.
 - `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite`, `ReadOnly`, and `NoAccess` profiles.
 
