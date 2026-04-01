@@ -27,7 +27,7 @@ use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
-use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+use crate::{SandboxAccess, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
@@ -59,18 +59,32 @@ pub(super) fn execute(
     let host_gid = unsafe { libc::getegid() };
 
     let mount_overlay_entries = if default_write_access {
-        let normalized_read_only_overlays =
-            normalize_existing_overlay_paths(&read_only_paths, "read_only")?;
-        let normalized_deny_overlays = normalize_existing_overlay_paths(&denied_paths, "deny")?;
+        let normalized_read_only_overlays = normalize_existing_overlay_paths(
+            &read_only_paths,
+            "read_only",
+            overlay_context_label(SandboxAccess::ReadWrite),
+        )?;
+        let normalized_deny_overlays = normalize_existing_overlay_paths(
+            &denied_paths,
+            "deny",
+            overlay_context_label(SandboxAccess::ReadWrite),
+        )?;
         collect_readwrite_overlay_entries(&normalized_read_only_overlays, &normalized_deny_overlays)
     } else if default_read_access {
-        let normalized_deny_overlays = normalize_existing_overlay_paths(&denied_paths, "deny")?;
+        let normalized_deny_overlays = normalize_existing_overlay_paths(
+            &denied_paths,
+            "deny",
+            overlay_context_label(SandboxAccess::ReadOnly),
+        )?;
         collect_deny_overlay_entries(&normalized_deny_overlays)
     } else {
         let overlapping_denied =
             collect_overlapping_denied_paths(&denied_paths, &readable_roots, &writable_roots)?;
-        let normalized_deny_overlays =
-            normalize_existing_overlay_paths(&overlapping_denied, "deny")?;
+        let normalized_deny_overlays = normalize_existing_overlay_paths(
+            &overlapping_denied,
+            "deny",
+            "default_access=NoAccess with overlapping deny overlays",
+        )?;
         collect_deny_overlay_entries(&normalized_deny_overlays)
     };
     let should_install_mount_overlays = !mount_overlay_entries.is_empty();
@@ -261,19 +275,28 @@ struct ReadWriteOverlayEntry {
 fn normalize_existing_overlay_paths(
     paths: &[PathBuf],
     label: &str,
+    context: &str,
 ) -> Result<Vec<PathBuf>, SandboxError> {
     let mut normalized = Vec::with_capacity(paths.len());
     for path in paths {
         let resolved = normalize_scope_path(path)?;
         if !resolved.exists() {
             return Err(SandboxError::InvalidRequest(format!(
-                "linux backend requires existing {label} path overlays when default_access=ReadWrite: {}",
+                "linux backend requires existing {label} overlay targets for {context}: {}",
                 path.display()
             )));
         }
         normalized.push(resolved);
     }
     Ok(normalized)
+}
+
+fn overlay_context_label(default_access: SandboxAccess) -> &'static str {
+    match default_access {
+        SandboxAccess::ReadWrite => "default_access=ReadWrite",
+        SandboxAccess::ReadOnly => "default_access=ReadOnly with deny overlays",
+        SandboxAccess::NoAccess => unreachable!("NoAccess uses a dedicated overlap-only context"),
+    }
 }
 
 fn collect_readwrite_overlay_entries(

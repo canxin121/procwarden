@@ -558,6 +558,119 @@ fn linux_no_access_overlap_allow_and_deny_is_enforced_when_overlays_are_availabl
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_overlay_backed_subtractive_paths_require_existing_targets() {
+    let fixture = Fixture::new("matrix-linux-existing-overlay-targets");
+    let manager = SandboxManager::new();
+
+    let missing_overlap_target = fixture.rw_dir.join("future-blocked.txt");
+    assert!(
+        !missing_overlap_target.exists(),
+        "test requires a missing overlay target"
+    );
+
+    let read_write_policy = policy(
+        SandboxAccess::ReadWrite,
+        false,
+        vec![
+            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
+            SandboxPathPermission::deny(missing_overlap_target.clone()),
+        ],
+    );
+    let read_write_result = manager.execute(
+        &sandbox_request(
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ],
+            &fixture.runtime_cwd,
+            2_500,
+        ),
+        &read_write_policy,
+    );
+    match read_write_result {
+        Err(SandboxError::InvalidRequest(message)) => {
+            assert!(
+                message.contains(
+                    "linux backend requires existing deny overlay targets for default_access=ReadWrite"
+                ),
+                "unexpected read_write missing-overlay error: {message}"
+            );
+        }
+        other => panic!(
+            "read_write default with missing deny overlay target should fail closed, got {other:?}"
+        ),
+    }
+
+    let no_access_overlap_policy = no_access_policy_with_runtime_roots(
+        false,
+        vec![
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+            SandboxPathPermission::deny(missing_overlap_target.clone()),
+        ],
+    );
+    let no_access_overlap_result = manager.execute(
+        &sandbox_request(
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ],
+            &fixture.rw_dir,
+            2_500,
+        ),
+        &no_access_overlap_policy,
+    );
+    match no_access_overlap_result {
+        Err(SandboxError::InvalidRequest(message)) => {
+            assert!(
+                message.contains(
+                    "linux backend requires existing deny overlay targets for default_access=NoAccess with overlapping deny overlays"
+                ),
+                "unexpected no_access overlap missing-overlay error: {message}"
+            );
+        }
+        other => {
+            panic!("no_access overlap with missing deny target should fail closed, got {other:?}")
+        }
+    }
+
+    let missing_non_overlap_deny = fixture.outside_dir.join("future-deny.txt");
+    assert!(
+        !missing_non_overlap_deny.exists(),
+        "test requires a missing non-overlapping deny target"
+    );
+
+    let no_access_non_overlap_policy = no_access_policy_with_runtime_roots(
+        false,
+        vec![
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+            SandboxPathPermission::deny(missing_non_overlap_deny),
+        ],
+    );
+    let non_overlap_result = manager.execute(
+        &sandbox_request(
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ],
+            &fixture.rw_dir,
+            2_500,
+        ),
+        &no_access_non_overlap_policy,
+    );
+    let non_overlap_output = non_overlap_result.unwrap_or_else(|error| {
+        panic!("no_access non-overlap missing deny should stay accepted: {error:?}")
+    });
+    assert_success(
+        &non_overlap_output,
+        "linux no_access non-overlap missing deny should stay accepted",
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_read_only_default_can_combine_read_write_and_deny() {
@@ -598,6 +711,79 @@ fn macos_read_only_default_can_combine_read_write_and_deny() {
         "macos readonly+deny read deny path",
     );
     assert_failure(&read_deny, "macos readonly+deny read deny path");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_no_access_overlap_allow_and_deny_is_enforced() {
+    use std::fs;
+
+    let fixture = Fixture::new("matrix-macos-noaccess-overlap");
+    let manager = SandboxManager::new();
+
+    let blocked_dir = fixture.rw_dir.join("blocked-subtree");
+    fs::create_dir_all(&blocked_dir).expect("blocked subtree should be created");
+    let blocked_seed = blocked_dir.join("blocked-seed.txt");
+    fs::write(&blocked_seed, "blocked-seed").expect("blocked seed should be created");
+
+    let test_policy = no_access_policy_with_runtime_roots(
+        false,
+        vec![
+            SandboxPathPermission::read_only(fixture.ro_dir.clone()),
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+            SandboxPathPermission::deny(blocked_dir.clone()),
+        ],
+    );
+
+    let read_ro = execute_case(
+        &manager,
+        &sandbox_request(read_command(&fixture.ro_seed), &fixture.ro_dir, 2_500),
+        &test_policy,
+        "macos no_access overlap read readonly seed",
+    );
+    assert_success(&read_ro, "macos no_access overlap read readonly seed");
+
+    let write_rw_target = fixture
+        .rw_dir
+        .join("allowed-matrix-macos-noaccess-overlap.txt");
+    let write_rw = execute_case(
+        &manager,
+        &sandbox_request(
+            write_command(&write_rw_target, "allowed"),
+            &fixture.rw_dir,
+            2_500,
+        ),
+        &test_policy,
+        "macos no_access overlap write allowed path",
+    );
+    assert_success(&write_rw, "macos no_access overlap write allowed path");
+
+    let read_blocked = execute_case(
+        &manager,
+        &sandbox_request(read_command(&blocked_seed), &fixture.ro_dir, 2_500),
+        &test_policy,
+        "macos no_access overlap read blocked subtree",
+    );
+    assert_failure(
+        &read_blocked,
+        "macos no_access overlap read blocked subtree",
+    );
+
+    let blocked_write_target = blocked_dir.join("blocked-write.txt");
+    let write_blocked = execute_case(
+        &manager,
+        &sandbox_request(
+            write_command(&blocked_write_target, "blocked"),
+            &fixture.ro_dir,
+            2_500,
+        ),
+        &test_policy,
+        "macos no_access overlap write blocked subtree",
+    );
+    assert_failure(
+        &write_blocked,
+        "macos no_access overlap write blocked subtree",
+    );
 }
 
 fn expected_for_current_platform(case: &CombinationCase) -> Expectation {
