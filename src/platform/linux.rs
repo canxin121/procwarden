@@ -55,38 +55,44 @@ pub(super) fn execute(
     let readable_roots = policy.readable_paths();
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
+    let host_uid = unsafe { libc::geteuid() };
+    let host_gid = unsafe { libc::getegid() };
 
-    let readwrite_overlay_entries = if default_write_access {
+    let mount_overlay_entries = if default_write_access {
         let normalized_read_only_overlays =
             normalize_existing_overlay_paths(&read_only_paths, "read_only")?;
         let normalized_deny_overlays = normalize_existing_overlay_paths(&denied_paths, "deny")?;
         collect_readwrite_overlay_entries(&normalized_read_only_overlays, &normalized_deny_overlays)
+    } else if default_read_access {
+        let normalized_deny_overlays = normalize_existing_overlay_paths(&denied_paths, "deny")?;
+        collect_deny_overlay_entries(&normalized_deny_overlays)
     } else {
-        Vec::new()
+        let overlapping_denied =
+            collect_overlapping_denied_paths(&denied_paths, &readable_roots, &writable_roots)?;
+        let normalized_deny_overlays =
+            normalize_existing_overlay_paths(&overlapping_denied, "deny")?;
+        collect_deny_overlay_entries(&normalized_deny_overlays)
     };
-    let should_install_readwrite_overlays = !readwrite_overlay_entries.is_empty();
-
-    validate_linux_policy_shape(
-        default_read_access,
-        default_write_access,
-        &denied_paths,
-        &readable_roots,
-        &writable_roots,
-    )?;
+    let should_install_mount_overlays = !mount_overlay_entries.is_empty();
 
     unsafe {
         command.pre_exec(move || {
-            if !network_access {
-                install_network_seccomp_filter_on_current_thread()?;
+            if should_install_mount_overlays {
+                install_readwrite_mount_overlays_on_current_process(
+                    &mount_overlay_entries,
+                    host_uid,
+                    host_gid,
+                )?;
             }
-            if should_install_readwrite_overlays {
-                install_readwrite_mount_overlays_on_current_process(&readwrite_overlay_entries)?;
-            } else if !default_write_access {
+            if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(
                     default_read_access,
                     &readable_roots,
                     &writable_roots,
                 )?;
+            }
+            if !network_access {
+                install_network_seccomp_filter_on_current_thread()?;
             }
             close_non_stdio_fds_on_current_process()?;
             Ok(())
@@ -94,13 +100,12 @@ pub(super) fn execute(
     }
 
     let execution = run_command_with_timeout(&mut command, request.timeout_ms, start);
-    if should_install_readwrite_overlays {
+    if should_install_mount_overlays {
         match execution {
             Err(SandboxError::Io(error)) if is_overlay_namespace_unavailable_error(&error) => {
-                Err(SandboxError::Unavailable(
-                    "linux readwrite path overlays require mount-namespace support (CLONE_NEWUSER/CLONE_NEWNS or CAP_SYS_ADMIN)"
-                        .to_string(),
-                ))
+                Err(SandboxError::Unavailable(format!(
+                    "linux path overlays require mount-namespace support (CLONE_NEWUSER/CLONE_NEWNS or CAP_SYS_ADMIN): {error}"
+                )))
             }
             other => other,
         }
@@ -109,64 +114,39 @@ pub(super) fn execute(
     }
 }
 
-fn validate_linux_policy_shape(
-    default_read_access: bool,
-    default_write_access: bool,
+fn collect_overlapping_denied_paths(
     denied_paths: &[PathBuf],
     readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
-) -> Result<(), SandboxError> {
+) -> Result<Vec<PathBuf>, SandboxError> {
     if denied_paths.is_empty() {
-        return Ok(());
-    }
-
-    if default_read_access && !default_write_access {
-        return Err(SandboxError::InvalidRequest(
-            "linux backend does not support NoAccess path overrides when default_access grants read access; use default_access=NoAccess with explicit allow paths"
-                .to_string(),
-        ));
-    }
-
-    if default_write_access {
-        return Ok(());
-    }
-
-    let mut allow_roots = Vec::with_capacity(readable_roots.len() + writable_roots.len());
-    allow_roots.extend(readable_roots.iter().cloned());
-    allow_roots.extend(writable_roots.iter().cloned());
-
-    if denied_overlaps_any_allowed_root(denied_paths, &allow_roots)? {
-        return Err(SandboxError::InvalidRequest(
-            "linux backend does not support overlapping allow and NoAccess path overrides under default_access=NoAccess; Landlock cannot express subtractive deny rules"
-                .to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn denied_overlaps_any_allowed_root(
-    denied_paths: &[PathBuf],
-    allow_roots: &[PathBuf],
-) -> Result<bool, SandboxError> {
-    if denied_paths.is_empty() || allow_roots.is_empty() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
 
     let normalized_denied = denied_paths
         .iter()
         .map(|path| normalize_scope_path(path))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut allow_roots = Vec::with_capacity(readable_roots.len() + writable_roots.len());
+    allow_roots.extend(readable_roots.iter().cloned());
+    allow_roots.extend(writable_roots.iter().cloned());
+    if allow_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let normalized_allowed = allow_roots
         .iter()
         .map(|path| normalize_scope_path(path))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(normalized_denied.iter().any(|denied| {
-        normalized_allowed
-            .iter()
-            .any(|allowed| paths_overlap(denied, allowed))
-    }))
+    Ok(normalized_denied
+        .into_iter()
+        .filter(|denied| {
+            normalized_allowed
+                .iter()
+                .any(|allowed| paths_overlap(denied, allowed))
+        })
+        .collect())
 }
 
 fn normalize_scope_path(path: &Path) -> Result<PathBuf, SandboxError> {
@@ -321,18 +301,38 @@ fn collect_readwrite_overlay_entries(
     entries
 }
 
+fn collect_deny_overlay_entries(denied_paths: &[PathBuf]) -> Vec<ReadWriteOverlayEntry> {
+    let mut entries = denied_paths
+        .iter()
+        .cloned()
+        .map(|path| ReadWriteOverlayEntry {
+            path,
+            kind: ReadWriteOverlayKind::Deny,
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        path_depth(&right.path)
+            .cmp(&path_depth(&left.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries
+}
+
 fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
 fn install_readwrite_mount_overlays_on_current_process(
     overlays: &[ReadWriteOverlayEntry],
+    host_uid: libc::uid_t,
+    host_gid: libc::gid_t,
 ) -> io::Result<()> {
     if overlays.is_empty() {
         return Ok(());
     }
 
-    enter_overlay_mount_namespace()?;
+    enter_overlay_mount_namespace(host_uid, host_gid)?;
 
     let scratch_root = create_overlay_scratch_root()?;
     for (index, overlay) in overlays.iter().enumerate() {
@@ -368,43 +368,88 @@ fn is_overlay_namespace_unavailable_error(error: &io::Error) -> bool {
     )
 }
 
-fn enter_overlay_mount_namespace() -> io::Result<()> {
+fn enter_overlay_mount_namespace(host_uid: libc::uid_t, host_gid: libc::gid_t) -> io::Result<()> {
+    let combined_flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+    if unsafe { libc::unshare(combined_flags) } == 0 {
+        configure_current_process_user_namespace_mapping(host_uid, host_gid)?;
+        return mark_mount_tree_private();
+    }
+
+    let combined_error = io::Error::last_os_error();
+    let combined_code = combined_error.raw_os_error();
+    if combined_code != Some(libc::EPERM) && combined_code != Some(libc::EINVAL) {
+        return Err(io::Error::new(
+            combined_error.kind(),
+            format!("unshare(CLONE_NEWUSER|CLONE_NEWNS) failed: {combined_error}"),
+        ));
+    }
+
     let userns_result = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
     if userns_result == 0 {
-        configure_current_process_user_namespace_mapping()?;
+        configure_current_process_user_namespace_mapping(host_uid, host_gid)?;
     } else {
         let error = io::Error::last_os_error();
         let code = error.raw_os_error();
         if code != Some(libc::EPERM) && code != Some(libc::EINVAL) {
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("unshare(CLONE_NEWUSER) failed: {error}"),
+            ));
         }
     }
 
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("unshare(CLONE_NEWNS) failed: {error}"),
+        ));
     }
 
     mark_mount_tree_private()
 }
 
-fn configure_current_process_user_namespace_mapping() -> io::Result<()> {
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-
+fn configure_current_process_user_namespace_mapping(
+    host_uid: libc::uid_t,
+    host_gid: libc::gid_t,
+) -> io::Result<()> {
     match fs::write("/proc/self/setgroups", "deny\n") {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("writing /proc/self/setgroups failed: {error}"),
+            ));
+        }
     }
 
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+    fs::write("/proc/self/uid_map", format!("0 {host_uid} 1\n")).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("writing /proc/self/uid_map failed: {error}"),
+        )
+    })?;
+    fs::write("/proc/self/gid_map", format!("0 {host_gid} 1\n")).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("writing /proc/self/gid_map failed: {error}"),
+        )
+    })?;
 
     if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("setresgid(0,0,0) failed: {error}"),
+        ));
     }
     if unsafe { libc::setresuid(0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("setresuid(0,0,0) failed: {error}"),
+        ));
     }
 
     Ok(())
@@ -422,7 +467,11 @@ fn mark_mount_tree_private() -> io::Result<()> {
         )
     } != 0
     {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("mount(MS_PRIVATE) failed: {error}"),
+        ));
     }
     Ok(())
 }

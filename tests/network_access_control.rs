@@ -13,6 +13,7 @@ use common::{
 const EXTERNAL_HOST: &str = "1.1.1.1";
 const EXTERNAL_PORT: u16 = 443;
 
+#[cfg(target_os = "windows")]
 #[test]
 fn network_enabled_is_explicitly_rejected_on_windows() {
     let fixture = Fixture::new("network-enabled-unsupported");

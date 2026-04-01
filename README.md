@@ -100,20 +100,27 @@ Implementation entry: `src/platform/linux.rs`
 
 ### Filesystem sandbox implementation
 
-Linux filesystem restrictions are applied in `pre_exec` using Landlock:
+Linux filesystem restrictions are applied in `pre_exec`, but the backend currently uses two different enforcement paths:
 
 - `default_access == ReadWrite`
-  - if no `ReadOnly`/`NoAccess` overlays are present, skips Landlock filesystem restriction setup.
-  - if `ReadOnly`/`NoAccess` overlays are present, Linux returns `SandboxError::InvalidRequest` (fail-closed) because Landlock cannot safely express these subtractive overrides over a full-write default.
-- `default_access == ReadOnly` with any `NoAccess` (`deny`) overlay:
-  - Linux returns `SandboxError::InvalidRequest` (fail-closed).
-  - reason: Landlock is allowlist-oriented and cannot subtract a denied subtree from a global read grant.
-- `default_access == NoAccess` with overlapping `allow` + `deny` scopes:
-  - Linux returns `SandboxError::InvalidRequest` (fail-closed).
-  - non-overlapping `deny` entries remain accepted (they are effectively redundant because the default is already deny).
-- otherwise:
+  - if no `ReadOnly` / `NoAccess` overlays are present, the backend leaves the filesystem unrestricted.
+  - if `ReadOnly` or `NoAccess` overlays are present, the backend builds bind-mount overlays inside a private mount namespace.
+  - all overlay targets must already exist, otherwise execution fails with `SandboxError::InvalidRequest`.
+  - if the host cannot create the required user/mount namespaces, execution fails with `SandboxError::Unavailable` instead of silently weakening the policy.
+- `default_access == ReadOnly` without any `NoAccess` (`deny`) overlay:
   - installs a Landlock ruleset.
-  - grants read scopes and write scopes based on policy-derived roots.
+  - grants global read access plus explicit write carve-outs from `read_write` paths.
+- `default_access == ReadOnly` with any `NoAccess` (`deny`) overlay:
+  - installs deny bind-mount overlays first, then installs the Landlock ruleset for global read-only plus explicit write carve-outs.
+  - all denied overlay targets must already exist.
+  - if the host cannot create the required user/mount namespaces, execution fails with `SandboxError::Unavailable`.
+- `default_access == NoAccess`
+  - installs a Landlock allowlist for explicit readable/writable roots.
+  - non-overlapping `deny` entries are accepted but are usually redundant because the default is already deny.
+  - overlapping `allow` + `deny` scopes are implemented by installing deny bind-mount overlays on the overlapping denied paths before Landlock is applied.
+  - overlapping denied overlay targets must already exist.
+  - if overlapping deny overlays are needed and the host cannot create the required user/mount namespaces, execution fails with `SandboxError::Unavailable`.
+  - the allowlist must include any runtime-readable roots needed to start the executable and its loader/interpreter in addition to the target data paths.
 
 Internal mapping used by the backend:
 
@@ -122,12 +129,14 @@ Internal mapping used by the backend:
 - `readable_roots = path_permissions where access in {ReadOnly, ReadWrite}`
 - `writable_roots = path_permissions where access == ReadWrite`
 
-Rule construction details:
+Rule construction details for the Landlock path:
 
 - if `default_read_access` is true, `"/"` is granted read access.
 - otherwise, read access is granted only to `readable_roots`.
 - `/dev/null` is always granted read/write for practical process I/O compatibility.
 - `writable_roots` receive read/write permissions.
+
+In practice, `default_access == NoAccess` usually needs runtime roots such as `/bin`, `/usr/bin`, `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, and `/usr/libexec` in the allowlist if the command is launched through `/bin/sh`, an interpreter, or a dynamically linked executable.
 
 ### Network sandbox implementation
 
@@ -238,13 +247,81 @@ Current mapping strategy:
 - base profile starts with `(version 1)` and `(allow default)`
 - `network_access == false` adds `(deny network*)`
 - this deny applies to local and external network access (e.g. loopback and remote endpoints).
-- `deny` paths are translated first into explicit `file-read*` and `file-write*` deny rules
 - default access is then mapped:
-  - `ReadWrite`: writable everywhere except explicit read-only/deny path rules
-  - `ReadOnly`: optional writable carve-outs, then fallback `(deny file-write*)`
-  - `NoAccess`: optional read/write carve-outs, then fallback `(deny file-read*)` + `(deny file-write*)`
+  - `ReadWrite`: explicit `read_only` paths become `file-write*` deny rules; explicit `deny` paths become `file-read*` and `file-write*` deny rules.
+  - `ReadOnly`: emit a global `(deny file-write*)`, then explicit `read_write` carve-out allow rules, then explicit `deny` path rules last so deny still overrides carve-outs.
+  - `NoAccess`: emit global `(deny file-read*)` and `(deny file-write*)`, then explicit read/write allowlist carve-outs, then explicit `deny` path rules last so deny still overrides overlapping allowlist entries.
 
 Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
+
+In practice, macOS path permissions should be canonicalized before constructing `SandboxPathPermission` entries. This avoids alias mismatches such as `/var/...` versus `/private/var/...`, which can make a rule look correct while still missing the real path evaluated by Seatbelt.
+
+---
+
+## Practical Linux/macOS Path Matrix
+
+The matrices below separate the two policy dimensions explicitly:
+
+- `default_access`: the fallback policy for paths not listed in `path_permissions`
+- `path_permissions`: the explicit per-path overrides (`read_only`, `read_write`, `deny`)
+- operational bootstrap requirements are separate from the matrix itself: under `NoAccess`, normal commands often still need extra allowlisted runtime roots for the executable, loader/interpreter, and usable working directory.
+
+"Accepted" means the backend accepts the request shape. "Usable" means it is a reasonable documented contract today. "Conditional" means the combination depends on extra host/runtime prerequisites. "Host-capability-dependent" means the policy shape is supported, but the Linux host must also provide the required mount-namespace capability. "Conditional + host-capability-dependent" means both kinds of prerequisites apply.
+
+### Linux
+
+| `default_access` | `path_permissions` shape | Backend result | Practical status | Notes |
+|---|---|---|---|---|
+| `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
+| `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not add new power over a global write default |
+| `ReadWrite` | `read_only` only | Accepted | Host-capability-dependent | Implemented via mount-namespace overlays; overlay targets must already exist |
+| `ReadWrite` | `deny` only | Accepted | Host-capability-dependent | Same overlay caveat as above |
+| `ReadWrite` | `read_only + deny` | Accepted | Host-capability-dependent | Same overlay caveat as above |
+| `ReadOnly` | none | Accepted | Usable | Global read-only mode |
+| `ReadOnly` | `read_only` only | Accepted | Usable but redundant | The default already allows reads and denies writes |
+| `ReadOnly` | `read_write` only | Accepted | Usable | Explicit write carve-outs |
+| `ReadOnly` | `deny` only | Accepted | Host-capability-dependent | Denied paths are implemented with overlays; writes remain controlled by Landlock |
+| `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant; `read_write` adds writable carve-outs |
+| `ReadOnly` | any shape containing `deny` | Accepted | Host-capability-dependent | Includes `read_write + deny` and `read_only + read_write + deny`; deny paths use overlays |
+| `NoAccess` | none | Accepted | Usually not usable for normal commands | Normal dynamically linked commands still need runtime-readable roots to bootstrap |
+| `NoAccess` | `read_only` only | Accepted | Conditional | Explicit read allowlist only; runtime/bootstrap roots must also be allowed if needed |
+| `NoAccess` | `read_write` only | Accepted | Conditional | Explicit read/write allowlist only; same bootstrap caveat |
+| `NoAccess` | `read_only + read_write` | Accepted | Conditional | Typical allowlist mode; same bootstrap caveat |
+| `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Conditional | Usually redundant because the default is already deny |
+| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional + host-capability-dependent | Overlapping denied paths are implemented with overlays; runtime roots and namespace support are both required |
+
+Linux-specific caveats:
+
+- Any Linux policy shape that requires deny/read-only bind overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
+- `NoAccess` policies must usually allow runtime/bootstrap roots such as `/bin`, `/usr/bin`, `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, and `/usr/libexec` in addition to the target data paths.
+
+### macOS
+
+| `default_access` | `path_permissions` shape | Backend result | Practical status | Notes |
+|---|---|---|---|---|
+| `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
+| `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not change a global write default |
+| `ReadWrite` | `read_only` only | Accepted | Usable with canonicalized paths | Denies writes under those paths |
+| `ReadWrite` | `deny` only | Accepted | Usable with canonicalized paths | Denies reads and writes under those paths |
+| `ReadWrite` | `read_only + deny` | Accepted | Usable with canonicalized, non-overlapping paths | Normal subtractive overlay case on macOS |
+| `ReadOnly` | none | Accepted | Usable | Global read-only mode |
+| `ReadOnly` | `read_only` only | Accepted | Usable but redundant | `read_only` entries do not add new restrictions over a global read-only default |
+| `ReadOnly` | `read_write` only | Accepted | Usable with canonicalized paths | Writable carve-outs depend on the policy path matching the canonical path seen by Seatbelt |
+| `ReadOnly` | `deny` only | Accepted | Usable with canonicalized paths | Read/write deny path; same canonicalization caveat |
+| `ReadOnly` | `read_only + read_write` | Accepted | Usable with canonicalized paths | `read_only` is redundant; `read_write` adds writable carve-outs |
+| `ReadOnly` | `read_write + deny` | Accepted | Usable with canonicalized, non-overlapping paths | Writable carve-out plus denied path; explicit deny rules are emitted after carve-outs |
+| `ReadOnly` | `read_only + read_write + deny` | Accepted | Usable with canonicalized, non-overlapping paths | Same caveat as above |
+| `NoAccess` | none | Accepted | Usually not usable for normal commands | Command/runtime bootstrap paths are also denied |
+| `NoAccess` | `read_only` only | Accepted | Conditional | Explicit read allowlist; include canonicalized bootstrap/runtime roots if the command needs them |
+| `NoAccess` | `read_write` only | Accepted | Conditional | Explicit read/write allowlist; same bootstrap caveat |
+| `NoAccess` | `read_only + read_write` | Accepted | Conditional | Same bootstrap and canonicalization caveat |
+| `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Conditional | Usually redundant because the default is already deny; still requires bootstrap/runtime roots |
+| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional, verify on target macOS | The backend now emits explicit deny rules after allowlist rules so deny is intended to win, but overlap precedence should still be validated on the macOS version you target |
+
+macOS-specific caveats:
+
+- Path-based policies are only reliable when the policy paths match the canonical paths seen by Seatbelt, for example `/private/var/...` instead of an unresolved `/var/...` alias.
+- `NoAccess` has the same bootstrap problem as Linux in practice: allowing only the target data path is usually not enough for `/bin/sh`, interpreters, or dynamically linked executables to start cleanly.
 
 ---
 
@@ -271,10 +348,10 @@ Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
 
 Current automated coverage emphasis:
 
-- Cross-platform shared matrix: `tests/cross_platform_unified_matrix.rs` runs common policy checks on all OS targets (CLI + Python + Node runtime coverage, depth 1/2/3 child-chain behavior, parent/child path scope checks, and loopback allow/deny validation).
-- Linux: extensive runtime integration matrix (policy permutations, parent/child/grandchild behavior, network on/off, stress, timeout, path boundaries).
-- Windows: compile + integration coverage around AppContainer policy/path safety plus loopback deny checks when baseline loopback is reachable.
-- macOS: SBPL profile compilation/fail-closed behavior plus loopback deny integration checks when runtime prerequisites are available.
+- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` / `NoAccess + overlapping deny` cases and runnable `NoAccess` allowlist coverage.
+- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including Linux `NoAccess` bootstrap regression coverage and macOS `ReadOnly + read_write + deny` behavior when run on macOS CI.
+- `tests/network_access_control.rs`: loopback and external TCP deny checks when `network_access == false`.
+- `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite`, `ReadOnly`, and `NoAccess` profiles.
 
 ---
 

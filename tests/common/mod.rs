@@ -59,22 +59,37 @@ impl Fixture {
         let workspace = TempDir::new(&format!("{prefix}-workspace"));
         let outside = TempDir::new(&format!("{prefix}-outside"));
 
-        let runtime_cwd = workspace.path().join("runtime-cwd");
-        let ro_dir = workspace.path().join("readonly");
-        let rw_dir = workspace.path().join("readwrite");
-        let deny_dir = workspace.path().join("deny");
-        let outside_dir = outside.path().join("outside");
+        let runtime_cwd_raw = workspace.path().join("runtime-cwd");
+        let ro_dir_raw = workspace.path().join("readonly");
+        let rw_dir_raw = workspace.path().join("readwrite");
+        let deny_dir_raw = workspace.path().join("deny");
+        let outside_dir_raw = outside.path().join("outside");
 
-        for dir in [&runtime_cwd, &ro_dir, &rw_dir, &deny_dir, &outside_dir] {
+        for dir in [
+            &runtime_cwd_raw,
+            &ro_dir_raw,
+            &rw_dir_raw,
+            &deny_dir_raw,
+            &outside_dir_raw,
+        ] {
             fs::create_dir_all(dir).expect("fixture directory should be created");
         }
 
-        let ro_seed = ro_dir.join("seed-ro.txt");
-        let deny_seed = deny_dir.join("seed-deny.txt");
-        let outside_seed = outside_dir.join("seed-outside.txt");
-        fs::write(&ro_seed, "readonly-seed").expect("readonly seed should be created");
-        fs::write(&deny_seed, "deny-seed").expect("deny seed should be created");
-        fs::write(&outside_seed, "outside-seed").expect("outside seed should be created");
+        let ro_seed_raw = ro_dir_raw.join("seed-ro.txt");
+        let deny_seed_raw = deny_dir_raw.join("seed-deny.txt");
+        let outside_seed_raw = outside_dir_raw.join("seed-outside.txt");
+        fs::write(&ro_seed_raw, "readonly-seed").expect("readonly seed should be created");
+        fs::write(&deny_seed_raw, "deny-seed").expect("deny seed should be created");
+        fs::write(&outside_seed_raw, "outside-seed").expect("outside seed should be created");
+
+        let runtime_cwd = normalize_path(&runtime_cwd_raw);
+        let ro_dir = normalize_path(&ro_dir_raw);
+        let rw_dir = normalize_path(&rw_dir_raw);
+        let deny_dir = normalize_path(&deny_dir_raw);
+        let outside_dir = normalize_path(&outside_dir_raw);
+        let ro_seed = normalize_path(&ro_seed_raw);
+        let deny_seed = normalize_path(&deny_seed_raw);
+        let outside_seed = normalize_path(&outside_seed_raw);
 
         Self {
             _workspace: workspace,
@@ -149,13 +164,7 @@ pub fn read_command(target: &Path) -> Vec<String> {
 
     #[cfg(not(windows))]
     {
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "cat \"$1\" > /dev/null".to_string(),
-            "sh".to_string(),
-            path_arg(target),
-        ]
+        vec!["/bin/cat".to_string(), path_arg(target)]
     }
 }
 
@@ -279,6 +288,101 @@ pub fn assert_failure(output: &SandboxExecOutput, context: &str) {
 
 pub fn path_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+pub fn normalize_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        fs::canonicalize(path).unwrap_or_else(|error| {
+            panic!(
+                "path should canonicalize on macOS ({}): {error}",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_path_buf()
+    }
+}
+
+pub fn no_access_policy_with_runtime_roots(
+    network_access: bool,
+    path_permissions: Vec<SandboxPathPermission>,
+) -> SandboxPolicy {
+    let mut permissions = runtime_readable_roots()
+        .into_iter()
+        .map(SandboxPathPermission::read_only)
+        .collect::<Vec<_>>();
+    permissions.extend(path_permissions);
+
+    let mut deduped = Vec::new();
+    for permission in permissions {
+        if deduped.iter().any(|existing: &SandboxPathPermission| {
+            existing.access == permission.access && existing.path == permission.path
+        }) {
+            continue;
+        }
+        deduped.push(permission);
+    }
+
+    policy(SandboxAccess::NoAccess, network_access, deduped)
+}
+
+fn runtime_readable_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let candidates = vec![
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/libexec"),
+    ];
+
+    #[cfg(target_os = "macos")]
+    let candidates = {
+        let mut roots = vec![
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/usr/lib"),
+            PathBuf::from("/System"),
+            PathBuf::from("/System/Library"),
+        ];
+
+        for tool in ["/bin/sh", "/bin/cat"] {
+            let tool_path = PathBuf::from(tool);
+            if let Some(parent) = tool_path.parent() {
+                roots.push(parent.to_path_buf());
+            }
+            if let Ok(canonical) = fs::canonicalize(&tool_path) {
+                if let Some(parent) = canonical.parent() {
+                    roots.push(parent.to_path_buf());
+                }
+            }
+        }
+
+        roots
+    };
+
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<PathBuf> = Vec::new();
+
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        let normalized = normalize_path(&candidate);
+        if roots.iter().any(|existing| existing == &normalized) {
+            continue;
+        }
+        roots.push(normalized);
+    }
+    roots
 }
 
 fn escape_powershell_single_quoted(path: &Path) -> String {
