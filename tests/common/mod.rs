@@ -272,11 +272,14 @@ pub fn assert_denied_or_failed(
 }
 
 pub fn assert_success(output: &SandboxExecOutput, context: &str) {
-    assert_eq!(
-        output.exit_code, 0,
-        "{context}: expected success, stdout: {}, stderr: {}",
-        output.stdout, output.stderr
-    );
+    if output.exit_code != 0 {
+        let sandbox_excerpt = macos_recent_sandbox_log_excerpt();
+        assert_eq!(
+            output.exit_code, 0,
+            "{context}: expected success, stdout: {}, stderr: {}, sandbox_log: {}",
+            output.stdout, output.stderr, sandbox_excerpt
+        );
+    }
 }
 
 pub fn assert_failure(output: &SandboxExecOutput, context: &str) {
@@ -422,6 +425,53 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
 
 fn escape_powershell_single_quoted(path: &Path) -> String {
     path_arg(path).replace('\'', "''")
+}
+
+fn macos_recent_sandbox_log_excerpt() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("log")
+            .args([
+                "show",
+                "--style",
+                "compact",
+                "--last",
+                "2m",
+                "--predicate",
+                r#"subsystem == "com.apple.sandbox" OR eventMessage CONTAINS[c] "deny""#,
+            ])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let lines = text
+                    .lines()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    "<no macOS sandbox log entries>".to_string()
+                } else {
+                    lines.join(" | ")
+                }
+            }
+            Ok(output) => format!(
+                "<log show failed: status={:?}, stderr={}>",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("<log show unavailable: {error}>"),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        String::new()
+    }
 }
 
 pub fn spawn_accept_probe(listener: TcpListener, timeout: Duration) -> mpsc::Receiver<bool> {
