@@ -6,7 +6,8 @@ use procwarden::{SandboxAccess, SandboxError, SandboxManager, SandboxPathPermiss
 
 use common::{
     Fixture, assert_denied_or_failed, assert_failure, assert_success, execute_case,
-    no_access_policy_with_runtime_roots, policy, read_command, sandbox_request, write_command,
+    no_access_policy_with_runtime_roots, policy, read_command, sandbox_request,
+    should_skip_windows_wfp_unavailable, write_command,
 };
 
 #[test]
@@ -23,12 +24,18 @@ fn default_no_access_enforces_readonly_readwrite_and_outside_denial() {
         ],
     );
 
-    let read_ro = execute_case(
-        &manager,
-        &sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500),
-        &test_policy,
-        "default_no_access read readonly seed",
-    );
+    let read_ro_request =
+        sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500);
+    let read_ro_result = manager.execute(&read_ro_request, &test_policy);
+    if should_skip_windows_wfp_unavailable(&read_ro_result) {
+        eprintln!(
+            "skip policy_access_consistency default_no_access test because Windows WFP is unsupported in this environment"
+        );
+        return;
+    }
+    let read_ro = read_ro_result.unwrap_or_else(|error| {
+        panic!("default_no_access read readonly seed: manager execution failed: {error:?}")
+    });
     assert_success(&read_ro, "default_no_access read readonly seed");
 
     let ro_write_target = fixture.ro_dir.join("blocked-noaccess.txt");
@@ -322,7 +329,14 @@ fn default_read_write_enforces_readonly_and_deny_overrides() {
         &fixture.runtime_cwd,
         2_500,
     );
-    let write_outside = match manager.execute(&write_outside_request, &test_policy) {
+    let write_outside_result = manager.execute(&write_outside_request, &test_policy);
+    if should_skip_windows_wfp_unavailable(&write_outside_result) {
+        eprintln!(
+            "skip policy_access_consistency default_read_write test because Windows WFP is unsupported in this environment"
+        );
+        return;
+    }
+    let write_outside = match write_outside_result {
         Ok(output) => output,
         Err(SandboxError::Unavailable(message))
             if cfg!(target_os = "linux") && message.contains("mount-namespace support") =>

@@ -286,6 +286,25 @@ pub fn assert_failure(output: &SandboxExecOutput, context: &str) {
     );
 }
 
+pub fn should_skip_windows_wfp_unavailable(
+    result: &Result<SandboxExecOutput, SandboxError>,
+) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            result,
+            Err(SandboxError::Windows(message))
+                if message.contains("FwpmEngineOpen0 failed: 50")
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = result;
+        false
+    }
+}
+
 pub fn path_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -357,10 +376,10 @@ fn runtime_readable_roots() -> Vec<PathBuf> {
             if let Some(parent) = tool_path.parent() {
                 roots.push(parent.to_path_buf());
             }
-            if let Ok(canonical) = fs::canonicalize(&tool_path) {
-                if let Some(parent) = canonical.parent() {
-                    roots.push(parent.to_path_buf());
-                }
+            if let Ok(canonical) = fs::canonicalize(&tool_path)
+                && let Some(parent) = canonical.parent()
+            {
+                roots.push(parent.to_path_buf());
             }
         }
 

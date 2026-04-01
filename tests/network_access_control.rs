@@ -3,11 +3,13 @@ mod common;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use procwarden::{SandboxAccess, SandboxError, SandboxManager, SandboxPathPermission};
+use procwarden::{SandboxAccess, SandboxManager, SandboxPathPermission};
+#[cfg(target_os = "windows")]
+use procwarden::SandboxError;
 
 use common::{
     Fixture, assert_failure, connect_command, execute_case, policy, sandbox_request,
-    spawn_http_probe,
+    should_skip_windows_wfp_unavailable, spawn_http_probe,
 };
 
 const EXTERNAL_HOST: &str = "1.1.1.1";
@@ -100,23 +102,4 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
         "network_disabled external connect",
     );
     assert_failure(&external_output, "network_disabled external connect");
-}
-
-fn should_skip_windows_wfp_unavailable(
-    result: &Result<procwarden::SandboxExecOutput, SandboxError>,
-) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(
-            result,
-            Err(SandboxError::Windows(message))
-                if message.contains("FwpmEngineOpen0 failed: 50")
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = result;
-        false
-    }
 }
