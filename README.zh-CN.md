@@ -274,25 +274,26 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 |---|---|---|---|---|
 | `ReadWrite` | 无 | Accepted | 可用 | 全局可读写模式 |
 | `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不增加权限 |
-| `ReadWrite` | 仅 `read_only` | Accepted | 依赖宿主能力 | 通过 mount-namespace overlay 实现；目标路径必须已存在 |
-| `ReadWrite` | 仅 `deny` | Accepted | 依赖宿主能力 | 同上 |
-| `ReadWrite` | `read_only + deny` | Accepted | 依赖宿主能力 | 同上 |
+| `ReadWrite` | 仅 `read_only` | Accepted | 依赖宿主能力 | 通过 mount-namespace overlay 实现；当前后端契约要求 overlay 目标路径必须已存在 |
+| `ReadWrite` | 仅 `deny` | Accepted | 依赖宿主能力 | 同上，也要求目标路径已存在 |
+| `ReadWrite` | `read_only + deny` | Accepted | 依赖宿主能力 | 同上，也要求目标路径已存在 |
 | `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
 | `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | 默认已允许读、拒绝写 |
 | `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 显式写 carve-out |
-| `ReadOnly` | 仅 `deny` | Accepted | 依赖宿主能力 | deny 路径通过 overlay 实现，写权限默认仍由 Landlock 控制 |
+| `ReadOnly` | 仅 `deny` | Accepted | 依赖宿主能力 | deny 路径通过 overlay 实现，写权限默认仍由 Landlock 控制，且目标路径必须已存在 |
 | `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，`read_write` 提供写 carve-out |
-| `ReadOnly` | 任意包含 `deny` 的形状 | Accepted | 依赖宿主能力 | 包括 `read_write + deny` 和 `read_only + read_write + deny`；deny 路径通过 overlay 实现 |
+| `ReadOnly` | 任意包含 `deny` 的形状 | Accepted | 依赖宿主能力 | 包括 `read_write + deny` 和 `read_only + read_write + deny`；deny 路径通过 overlay 实现，且目标路径必须已存在 |
 | `NoAccess` | 无 | Accepted | 对普通命令通常不可用 | 普通动态链接命令仍需要运行时可读根路径才能正常启动 |
 | `NoAccess` | 仅 `read_only` | Accepted | 有条件可用 | 显式只读 allowlist；若命令需要运行时根路径也必须一并放行 |
 | `NoAccess` | 仅 `read_write` | Accepted | 有条件可用 | 显式读写 allowlist；同样受 bootstrap 前提约束 |
 | `NoAccess` | `read_only + read_write` | Accepted | 有条件可用 | 典型 allowlist 模式；同样受 bootstrap 前提约束 |
 | `NoAccess` | 在任意非重叠 allowlist 上再加非重叠 `deny` | Accepted | 有条件可用 | 通常是冗余的，因为默认本来就是 deny |
-| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 有条件可用 + 依赖宿主能力 | 重叠 deny 路径通过 overlay 实现；既需要运行时根路径，也需要 namespace 能力 |
+| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 有条件可用 + 依赖宿主能力 | 重叠 deny 路径通过 overlay 实现；既需要运行时根路径，也需要 namespace 能力，而且被 deny 的目标必须已存在 |
 
 Linux 额外前提：
 
 - 任何需要 deny/read-only bind overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
+- 依赖 overlay 的减法规则目前只适用于“已经存在的路径对象”。这不仅是当前后端契约，也来自所用内核原语的边界：bind mount 需要已有 mount point，而如果只在私有 mount namespace 里临时创建这个目标，那个文件或目录仍然会真实出现在共享的宿主文件系统上。
 - `NoAccess` 在实践中通常还需要显式放行 `/bin`、`/usr/bin`、`/lib`、`/lib64`、`/usr/lib`、`/usr/lib64`、`/usr/libexec` 等运行时根路径。
 
 ### macOS
@@ -316,13 +317,14 @@ Linux 额外前提：
 | `NoAccess` | 仅 `read_write` | Accepted | 有条件可用 | 同样依赖 runtime roots 与所需 macOS 设备节点 |
 | `NoAccess` | `read_only + read_write` | Accepted | 有条件可用 | 在当前 CI 上配齐 bootstrap allowlist 后可运行；这是典型严格 allowlist 模式 |
 | `NoAccess` | 在任意非重叠 allowlist 上再加非重叠 `deny` | Accepted | 有条件可用 | 在当前 CI 上同样可运行；但 `deny` 往往本就冗余，因为默认已经是 deny |
-| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 有条件可用，但仍应在目标 macOS 上验证 deny 优先级 | 当前 CI 已证明这种形状可运行；但显式 deny 虽然仍然在 allowlist 之后发出，重叠优先级仍建议按目标 macOS 版本实测 |
+| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 有条件可用 | 在当前 `macos-latest` CI 上，配齐 canonicalized 路径和文档中的 bootstrap allowlist 后可运行；重叠 deny 子树已被运行时测试验证会被拦截 |
 
 macOS 额外前提：
 
 - 路径型策略只有在 policy 里的路径与 Seatbelt 实际看到的 canonical path 一致时才可靠，例如 `/private/var/...` 而不是未解析别名的 `/var/...`。
 - `NoAccess` 现在会为每个可读 allowlist 路径的所有祖先目录发出 literal `file-read*` 规则。没有这些祖先 literal 规则时，Seatbelt 可能会在进入 allowlisted 子树之前就把路径遍历挡掉。
 - 在实践中，macOS `NoAccess` 依然需要比业务数据子树更完整的 bootstrap 前提。当前 `macos-15-arm64` CI 覆盖使用的是 canonicalized runtime roots，再加上 `/dev/null`、`/dev/tty`、`/dev/dtracehelper` 这类可写设备节点。
+- 当前 `macos-latest` CI 也已经实际覆盖 `NoAccess + allow/deny 重叠` 的运行时行为，因此剩余 caveat 主要是 bootstrap/runtime 路径敏感性，而不是本 crate 已知的 deny precedence 缺口。
 - 因此 macOS 上的 `NoAccess` 应理解为“有条件可运行”而不是“天然通用可运行”；真正发版前仍应在目标 macOS 版本上按实际命令做验证。
 
 ---
@@ -350,7 +352,7 @@ macOS 额外前提：
 
 当前覆盖重点：
 
-- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite` / `ReadOnly + deny` / `NoAccess + 重叠 deny` 组合，以及 Linux 和 macOS CI 上都能实际跑通的 `NoAccess` allowlist 覆盖。
+- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite` / `ReadOnly + deny` / `NoAccess + 重叠 deny` 组合、Linux 对“overlay target 必须已存在”的 fail-closed 覆盖，以及 Linux 和 macOS CI 上都能实际跑通的 `NoAccess` allowlist/overlap 覆盖。
 - `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为，包括 Linux `NoAccess` bootstrap 回归测试，以及在 macOS CI 上运行时的 `NoAccess` / `ReadOnly + read_write + deny` 组合行为。
 - `tests/network_access_control.rs`：覆盖 `network_access == false` 时对 loopback 与外部 TCP 的阻断。
 - `src/platform/macos.rs` 单元测试：覆盖 `ReadWrite`、`ReadOnly`、`NoAccess` 三类 SBPL 生成顺序。

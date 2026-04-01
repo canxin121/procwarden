@@ -274,25 +274,26 @@ The matrices below separate the two policy dimensions explicitly:
 |---|---|---|---|---|
 | `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
 | `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not add new power over a global write default |
-| `ReadWrite` | `read_only` only | Accepted | Host-capability-dependent | Implemented via mount-namespace overlays; overlay targets must already exist |
-| `ReadWrite` | `deny` only | Accepted | Host-capability-dependent | Same overlay caveat as above |
-| `ReadWrite` | `read_only + deny` | Accepted | Host-capability-dependent | Same overlay caveat as above |
+| `ReadWrite` | `read_only` only | Accepted | Host-capability-dependent | Implemented via mount-namespace overlays; current backend contract requires the overlay target path to already exist |
+| `ReadWrite` | `deny` only | Accepted | Host-capability-dependent | Same overlay/target-existence caveat as above |
+| `ReadWrite` | `read_only + deny` | Accepted | Host-capability-dependent | Same overlay/target-existence caveat as above |
 | `ReadOnly` | none | Accepted | Usable | Global read-only mode |
 | `ReadOnly` | `read_only` only | Accepted | Usable but redundant | The default already allows reads and denies writes |
 | `ReadOnly` | `read_write` only | Accepted | Usable | Explicit write carve-outs |
-| `ReadOnly` | `deny` only | Accepted | Host-capability-dependent | Denied paths are implemented with overlays; writes remain controlled by Landlock |
+| `ReadOnly` | `deny` only | Accepted | Host-capability-dependent | Denied paths are implemented with overlays; writes remain controlled by Landlock, and denied overlay targets must already exist |
 | `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant; `read_write` adds writable carve-outs |
-| `ReadOnly` | any shape containing `deny` | Accepted | Host-capability-dependent | Includes `read_write + deny` and `read_only + read_write + deny`; deny paths use overlays |
+| `ReadOnly` | any shape containing `deny` | Accepted | Host-capability-dependent | Includes `read_write + deny` and `read_only + read_write + deny`; deny paths use overlays and require existing targets |
 | `NoAccess` | none | Accepted | Usually not usable for normal commands | Normal dynamically linked commands still need runtime-readable roots to bootstrap |
 | `NoAccess` | `read_only` only | Accepted | Conditional | Explicit read allowlist only; runtime/bootstrap roots must also be allowed if needed |
 | `NoAccess` | `read_write` only | Accepted | Conditional | Explicit read/write allowlist only; same bootstrap caveat |
 | `NoAccess` | `read_only + read_write` | Accepted | Conditional | Typical allowlist mode; same bootstrap caveat |
 | `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Conditional | Usually redundant because the default is already deny |
-| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional + host-capability-dependent | Overlapping denied paths are implemented with overlays; runtime roots and namespace support are both required |
+| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional + host-capability-dependent | Overlapping denied paths are implemented with overlays; runtime roots, namespace support, and an already-existing denied target are all required |
 
 Linux-specific caveats:
 
 - Any Linux policy shape that requires deny/read-only bind overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
+- Overlay-backed subtractive rules currently apply only to already-existing path objects. This is a backend contract on top of the kernel primitives we use: bind mounts need an existing mount point, and creating that target inside only a private mount namespace would still create it on the shared host filesystem.
 - `NoAccess` policies must usually allow runtime/bootstrap roots such as `/bin`, `/usr/bin`, `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, and `/usr/libexec` in addition to the target data paths.
 
 ### macOS
@@ -316,13 +317,14 @@ Linux-specific caveats:
 | `NoAccess` | `read_write` only | Accepted | Conditional | Same bootstrap caveat: include runtime roots plus required macOS device nodes |
 | `NoAccess` | `read_only + read_write` | Accepted | Conditional | Runnable on current CI with the bootstrap allowlist; typical strict-allowlist mode |
 | `NoAccess` | non-overlapping `deny` added to any non-overlapping allowlist | Accepted | Conditional | Runnable on current CI with the same bootstrap prerequisites; `deny` is usually redundant because the default is already deny |
-| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional, verify deny precedence on the target macOS | The policy shape is runnable on current CI; explicit deny is still emitted after allowlist rules, but overlap precedence should still be validated on the macOS version you target |
+| `NoAccess` | overlapping allow + `deny` | Accepted | Conditional | Runnable on current `macos-latest` CI with canonicalized paths plus the documented bootstrap allowlist; the overlapping denied subtree is enforced in runtime tests |
 
 macOS-specific caveats:
 
 - Path-based policies are only reliable when the policy paths match the canonical paths seen by Seatbelt, for example `/private/var/...` instead of an unresolved `/var/...` alias.
 - `NoAccess` profiles now emit literal read allowances for every ancestor of each allowlisted readable path. Without those ancestor literals, Seatbelt could deny path traversal before the allowlisted subtree was ever reached.
 - In practice, runnable macOS `NoAccess` policies still need bootstrap paths beyond the target data subtree. Current CI coverage on `macos-15-arm64` uses canonicalized runtime roots plus read-write device nodes such as `/dev/null`, `/dev/tty`, and `/dev/dtracehelper`.
+- Current CI coverage on `macos-latest` also exercises `NoAccess + overlapping allow + deny` at runtime, so the remaining caveat is bootstrap/runtime-path sensitivity rather than a known deny-precedence gap in this crate.
 - Treat macOS `NoAccess` as conditionally runnable rather than universally runnable: validate the exact command, runtime roots, and device-node requirements on the macOS version you ship against.
 
 ---
@@ -350,7 +352,7 @@ macOS-specific caveats:
 
 Current automated coverage emphasis:
 
-- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` / `NoAccess + overlapping deny` cases and runnable `NoAccess` allowlist coverage on both Linux and macOS CI.
+- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` / `NoAccess + overlapping deny` cases, Linux existing-overlay-target fail-closed coverage, and runnable `NoAccess` allowlist/overlap coverage on both Linux and macOS CI.
 - `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including Linux `NoAccess` bootstrap regression coverage and macOS `NoAccess` / `ReadOnly + read_write + deny` behavior when run on macOS CI.
 - `tests/network_access_control.rs`: loopback and external TCP deny checks when `network_access == false`.
 - `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite`, `ReadOnly`, and `NoAccess` profiles.
