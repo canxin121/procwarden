@@ -350,24 +350,28 @@ pub fn no_access_policy_with_runtime_roots(
 }
 
 fn runtime_bootstrap_permissions() -> Vec<SandboxPathPermission> {
-    let permissions = runtime_readable_roots()
-        .into_iter()
-        .map(SandboxPathPermission::read_only)
-        .collect::<Vec<_>>();
-
     #[cfg(target_os = "macos")]
     {
-        let mut permissions = permissions;
+        let mut permissions = runtime_readable_roots()
+            .into_iter()
+            .map(SandboxPathPermission::read_only)
+            .collect::<Vec<_>>();
         for device_path in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] {
             let path = PathBuf::from(device_path);
             if path.exists() {
                 permissions.push(SandboxPathPermission::read_write(path));
             }
         }
-        return permissions;
+        permissions
     }
 
-    permissions
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime_readable_roots()
+            .into_iter()
+            .map(SandboxPathPermission::read_only)
+            .collect::<Vec<_>>()
+    }
 }
 
 fn runtime_readable_roots() -> Vec<PathBuf> {
