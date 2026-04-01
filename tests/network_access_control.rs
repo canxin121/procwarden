@@ -3,9 +3,9 @@ mod common;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use procwarden::{SandboxAccess, SandboxManager, SandboxPathPermission};
 #[cfg(target_os = "windows")]
 use procwarden::SandboxError;
+use procwarden::{SandboxAccess, SandboxManager, SandboxPathPermission};
 
 use common::{
     Fixture, assert_failure, connect_command, execute_case, policy, sandbox_request,
