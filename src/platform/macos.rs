@@ -76,10 +76,10 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
             lines.push("(deny file-read*)".to_string());
             lines.push("(deny file-write*)".to_string());
 
-            // Traversing an allowlisted path under a global file-read deny still needs metadata
-            // access to each ancestor directory, including `/`.
+            // Traversing an allowlisted path under a global file-read deny still needs literal
+            // reads of each ancestor directory, including `/`.
             for ancestor in readable_path_ancestors(&readable_paths) {
-                push_literal_rule(&mut lines, "allow", "file-read-metadata", &ancestor);
+                push_literal_rule(&mut lines, "allow", "file-read*", &ancestor);
             }
 
             for readable in readable_paths {
@@ -229,11 +229,11 @@ mod tests {
         assert_line_before(
             &profile,
             "(deny file-read*)",
-            "(allow file-read-metadata (literal \"/\"))",
+            "(allow file-read* (literal \"/\"))",
         );
         assert_line_before(
             &profile,
-            "(allow file-read-metadata (literal \"/private\"))",
+            "(allow file-read* (literal \"/private\"))",
             &format!("(allow file-read* (literal \"{}\"))", readable.display()),
         );
         assert_line_before(

@@ -333,10 +333,7 @@ pub fn no_access_policy_with_runtime_roots(
     network_access: bool,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
-    let mut permissions = runtime_readable_roots()
-        .into_iter()
-        .map(SandboxPathPermission::read_only)
-        .collect::<Vec<_>>();
+    let mut permissions = runtime_bootstrap_permissions();
     permissions.extend(path_permissions);
 
     let mut deduped = Vec::new();
@@ -350,6 +347,27 @@ pub fn no_access_policy_with_runtime_roots(
     }
 
     policy(SandboxAccess::NoAccess, network_access, deduped)
+}
+
+fn runtime_bootstrap_permissions() -> Vec<SandboxPathPermission> {
+    let permissions = runtime_readable_roots()
+        .into_iter()
+        .map(SandboxPathPermission::read_only)
+        .collect::<Vec<_>>();
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut permissions = permissions;
+        for device_path in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] {
+            let path = PathBuf::from(device_path);
+            if path.exists() {
+                permissions.push(SandboxPathPermission::read_write(path));
+            }
+        }
+        return permissions;
+    }
+
+    permissions
 }
 
 fn runtime_readable_roots() -> Vec<PathBuf> {
