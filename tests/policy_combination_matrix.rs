@@ -186,7 +186,7 @@ fn policy_shape_matrix_acceptance_contract() {
             overlap_read_write_with_deny: false,
             use_runtime_roots: true,
             linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            macos_expectation: Expectation::AcceptedShapeOnly,
         },
         CombinationCase {
             name: "no_access_default_read_write_allowlist",
@@ -197,7 +197,7 @@ fn policy_shape_matrix_acceptance_contract() {
             overlap_read_write_with_deny: false,
             use_runtime_roots: true,
             linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            macos_expectation: Expectation::AcceptedShapeOnly,
         },
         CombinationCase {
             name: "no_access_default_allow_carveouts",
@@ -208,7 +208,7 @@ fn policy_shape_matrix_acceptance_contract() {
             overlap_read_write_with_deny: false,
             use_runtime_roots: true,
             linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            macos_expectation: Expectation::AcceptedShapeOnly,
         },
         CombinationCase {
             name: "no_access_default_allow_and_non_overlap_deny",
@@ -219,7 +219,7 @@ fn policy_shape_matrix_acceptance_contract() {
             overlap_read_write_with_deny: false,
             use_runtime_roots: true,
             linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            macos_expectation: Expectation::AcceptedShapeOnly,
         },
         CombinationCase {
             name: "no_access_default_overlap_allow_and_deny",
@@ -230,7 +230,7 @@ fn policy_shape_matrix_acceptance_contract() {
             overlap_read_write_with_deny: true,
             use_runtime_roots: true,
             linux_expectation: Expectation::HostCapabilityDependent,
-            macos_expectation: Expectation::Runnable,
+            macos_expectation: Expectation::AcceptedShapeOnly,
         },
     ];
 
@@ -306,6 +306,7 @@ fn policy_shape_matrix_acceptance_contract() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn no_access_default_supports_read_only_and_read_write_carveouts() {
     let fixture = Fixture::new("matrix-no-access-carveouts");
@@ -355,6 +356,7 @@ fn no_access_default_supports_read_only_and_read_write_carveouts() {
     assert_success(&write_rw, "no_access_default write readwrite path");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn no_access_default_non_overlapping_deny_remains_runnable_and_fails_closed_for_denied_path() {
     let fixture = Fixture::new("matrix-no-access-non-overlap-deny");

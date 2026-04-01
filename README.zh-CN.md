@@ -312,16 +312,17 @@ Linux 额外前提：
 | `ReadOnly` | `read_write + deny` | Accepted | 使用 canonicalized 且非重叠路径时可用 | “可写 carve-out + deny 路径”；显式 deny 规则会在 carve-out 之后发出 |
 | `ReadOnly` | `read_only + read_write + deny` | Accepted | 使用 canonicalized 且非重叠路径时可用 | 同上 |
 | `NoAccess` | 无 | Accepted | 对普通命令通常不可用 | 命令本身及其运行时 bootstrap 路径也会被一起拒绝 |
-| `NoAccess` | 仅 `read_only` | Accepted | 有条件可用 | 显式只读 allowlist；若命令需要运行时根路径，也要用 canonicalized 路径一并放行 |
-| `NoAccess` | 仅 `read_write` | Accepted | 有条件可用 | 显式读写 allowlist；同样受 bootstrap 前提约束 |
-| `NoAccess` | `read_only + read_write` | Accepted | 有条件可用 | 同样受 bootstrap 和 canonicalize 前提约束 |
-| `NoAccess` | 在任意非重叠 allowlist 上再加非重叠 `deny` | Accepted | 有条件可用 | 通常是冗余的，因为默认本来就是 deny；同时仍然需要 bootstrap/runtime roots |
-| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 有条件可用，但应在目标 macOS 上验证 | 后端现在会把显式 deny 规则放在 allowlist 规则之后，意图上是 deny 覆盖 allow；但重叠优先级仍建议在目标 macOS 版本上实测 |
+| `NoAccess` | 仅 `read_only` | Accepted | 仅保证形状被接受；必须在目标 macOS 和目标命令上单独验证 | 在 GitHub Actions `macos-15-arm64` 上，即使加入 canonicalized runtime roots，普通 `/bin/sh` / `/bin/cat` 也不能在 `NoAccess` 下稳定 bootstrap |
+| `NoAccess` | 仅 `read_write` | Accepted | 仅保证形状被接受；必须在目标 macOS 和目标命令上单独验证 | 当前 macOS CI 观察到相同 bootstrap 问题 |
+| `NoAccess` | `read_only + read_write` | Accepted | 仅保证形状被接受；必须在目标 macOS 和目标命令上单独验证 | 后端接受 allowlist 形状，但当前 macOS CI 不能支撑“普通动态命令可运行”的结论 |
+| `NoAccess` | 在任意非重叠 allowlist 上再加非重叠 `deny` | Accepted | 仅保证形状被接受；必须在目标 macOS 和目标命令上单独验证 | 通常本就冗余，因为默认就是 deny；当前 macOS CI 仍无法证明普通命令能 bootstrap |
+| `NoAccess` | allow 与 `deny` 重叠 | Accepted | 仅保证形状被接受；必须在目标 macOS 上实测 | 后端会把显式 deny 放在 allowlist 之后，但当前 macOS CI 不足以支持“普通命令可运行且重叠优先级稳定”这一结论 |
 
 macOS 额外前提：
 
 - 路径型策略只有在 policy 里的路径与 Seatbelt 实际看到的 canonical path 一致时才可靠，例如 `/private/var/...` 而不是未解析别名的 `/var/...`。
-- `NoAccess` 在实践中和 Linux 一样存在 bootstrap 问题，只放行业务数据路径通常不足以让 `/bin/sh`、解释器或动态链接可执行文件干净启动。
+- 当前 CI 观察下，macOS `NoAccess` 比 Linux 更不稳定：在 GitHub Actions `macos-15-arm64` 上，即使加入 canonicalized runtime-root allowlist，普通 `/bin/sh` / `/bin/cat` 仍不能干净 bootstrap。
+- 因此 macOS 上的 `NoAccess` 目前只能保守表述为“后端接受这种策略形状”；若要宣称某个组合“可运行”，必须拿目标 macOS 版本和目标命令单独实测。
 
 ---
 
@@ -348,7 +349,7 @@ macOS 额外前提：
 
 当前覆盖重点：
 
-- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite` / `ReadOnly + deny` / `NoAccess + 重叠 deny` 组合，以及可运行的 `NoAccess` allowlist 组合。
+- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite` / `ReadOnly + deny` / `NoAccess + 重叠 deny` 组合、Linux 上可运行的 `NoAccess` allowlist 组合，以及 macOS 上 `NoAccess` 的 shape-acceptance 覆盖。
 - `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为，包括 Linux `NoAccess` bootstrap 回归测试，以及在 macOS CI 上运行时的 `ReadOnly + read_write + deny` 组合行为。
 - `tests/network_access_control.rs`：覆盖 `network_access == false` 时对 loopback 与外部 TCP 的阻断。
 - `src/platform/macos.rs` 单元测试：覆盖 `ReadWrite`、`ReadOnly`、`NoAccess` 三类 SBPL 生成顺序。

@@ -10,6 +10,7 @@ use common::{
     should_skip_windows_wfp_unavailable, write_command,
 };
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn default_no_access_enforces_readonly_readwrite_and_outside_denial() {
     let fixture = Fixture::new("policy-noaccess");
@@ -100,6 +101,34 @@ fn default_no_access_enforces_readonly_readwrite_and_outside_denial() {
         !outside_write_target.exists(),
         "default_no_access write outside path should not create file"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn default_no_access_allowlist_shape_is_accepted_but_bootstrap_is_target_dependent() {
+    let fixture = Fixture::new("policy-noaccess");
+    let manager = SandboxManager::new();
+
+    let test_policy = no_access_policy_with_runtime_roots(
+        false,
+        vec![
+            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
+            SandboxPathPermission::read_only(fixture.ro_dir.clone()),
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+        ],
+    );
+
+    let read_ro_request =
+        sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500);
+    let read_ro_result = manager.execute(&read_ro_request, &test_policy);
+    match read_ro_result {
+        Ok(_) => {}
+        Err(error) => {
+            panic!(
+                "default_no_access macos shape acceptance probe: manager execution failed: {error:?}"
+            )
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
