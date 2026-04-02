@@ -212,9 +212,15 @@ When `network_access == false`, the backend installs Windows Filtering Platform 
 - Filters live only for the sandbox session lifetime and are removed when the engine session closes (dynamic session semantics).
 - Effectively this is all-IP-network deny for the sandboxed process (loopback + local subnet + external network), not only public internet deny.
 
-If WFP setup fails with privilege/support limitations (`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`), the backend automatically requests administrator elevation (UAC) and installs temporary firewall block rules via an elevated helper.
+If WFP setup fails with privilege/support limitations (`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`)
+and the current process is not already elevated, the backend requests administrator elevation (UAC)
+and installs temporary firewall block rules via an elevated helper.
 
-If automatic elevation fails (for example user cancellation), execution fails closed with an explicit error.
+If the current process is already elevated and WFP still reports unsupported, execution fails closed
+with `SandboxError::Windows`; there is no weaker network-enforcement downgrade.
+
+If automatic elevation fails (for example user cancellation), execution fails closed with an
+explicit error.
 
 ---
 
@@ -330,7 +336,12 @@ macOS-specific caveats:
 The matrix above describes the platform contract. GitHub Actions results are an observation layer on
 top of that contract, not a replacement for it.
 
-As of April 1, 2026, the latest fully green three-platform CI runs were:
+As of April 2, 2026, a key fully green three-platform CI run for the current Windows
+investigation is:
+
+- [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558) on `windows-matrix-investigation` ("Fix Windows target clippy lint in matrix probe")
+
+Historical green runs that were still useful for the Linux/macOS investigation:
 
 - [`23849870506`](https://github.com/canxin121/procwarden/actions/runs/23849870506) on `master` ("Clarify Linux and macOS matrix caveats")
 - [`23845006394`](https://github.com/canxin121/procwarden/actions/runs/23845006394) on `master` ("fix: align macos noaccess matrix with CI")
@@ -344,6 +355,26 @@ What those runs tell us:
 - CI now also runs a dedicated hosted-runner probe (`cargo run --quiet --bin ci_matrix_probe`) and writes its findings into the GitHub Actions step summary.
 - On `windows-latest`, that probe now records the effective Windows filesystem support matrix plus per-policy wall-clock timing samples so we can tell whether the backend is merely functional or too slow to be practical on hosted runners.
 
+### Windows hosted-runner result (`windows-latest`)
+
+Run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558) gives the
+first clean three-platform observation for the current public API on GitHub-hosted Windows:
+
+| Probe dimension | Observed result | Interpretation |
+|---|---|---|
+| Host process elevation | `windows.host_process_elevated=true` | The runner process was already elevated |
+| `network_access=true` | `invalid_request` | Current Windows backend contract only supports `network_access=false` |
+| Any probed `network_access=false` policy shape | `windows_error(FwpmEngineOpen0 failed: 50 ...)` | WFP dynamic-session setup is unsupported on this host, so execution fails before process launch |
+| Enforcement follow-up probes | `wfp_unavailable` | No downgrade occurred; the backend failed closed instead of running with weaker network isolation |
+| Per-shape timing samples | `windows.timing.skipped_reason=wfp_unavailable` | There is no "very slow but usable" result here; the runner is effectively unusable for Windows backend execution |
+
+Practical conclusion for GitHub-hosted Windows:
+
+- The current `windows-latest` runner is not a usable environment for this backend.
+- The limiting factor is host WFP availability, not the path-permission matrix implementation in this crate.
+- Because the process is already elevated on that runner, the non-elevated auto-elevation firewall fallback path is never taken.
+- The full `windows-latest` CI job took about 80 seconds, but the hosted-runner diagnostics step took about 1 second; there is no evidence of long per-policy execution time because requests abort during WFP setup.
+
 ---
 
 ## Three-platform comparison
@@ -355,7 +386,7 @@ What those runs tell us:
 | Network enforcement location | seccomp syscall filtering | WFP ALE-layer filter enforcement | Seatbelt `network*` rule filtering |
 | Path pre-validation in this crate | Manager canonicalizes existing request/policy paths before dispatch; kernel still enforces namespaces and overlays | Manager canonicalizes existing request/policy paths, then Windows re-sanitizes ACL inputs case-insensitively | Manager canonicalizes existing request/policy paths before SBPL emission |
 | Process timeout handling | Process-group aware timeout kill | Explicit timeout with termination and job containment | Uses shared timeout runner wrapper |
-| Missing backend dependency behavior | N/A | N/A | Fails closed when `sandbox-exec` missing |
+| Missing backend dependency behavior | N/A | Fails closed on unsupported WFP hosts when no helper fallback applies | Fails closed when `sandbox-exec` missing |
 
 ---
 

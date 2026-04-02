@@ -212,7 +212,12 @@ policy 按“默认 + 覆盖”转换为 ACL 计划：
 - 过滤器随动态会话生命周期存在；会话关闭后自动清理。
 - 效果上属于沙盒进程“全 IP 网络阻断”（loopback + 内网 + 外网），不是仅阻断公网。
 
-若 WFP 因权限/环境限制失败（`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`），后端会默认自动发起管理员提权（UAC），并通过提权 helper 安装临时防火墙阻断规则。
+若 WFP 因权限/环境限制失败（`ERROR_ACCESS_DENIED` / `ERROR_NOT_SUPPORTED`），且当前进程
+本身还不是管理员，后端会自动发起管理员提权（UAC），并通过提权 helper 安装临时防火墙
+阻断规则。
+
+若当前进程已经是管理员，而 WFP 仍报告 unsupported，则执行会直接以
+`SandboxError::Windows` fail-closed，不会降级到更弱的网络约束模式。
 
 若自动提权失败（例如用户取消），执行会以明确错误 fail-closed。
 
@@ -330,7 +335,11 @@ macOS 额外前提：
 上面的矩阵描述的是平台 contract。GitHub Actions 的结果只是这个 contract 之上的观测层，
 不能直接替代 contract 本身。
 
-截至 2026 年 4 月 1 日，最近两次三平台全绿的 CI run 是：
+截至 2026 年 4 月 2 日，当前这轮 Windows 调查里一个关键的三平台全绿 CI run 是：
+
+- [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558)，`windows-matrix-investigation` 分支，标题 "Fix Windows target clippy lint in matrix probe"
+
+之前对 Linux/macOS 调查仍然有参考价值的历史全绿 run：
 
 - [`23849870506`](https://github.com/canxin121/procwarden/actions/runs/23849870506)，`master` 分支，标题 "Clarify Linux and macOS matrix caveats"
 - [`23845006394`](https://github.com/canxin121/procwarden/actions/runs/23845006394)，`master` 分支，标题 "fix: align macos noaccess matrix with CI"
@@ -344,6 +353,26 @@ macOS 额外前提：
 - 现在 CI 还会额外跑一个 hosted-runner probe（`cargo run --quiet --bin ci_matrix_probe`），并把结果写入 GitHub Actions step summary。
 - 在 `windows-latest` 上，这个 probe 现在还会记录 Windows 文件系统支持矩阵的实际结果，以及按策略形状分组的 wall-clock timing 样本。这样后续 run 不只知道“能不能跑”，还能判断 hosted runner 上的性能是否已经慢到不适合实际使用。
 
+### Windows hosted runner 结果（`windows-latest`）
+
+run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558)
+给出了当前公开 API 在 GitHub Hosted Windows 上第一轮干净的三平台观测：
+
+| 探针维度 | 实际结果 | 解释 |
+|---|---|---|
+| 宿主进程是否已提权 | `windows.host_process_elevated=true` | runner 进程本身已经是管理员 |
+| `network_access=true` | `invalid_request` | 当前 Windows 后端 contract 只支持 `network_access=false` |
+| 任意探测到的 `network_access=false` 策略形状 | `windows_error(FwpmEngineOpen0 failed: 50 ...)` | 宿主不支持 WFP 动态会话初始化，进程在真正启动前就失败 |
+| enforcement 跟进探测 | `wfp_unavailable` | 没有发生降级；后端是 fail-closed，而不是带着更弱网络隔离继续跑 |
+| 分策略 timing 样本 | `windows.timing.skipped_reason=wfp_unavailable` | 这里不存在“很慢但能用”的结论；这个 runner 对 Windows 后端来说实际上不可用 |
+
+对 GitHub Hosted Windows 的实际结论：
+
+- 当前 `windows-latest` runner 不是这个后端的可用运行环境。
+- 限制因素是宿主的 WFP 可用性，不是本 crate 的路径权限矩阵实现。
+- 由于该 runner 进程本身已经是管理员，因此“先普通进程启动，再自动提权到防火墙 helper”这条回退路径不会被触发。
+- 整个 `windows-latest` job 大约耗时 80 秒，但 hosted-runner diagnostics 这一步只耗时约 1 秒；没有证据表明策略执行是“很慢”，因为请求在 WFP 设置阶段就已经终止了。
+
 ---
 
 ## 三平台对比
@@ -355,7 +384,7 @@ macOS 额外前提：
 | 网络约束位置 | seccomp syscall 过滤 | WFP ALE 层过滤 | Seatbelt `network*` 规则过滤 |
 | 本 crate 的路径预校验 | manager 先 canonicalize 已存在的 request/policy 路径，再交给内核执行 namespace/overlay 约束 | manager 先 canonicalize，再由 Windows 以大小写不敏感方式二次清洗 ACL 输入 | manager 先 canonicalize 已存在的 request/policy 路径，再生成 SBPL |
 | 超时处理 | 进程组感知的超时 kill | 显式超时终止 + job 约束 | 复用共享超时执行器 |
-| 后端依赖缺失行为 | N/A | N/A | `sandbox-exec` 缺失时 fail-closed |
+| 后端依赖缺失行为 | N/A | 当 WFP 在宿主上不可用且 helper 回退不适用时 fail-closed | `sandbox-exec` 缺失时 fail-closed |
 
 ---
 
