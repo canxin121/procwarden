@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxPathPermission};
+use procwarden::{SandboxDefaultAccess, SandboxError, SandboxManager, SandboxPathPermission};
 
 use common::{
     Fixture, assert_failure, assert_success, execute_case, policy, read_command, sandbox_request,
@@ -124,9 +124,17 @@ fn default_read_write_enforces_readonly_overrides() {
         );
         return;
     }
-    let write_outside = write_outside_result.unwrap_or_else(|error| {
-        panic!("default_read_write write outside path: manager execution failed: {error:?}")
-    });
+    let write_outside = match write_outside_result {
+        Ok(output) => output,
+        Err(SandboxError::Unavailable(message))
+            if cfg!(target_os = "linux") && message.contains("mount-namespace support") =>
+        {
+            return;
+        }
+        Err(error) => {
+            panic!("default_read_write write outside path: manager execution failed: {error:?}")
+        }
+    };
     assert_success(&write_outside, "default_read_write write outside path");
     assert_eq!(
         fs::read_to_string(&write_outside_target).expect("outside write target should exist"),
