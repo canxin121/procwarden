@@ -4,10 +4,7 @@ mod common;
 
 use procwarden::{SandboxDefaultAccess, SandboxError, SandboxManager, SandboxPathPermission};
 
-use common::{
-    Fixture, assert_failure, assert_success, execute_case, policy, read_command, sandbox_request,
-    write_command,
-};
+use common::{Fixture, assert_success, policy, sandbox_request};
 
 #[derive(Clone, Copy)]
 enum Expectation {
@@ -165,7 +162,7 @@ fn linux_read_write_default_with_read_only_overlay_is_enforced_when_overlays_are
     let write_outside_target = fixture.outside_dir.join("allowed-linux-readwrite.txt");
     let write_outside = match manager.execute(
         &sandbox_request(
-            write_command(&write_outside_target, "allowed"),
+            common::write_command(&write_outside_target, "allowed"),
             &fixture.runtime_cwd,
             2_500,
         ),
@@ -184,26 +181,30 @@ fn linux_read_write_default_with_read_only_overlay_is_enforced_when_overlays_are
         "linux readwrite+readonly write outside path",
     );
 
-    let read_ro = execute_case(
+    let read_ro = common::execute_case(
         &manager,
-        &sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500),
+        &sandbox_request(
+            common::read_command(&fixture.ro_seed),
+            &fixture.runtime_cwd,
+            2_500,
+        ),
         &test_policy,
         "linux readwrite+readonly read readonly path",
     );
     assert_success(&read_ro, "linux readwrite+readonly read readonly path");
 
     let write_ro_target = fixture.ro_dir.join("blocked-linux-readwrite-readonly.txt");
-    let write_ro = execute_case(
+    let write_ro = common::execute_case(
         &manager,
         &sandbox_request(
-            write_command(&write_ro_target, "blocked"),
+            common::write_command(&write_ro_target, "blocked"),
             &fixture.runtime_cwd,
             2_500,
         ),
         &test_policy,
         "linux readwrite+readonly write readonly path",
     );
-    assert_failure(&write_ro, "linux readwrite+readonly write readonly path");
+    common::assert_failure(&write_ro, "linux readwrite+readonly write readonly path");
 }
 
 #[cfg(target_os = "linux")]
