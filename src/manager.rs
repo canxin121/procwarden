@@ -102,7 +102,6 @@ fn sanitize_policy_for_execution(policy: &SandboxPolicy) -> Result<SandboxPolicy
 
 fn sanitize_policy_path(permission: &SandboxPathPermission) -> Result<PathBuf, SandboxError> {
     let label = match permission.access {
-        SandboxPathAccess::Deny => "deny",
         SandboxPathAccess::ReadOnly => "read_only",
         SandboxPathAccess::ReadWrite => "read_write",
     };
@@ -149,20 +148,16 @@ fn sanitize_existing_path(
 
 fn path_access_key(access: SandboxPathAccess) -> u8 {
     match access {
-        SandboxPathAccess::Deny => 0,
-        SandboxPathAccess::ReadOnly => 1,
-        SandboxPathAccess::ReadWrite => 2,
+        SandboxPathAccess::ReadOnly => 0,
+        SandboxPathAccess::ReadWrite => 1,
     }
 }
 
 fn explicit_priority(default_access: super::SandboxDefaultAccess, access: SandboxPathAccess) -> u8 {
-    use super::SandboxDefaultAccess::{ReadOnly, ReadWrite};
-
-    match (default_access, access) {
-        (_, SandboxPathAccess::Deny) => 2,
-        (ReadOnly, SandboxPathAccess::ReadWrite) => 1,
-        (ReadWrite, SandboxPathAccess::ReadOnly) => 1,
-        _ => 0,
+    if access == default_access_path_access(default_access) {
+        0
+    } else {
+        1
     }
 }
 
@@ -170,14 +165,18 @@ fn access_for_priority(
     default_access: super::SandboxDefaultAccess,
     priority: u8,
 ) -> Option<SandboxPathAccess> {
-    use super::SandboxDefaultAccess::{ReadOnly, ReadWrite};
-
     match (default_access, priority) {
         (_, 0) => None,
-        (_, 2) => Some(SandboxPathAccess::Deny),
-        (ReadOnly, 1) => Some(SandboxPathAccess::ReadWrite),
-        (ReadWrite, 1) => Some(SandboxPathAccess::ReadOnly),
+        (super::SandboxDefaultAccess::ReadOnly, 1) => Some(SandboxPathAccess::ReadWrite),
+        (super::SandboxDefaultAccess::ReadWrite, 1) => Some(SandboxPathAccess::ReadOnly),
         _ => None,
+    }
+}
+
+fn default_access_path_access(default_access: super::SandboxDefaultAccess) -> SandboxPathAccess {
+    match default_access {
+        super::SandboxDefaultAccess::ReadOnly => SandboxPathAccess::ReadOnly,
+        super::SandboxDefaultAccess::ReadWrite => SandboxPathAccess::ReadWrite,
     }
 }
 
@@ -332,16 +331,16 @@ mod tests {
         let missing_path = temp.path().join("missing");
 
         let error = sanitize_policy_for_execution(&SandboxPolicy {
-            default_access: SandboxDefaultAccess::ReadOnly,
+            default_access: SandboxDefaultAccess::ReadWrite,
             network_access: false,
-            path_permissions: vec![SandboxPathPermission::deny(missing_path.clone())],
+            path_permissions: vec![SandboxPathPermission::read_only(missing_path.clone())],
         })
         .expect_err("missing path should fail validation");
 
         match error {
             SandboxError::InvalidRequest(message) => {
                 assert!(
-                    message.contains("deny path does not exist"),
+                    message.contains("read_only path does not exist"),
                     "unexpected error message: {message}"
                 );
                 assert!(
@@ -406,24 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn deny_wins_for_same_path_conflicts_before_dispatch() {
-        let temp = TestTempDir::new("deny-wins-same-path");
+    fn conflicting_same_path_entries_collapse_to_effective_overlay_before_dispatch() {
+        let temp = TestTempDir::new("conflicting-same-path");
         let path = temp.path().join("target");
         fs::create_dir_all(&path).expect("target path should be created");
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
-            default_access: SandboxDefaultAccess::ReadOnly,
+            default_access: SandboxDefaultAccess::ReadWrite,
             network_access: false,
             path_permissions: vec![
+                SandboxPathPermission::read_only(path.clone()),
                 SandboxPathPermission::read_write(path.clone()),
-                SandboxPathPermission::deny(path.clone()),
             ],
         })
         .expect("policy should sanitize successfully");
 
         assert_eq!(
             sanitized.path_permissions,
-            vec![SandboxPathPermission::deny(
+            vec![SandboxPathPermission::read_only(
                 cap_fs::canonicalize_path(&path).expect("path should canonicalize")
             )]
         );

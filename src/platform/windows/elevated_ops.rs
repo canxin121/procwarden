@@ -50,7 +50,6 @@ function Rule-Permission([string]$Kind, [bool]$IsDirectory) {
         "ro" { return $(if ($IsDirectory) { "(OI)(CI)(RX)" } else { "(RX)" }) }
         "rw" { return $(if ($IsDirectory) { "(OI)(CI)(M)" } else { "(M)" }) }
         "dw" { return $(if ($IsDirectory) { "(OI)(CI)(W)" } else { "(W)" }) }
-        "dn" { return $(if ($IsDirectory) { "(OI)(CI)(RX,W)" } else { "(RX,W)" }) }
         default { throw "unknown ACL rule kind: $Kind" }
     }
 }
@@ -60,7 +59,6 @@ function Rule-AccessMode([string]$Kind) {
         "ro" { return "/grant" }
         "rw" { return "/grant" }
         "dw" { return "/deny" }
-        "dn" { return "/deny" }
         default { throw "unknown ACL rule kind: $Kind" }
     }
 }
@@ -176,7 +174,6 @@ pub(super) struct ElevatedOpsSpec {
     pub(super) allow_readonly_paths: Vec<PathBuf>,
     pub(super) allow_readwrite_paths: Vec<PathBuf>,
     pub(super) deny_write_paths: Vec<PathBuf>,
-    pub(super) deny_readwrite_paths: Vec<PathBuf>,
 }
 
 pub(super) struct ElevatedOpsGuard {
@@ -338,9 +335,6 @@ fn elevated_powershell_parameters(
 fn serialize_acl_spec(spec: &ElevatedOpsSpec) -> String {
     let mut lines = Vec::new();
 
-    for path in &spec.deny_readwrite_paths {
-        lines.push(format!("dn\t{}", path.to_string_lossy()));
-    }
     for path in &spec.deny_write_paths {
         lines.push(format!("dw\t{}", path.to_string_lossy()));
     }

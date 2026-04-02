@@ -31,15 +31,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn probe_frontloaded_missing_path_validation() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new("frontloaded-missing-path");
     let manager = SandboxManager::new();
-    let missing_path = fixture.runtime_cwd.join("missing-deny-target");
+    let missing_path = fixture.runtime_cwd.join("missing-readonly-target");
 
     let policy = SandboxPolicy {
-        default_access: SandboxDefaultAccess::ReadOnly,
+        default_access: SandboxDefaultAccess::ReadWrite,
         network_access: false,
-        path_permissions: vec![
-            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
-            SandboxPathPermission::deny(missing_path.clone()),
-        ],
+        path_permissions: vec![SandboxPathPermission::read_only(missing_path.clone())],
     };
 
     let result = manager.execute(
@@ -48,7 +45,7 @@ fn probe_frontloaded_missing_path_validation() -> Result<(), Box<dyn Error>> {
     );
     match result {
         Err(SandboxError::InvalidRequest(message))
-            if message.contains("deny path does not exist") =>
+            if message.contains("read_only path does not exist") =>
         {
             println!("manager.missing_path_validation=frontloaded_invalid_request");
             Ok(())
@@ -64,7 +61,7 @@ fn probe_frontloaded_missing_path_validation() -> Result<(), Box<dyn Error>> {
 fn probe_linux_overlay_capability() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new("linux-overlay-capability");
     let manager = SandboxManager::new();
-    let policy = readonly_with_rw_and_deny_policy(&fixture);
+    let policy = readwrite_with_readonly_policy(&fixture);
 
     let bootstrap = manager.execute(
         &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
@@ -84,14 +81,18 @@ fn probe_linux_overlay_capability() -> Result<(), Box<dyn Error>> {
             )?;
             assert_success(&write_output, "linux writable carve-out")?;
 
-            let deny_output = manager.execute(
-                &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
+            let readonly_target = fixture.ro_dir.join("linux-overlay-readonly.txt");
+            let readonly_output = manager.execute(
+                &sandbox_request(
+                    write_command(&readonly_target, "blocked"),
+                    &fixture.runtime_cwd,
+                ),
                 &policy,
             )?;
-            assert_failure(&deny_output, "linux deny overlay enforcement")?;
+            assert_failure(&readonly_output, "linux readonly overlay enforcement")?;
 
             println!("linux.overlay_subtractive=available");
-            println!("linux.readonly_plus_deny_enforcement=ok");
+            println!("linux.readwrite_plus_readonly_enforcement=ok");
             Ok(())
         }
         Err(SandboxError::Unavailable(message)) if message.contains("mount-namespace support") => {
@@ -113,7 +114,7 @@ fn probe_macos_matrix_contract() -> Result<(), Box<dyn Error>> {
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.alias_rw_dir.clone()),
-            SandboxPathPermission::deny(fixture.deny_dir.clone()),
+            SandboxPathPermission::read_only(fixture.ro_dir.clone()),
         ],
     };
 
@@ -127,13 +128,17 @@ fn probe_macos_matrix_contract() -> Result<(), Box<dyn Error>> {
     )?;
     assert_success(&write_output, "macos writable carve-out")?;
 
-    let deny_output = manager.execute(
-        &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
+    let readonly_target = fixture.ro_dir.join("macos-readonly-blocked.txt");
+    let readonly_output = manager.execute(
+        &sandbox_request(
+            write_command(&readonly_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
         &policy,
     )?;
-    assert_failure(&deny_output, "macos deny enforcement")?;
+    assert_failure(&readonly_output, "macos readonly enforcement")?;
 
-    println!("macos.readonly_plus_readwrite_plus_deny=usable");
+    println!("macos.readonly_plus_readwrite=usable");
     println!("macos.alias_path_canonicalization=ok");
     Ok(())
 }
@@ -196,40 +201,28 @@ fn probe_windows_policy_shape_matrix(
             SandboxDefaultAccess::ReadWrite,
             false,
             false,
-            false,
         ),
         WindowsMatrixCase::new(
             "readwrite_readwrite",
             SandboxDefaultAccess::ReadWrite,
             false,
             true,
-            false,
         ),
         WindowsMatrixCase::new(
             "readwrite_readonly",
             SandboxDefaultAccess::ReadWrite,
             true,
             false,
-            false,
         ),
         WindowsMatrixCase::new(
-            "readwrite_deny",
-            SandboxDefaultAccess::ReadWrite,
-            false,
-            false,
-            true,
-        ),
-        WindowsMatrixCase::new(
-            "readwrite_readonly_deny",
+            "readwrite_readonly_readwrite",
             SandboxDefaultAccess::ReadWrite,
             true,
-            false,
             true,
         ),
         WindowsMatrixCase::new(
             "readonly_none",
             SandboxDefaultAccess::ReadOnly,
-            false,
             false,
             false,
         ),
@@ -238,40 +231,16 @@ fn probe_windows_policy_shape_matrix(
             SandboxDefaultAccess::ReadOnly,
             true,
             false,
-            false,
         ),
         WindowsMatrixCase::new(
             "readonly_readwrite",
             SandboxDefaultAccess::ReadOnly,
             false,
             true,
-            false,
-        ),
-        WindowsMatrixCase::new(
-            "readonly_deny",
-            SandboxDefaultAccess::ReadOnly,
-            false,
-            false,
-            true,
         ),
         WindowsMatrixCase::new(
             "readonly_readonly_readwrite",
             SandboxDefaultAccess::ReadOnly,
-            true,
-            true,
-            false,
-        ),
-        WindowsMatrixCase::new(
-            "readonly_readwrite_deny",
-            SandboxDefaultAccess::ReadOnly,
-            false,
-            true,
-            true,
-        ),
-        WindowsMatrixCase::new(
-            "readonly_readonly_readwrite_deny",
-            SandboxDefaultAccess::ReadOnly,
-            true,
             true,
             true,
         ),
@@ -303,7 +272,6 @@ fn probe_windows_enforcement_cases(
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
-            SandboxPathPermission::deny(fixture.deny_dir.clone()),
         ],
     };
 
@@ -313,26 +281,27 @@ fn probe_windows_enforcement_cases(
         &read_only_policy,
     );
     if is_windows_wfp_unavailable(&write_rw) {
-        println!("windows.enforcement.readonly_readwrite_deny=wfp_unavailable");
-        println!("windows.enforcement.readwrite_readonly_deny=wfp_unavailable");
+        println!("windows.enforcement.readonly_readwrite=wfp_unavailable");
+        println!("windows.enforcement.readwrite_readonly=wfp_unavailable");
         println!("windows.timing.skipped_reason=wfp_unavailable");
         return Ok(());
     }
     assert_success(
         &write_rw
-            .map_err(|error| format!("windows readonly+readwrite+deny manager error: {error:?}"))?,
-        "windows readonly+readwrite+deny write carve-out",
+            .map_err(|error| format!("windows readonly+readwrite manager error: {error:?}"))?,
+        "windows readonly+readwrite write carve-out",
     )?;
 
-    let read_deny = manager.execute(
-        &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
+    let write_outside_target = fixture.outside_dir.join("probe-readonly-outside.txt");
+    let write_outside = manager.execute(
+        &sandbox_request(
+            write_command(&write_outside_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
         &read_only_policy,
     );
-    assert_denied_or_failed_result(
-        &read_deny,
-        "windows readonly+readwrite+deny deny enforcement",
-    )?;
-    println!("windows.enforcement.readonly_readwrite_deny=ok");
+    assert_failed_result(&write_outside, "windows readonly+readwrite outside write")?;
+    println!("windows.enforcement.readonly_readwrite=ok");
 
     let read_write_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
@@ -340,7 +309,6 @@ fn probe_windows_enforcement_cases(
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_only(fixture.ro_dir.clone()),
-            SandboxPathPermission::deny(fixture.deny_dir.clone()),
         ],
     };
 
@@ -354,8 +322,8 @@ fn probe_windows_enforcement_cases(
     );
     assert_success(
         &write_outside
-            .map_err(|error| format!("windows readwrite+readonly+deny manager error: {error:?}"))?,
-        "windows readwrite+readonly+deny outside write",
+            .map_err(|error| format!("windows readwrite+readonly manager error: {error:?}"))?,
+        "windows readwrite+readonly outside write",
     )?;
 
     let write_ro_target = fixture.ro_dir.join("probe-readwrite-ro.txt");
@@ -366,20 +334,8 @@ fn probe_windows_enforcement_cases(
         ),
         &read_write_policy,
     );
-    assert_failed_result(
-        &write_ro,
-        "windows readwrite+readonly deny readonly override",
-    )?;
-
-    let read_deny = manager.execute(
-        &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
-        &read_write_policy,
-    );
-    assert_denied_or_failed_result(
-        &read_deny,
-        "windows readwrite+readonly+deny deny enforcement",
-    )?;
-    println!("windows.enforcement.readwrite_readonly_deny=ok");
+    assert_failed_result(&write_ro, "windows readwrite+readonly readonly override")?;
+    println!("windows.enforcement.readwrite_readonly=ok");
 
     Ok(())
 }
@@ -402,9 +358,9 @@ fn probe_windows_timing_samples(
             vec![SandboxPathPermission::read_write(fixture.rw_dir.clone())],
         ),
         WindowsTimingCase::new(
-            "readonly_deny",
+            "readonly_readonly",
             SandboxDefaultAccess::ReadOnly,
-            vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
+            vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
         ),
         WindowsTimingCase::new("readwrite_none", SandboxDefaultAccess::ReadWrite, vec![]),
         WindowsTimingCase::new(
@@ -413,9 +369,9 @@ fn probe_windows_timing_samples(
             vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
         ),
         WindowsTimingCase::new(
-            "readwrite_deny",
+            "readwrite_readwrite",
             SandboxDefaultAccess::ReadWrite,
-            vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
+            vec![SandboxPathPermission::read_write(fixture.rw_dir.clone())],
         ),
     ];
 
@@ -543,22 +499,6 @@ fn assert_failed_result(
 }
 
 #[cfg(target_os = "windows")]
-fn assert_denied_or_failed_result(
-    result: &Result<procwarden::SandboxExecOutput, SandboxError>,
-    context: &str,
-) -> Result<(), Box<dyn Error>> {
-    match result {
-        Ok(output) if output.exit_code != 0 => Ok(()),
-        Ok(output) => Err(format!(
-            "{context} succeeded unexpectedly: stdout={}, stderr={}",
-            output.stdout, output.stderr
-        )
-        .into()),
-        Err(SandboxError::Denied(_)) | Err(SandboxError::InvalidRequest(_)) => Ok(()),
-        Err(error) => Err(format!("{context} returned unexpected manager error: {error:?}").into()),
-    }
-}
-
 #[cfg(target_os = "windows")]
 fn average_ms(samples: &[u128]) -> u128 {
     let total = samples.iter().sum::<u128>();
@@ -606,7 +546,6 @@ struct WindowsMatrixCase {
     default_access: SandboxDefaultAccess,
     include_read_only: bool,
     include_read_write: bool,
-    include_deny: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -616,14 +555,12 @@ impl WindowsMatrixCase {
         default_access: SandboxDefaultAccess,
         include_read_only: bool,
         include_read_write: bool,
-        include_deny: bool,
     ) -> Self {
         Self {
             name,
             default_access,
             include_read_only,
             include_read_write,
-            include_deny,
         }
     }
 
@@ -634,9 +571,6 @@ impl WindowsMatrixCase {
         }
         if self.include_read_write {
             path_permissions.push(SandboxPathPermission::read_write(fixture.rw_dir.clone()));
-        }
-        if self.include_deny {
-            path_permissions.push(SandboxPathPermission::deny(fixture.deny_dir.clone()));
         }
 
         SandboxPolicy {
@@ -670,15 +604,11 @@ impl WindowsTimingCase {
 }
 
 #[cfg(target_os = "linux")]
-fn readonly_with_rw_and_deny_policy(fixture: &Fixture) -> SandboxPolicy {
+fn readwrite_with_readonly_policy(fixture: &Fixture) -> SandboxPolicy {
     SandboxPolicy {
-        default_access: SandboxDefaultAccess::ReadOnly,
+        default_access: SandboxDefaultAccess::ReadWrite,
         network_access: false,
-        path_permissions: vec![
-            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
-            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
-            SandboxPathPermission::deny(fixture.deny_dir.clone()),
-        ],
+        path_permissions: vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
     }
 }
 
@@ -760,27 +690,6 @@ fn exit_zero_command() -> Vec<String> {
     ]
 }
 
-fn read_command(target: &Path) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        let escaped_target = escape_powershell_single_quoted(target);
-        vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            format!(
-                "try {{ [System.IO.File]::ReadAllText('{escaped_target}') | Out-Null; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
-            ),
-        ]
-    }
-
-    #[cfg(not(windows))]
-    {
-        vec!["/bin/cat".to_string(), path_arg(target)]
-    }
-}
-
 fn write_command(target: &Path, payload: &str) -> Vec<String> {
     #[cfg(windows)]
     {
@@ -851,13 +760,10 @@ impl Drop for TempDir {
 struct Fixture {
     _workspace: TempDir,
     runtime_cwd: PathBuf,
-    #[cfg(target_os = "windows")]
     ro_dir: PathBuf,
     rw_dir: PathBuf,
     #[cfg(target_os = "macos")]
     alias_rw_dir: PathBuf,
-    deny_dir: PathBuf,
-    deny_seed: PathBuf,
     #[cfg(target_os = "windows")]
     outside_dir: PathBuf,
 }
@@ -868,15 +774,13 @@ impl Fixture {
         let runtime_cwd = workspace.path().join("runtime-cwd");
         let ro_dir = workspace.path().join("readonly");
         let rw_dir = workspace.path().join("readwrite");
-        let deny_dir = workspace.path().join("deny");
         let outside_dir = workspace.path().join("outside");
 
-        for dir in [&runtime_cwd, &ro_dir, &rw_dir, &deny_dir, &outside_dir] {
+        for dir in [&runtime_cwd, &ro_dir, &rw_dir, &outside_dir] {
             fs::create_dir_all(dir).expect("probe directory should be created");
         }
-
-        let deny_seed = deny_dir.join("seed-deny.txt");
-        fs::write(&deny_seed, "deny-seed").expect("deny seed should be created");
+        let ro_seed = ro_dir.join("seed-ro.txt");
+        fs::write(&ro_seed, "readonly-seed").expect("readonly seed should be created");
 
         #[cfg(target_os = "macos")]
         let alias_rw_dir = workspace
@@ -888,13 +792,10 @@ impl Fixture {
         Self {
             _workspace: workspace,
             runtime_cwd,
-            #[cfg(target_os = "windows")]
             ro_dir,
             rw_dir,
             #[cfg(target_os = "macos")]
             alias_rw_dir,
-            deny_dir,
-            deny_seed,
             #[cfg(target_os = "windows")]
             outside_dir,
         }

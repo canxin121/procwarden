@@ -21,7 +21,6 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
   - constructors:
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
-    - `SandboxPathPermission::deny(path)`
 - `default_access: SandboxDefaultAccess`
   - `ReadOnly | ReadWrite`
   - interpreted as the fallback rule for paths not explicitly listed in `path_permissions`
@@ -61,7 +60,6 @@ let policy = SandboxPolicy {
     path_permissions: vec![
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
-        SandboxPathPermission::deny(PathBuf::from("/tmp/job-123/secrets")),
     ],
     default_access: SandboxDefaultAccess::ReadOnly,
     network_access: false,
@@ -106,15 +104,12 @@ Implementation entry: `src/platform/linux.rs`
 Linux filesystem restrictions are applied in `pre_exec`, and the backend uses two enforcement paths:
 
 - `default_access == ReadWrite`
-  - if no `read_only` or `deny` overlays are present, the backend leaves the filesystem unrestricted.
-  - if `read_only` or `deny` overlays are present, the backend builds bind-mount overlays inside a private mount namespace.
+  - if no `read_only` overlays are present, the backend leaves the filesystem unrestricted.
+  - if `read_only` overlays are present, the backend builds bind-mount overlays inside a private mount namespace.
   - all overlay targets must already exist, otherwise execution fails with `SandboxError::InvalidRequest`.
   - if the host cannot create the required user/mount namespaces, execution fails with `SandboxError::Unavailable` instead of silently weakening the policy.
 - `default_access == ReadOnly`
-  - without any `deny` overlay, the backend installs a Landlock ruleset that grants global read access plus explicit write carve-outs from `read_write` paths.
-  - with any `deny` overlay, the backend installs deny bind-mount overlays first, then applies the Landlock ruleset.
-  - denied overlay targets must already exist.
-  - if the host cannot create the required user/mount namespaces, execution fails with `SandboxError::Unavailable`.
+  - the backend installs a Landlock ruleset that grants global read access plus explicit write carve-outs from `read_write` paths.
 
 Internal mapping used by the backend:
 
@@ -151,8 +146,8 @@ Implementation entry: `src/platform/windows/mod.rs`
 ### High-level execution flow
 
 1. Normalize selected environment defaults (`/dev/null`-like values -> `NUL`, non-interactive pager defaults).
-2. Build allow/deny path plan from policy.
-3. Validate and sanitize allow/deny paths.
+2. Build the ACL overlay plan from policy.
+3. Validate and sanitize overlay paths.
 4. Resolve the executable path.
 5. Create AppContainer context (SID/profile).
 6. If the process is not elevated, request a single UAC elevation and start one elevated helper for ACL + optional network block lifecycle.
@@ -176,15 +171,12 @@ Windows ACL inputs are then sanitized through `ensure_safe_allow_path`:
 
 Policy is converted to an ACL plan using default+overlay semantics:
 
-- `allow_readonly_paths = read_only_paths`
-- `allow_readwrite_paths = read_write_paths`
-- `deny_readwrite_paths = denied_paths`
 - if `default_access == ReadOnly`, the backend also grants readonly access to the inferred execution scope (for example `cwd`, executable path, executable parent, and path-like command arguments).
-- if `default_access == ReadWrite`, that inferred execution scope becomes read/write by default, while explicit `read_only` paths are additionally enforced as deny-write overlays.
+- if `default_access == ReadOnly`, explicit `read_write` paths add writable carve-outs on top of that readonly scope.
+- if `default_access == ReadWrite`, the inferred execution scope becomes read/write by default, while explicit `read_only` paths are additionally enforced as deny-write overlays.
 
 Then the backend:
 
-- adds deny read/write/execute ACEs for `deny_readwrite_paths`.
 - adds deny-write ACEs for read-only overlays under `default_access == ReadWrite`.
 - adds allow read/execute ACEs for `allow_readonly_paths`.
 - adds allow read/write/execute ACEs for `allow_readwrite_paths`.
@@ -249,8 +241,8 @@ Current mapping strategy:
 - `network_access == false` adds `(deny network*)`
 - this deny applies to local and external network access (for example loopback and remote endpoints).
 - default access is then mapped:
-  - `ReadWrite`: explicit `read_only` paths become `file-write*` deny rules; explicit `deny` paths become `file-read*` and `file-write*` deny rules.
-  - `ReadOnly`: emit a global `(deny file-write*)`, then explicit `read_write` carve-out allow rules, then explicit `deny` path rules last so deny still overrides carve-outs.
+  - `ReadWrite`: explicit `read_only` paths become `file-write*` deny rules.
+  - `ReadOnly`: emit a global `(deny file-write*)`, then explicit `read_write` carve-out allow rules.
 
 Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
 
@@ -266,7 +258,7 @@ backend builds SBPL rules. That closes the old alias mismatch gap for existing p
 The matrices below separate the two policy dimensions explicitly:
 
 - `default_access`: the fallback policy for paths not listed in `path_permissions`
-- `path_permissions`: the explicit per-path overrides (`read_only`, `read_write`, `deny`)
+- `path_permissions`: the explicit per-path overrides (`read_only`, `read_write`)
 
 "Accepted" means the backend accepts the request shape. "Usable" means it is a reasonable documented
 contract today. "Host-capability-dependent" means the policy shape is supported, but the Linux host
@@ -281,9 +273,6 @@ Interpretation notes for the current model:
   - usable means the host can create the required user/mount namespaces after the manager-level path validation has already succeeded.
   - if namespace support is missing, execution fails closed with `SandboxError::Unavailable`.
   - this is not a degraded mode; the backend does not silently continue with weaker enforcement.
-- For macOS rows labeled "Usable with non-overlapping paths":
-  - usable means manager-side canonicalization already succeeded, and the policy does not rely on overlapping carve-out/deny paths with ambiguous ordering.
-  - this is not a degraded mode; overlapping paths are a policy-shape caveat, not a runtime downgrade signal.
 
 ### Linux
 
@@ -292,18 +281,15 @@ Interpretation notes for the current model:
 | `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
 | `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not add new power over a global write default; manager normalizes them away before backend dispatch |
 | `ReadWrite` | `read_only` only | Accepted | Host-capability-dependent | Implemented via mount-namespace overlays; overlay targets must already exist |
-| `ReadWrite` | `deny` only | Accepted | Host-capability-dependent | Same overlay/target-existence caveat as above |
-| `ReadWrite` | `read_only + deny` | Accepted | Host-capability-dependent | Same overlay/target-existence caveat as above |
+| `ReadWrite` | `read_only + read_write` | Accepted | Host-capability-dependent | `read_write` is redundant and is normalized away; `read_only` still needs mount-namespace overlays |
 | `ReadOnly` | none | Accepted | Usable | Global read-only mode |
 | `ReadOnly` | `read_only` only | Accepted | Usable but redundant | The default already allows reads and denies writes; manager normalizes these entries away |
 | `ReadOnly` | `read_write` only | Accepted | Usable | Explicit write carve-outs |
-| `ReadOnly` | `deny` only | Accepted | Host-capability-dependent | Denied paths are implemented with overlays; denied overlay targets must already exist |
 | `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant and is normalized away; `read_write` adds writable carve-outs |
-| `ReadOnly` | any shape containing `deny` | Accepted | Host-capability-dependent | Includes `read_write + deny` and `read_only + read_write + deny`; deny paths use overlays and require existing targets |
 
 Linux-specific caveats:
 
-- Any Linux policy shape that requires deny/read-only bind overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
+- Any Linux policy shape that requires read-only bind overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
 - Overlay-backed subtractive rules currently apply only to already-existing path objects. This is a backend contract on top of the kernel primitives we use: bind mounts need an existing mount point, and creating that target inside only a private mount namespace would still create it on the shared host filesystem.
 
 ### macOS
@@ -313,20 +299,15 @@ Linux-specific caveats:
 | `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
 | `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not change a global write default; manager normalizes them away before SBPL generation |
 | `ReadWrite` | `read_only` only | Accepted | Usable | Denies writes under those paths |
-| `ReadWrite` | `deny` only | Accepted | Usable | Denies reads and writes under those paths |
-| `ReadWrite` | `read_only + deny` | Accepted | Usable with non-overlapping paths | Normal subtractive case on macOS |
+| `ReadWrite` | `read_only + read_write` | Accepted | Usable | `read_write` is redundant and is normalized away; `read_only` still subtracts writes under those paths |
 | `ReadOnly` | none | Accepted | Usable | Global read-only mode |
 | `ReadOnly` | `read_only` only | Accepted | Usable but redundant | `read_only` entries do not add new restrictions over a global read-only default; manager normalizes them away |
 | `ReadOnly` | `read_write` only | Accepted | Usable | Writable carve-outs are emitted against canonicalized paths |
-| `ReadOnly` | `deny` only | Accepted | Usable | Read/write deny path |
 | `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant and is normalized away; `read_write` adds writable carve-outs |
-| `ReadOnly` | `read_write + deny` | Accepted | Usable with non-overlapping paths | Writable carve-out plus denied path; explicit deny rules are emitted after carve-outs |
-| `ReadOnly` | `read_only + read_write + deny` | Accepted | Usable with non-overlapping paths | Same caveat as above |
 
 macOS-specific caveats:
 
 - Manager-side validation now canonicalizes every existing policy path before SBPL generation and rejects missing or uncanonicalizable entries with `SandboxError::InvalidRequest`.
-- When mixing writable carve-outs with `deny` rules, prefer non-overlapping canonical paths; Seatbelt still evaluates the emitted rules in order, so heavily overlapping policies are a poor contract surface.
 - There is no strict global-allowlist / `NoAccess` mode in the current API; macOS support is intentionally limited to global read-only or global read-write defaults with path overlays.
 
 ---
@@ -353,7 +334,7 @@ What those runs tell us:
 - `macos-latest` currently passes the remaining public macOS matrix for the `ReadOnly` / `ReadWrite` defaults with path overlays.
 - Historical `NoAccess` investigation runs on April 1, 2026 failed on `macos-latest`, for example [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152) on branch `macos-noaccess-investigation`. That mode has since been removed from the public API and is intentionally no longer part of the matrix.
 - CI now also runs a dedicated hosted-runner probe (`cargo run --quiet --bin ci_matrix_probe`) and writes its findings into the GitHub Actions step summary.
-- On `windows-latest`, that probe now records the effective Windows filesystem support matrix plus per-policy wall-clock timing samples so we can tell whether the backend is merely functional or too slow to be practical on hosted runners.
+- On `windows-latest`, that probe now records the remaining Windows filesystem support matrix for the public `read_only` / `read_write` overlay model plus per-policy wall-clock timing samples so we can tell whether the backend is merely functional or too slow to be practical on hosted runners.
 
 ### Windows hosted-runner result (`windows-latest`)
 
@@ -403,7 +384,7 @@ Practical conclusion for GitHub-hosted Windows:
 
 Current automated coverage emphasis:
 
-- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite` / `ReadOnly + deny` cases and Linux existing-overlay-target fail-closed coverage.
+- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite + read_only` cases and Linux existing-overlay-target fail-closed coverage.
 - `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes.
 - `tests/network_access_control.rs`: loopback and external TCP deny checks when `network_access == false`.
 - `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite` and `ReadOnly` profiles.

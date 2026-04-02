@@ -3,7 +3,6 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -52,39 +51,28 @@ pub(super) fn execute(
 
     let default_write_access = policy.default_write_access();
     let read_only_paths = policy.read_only_paths();
-    let denied_paths = policy.denied_paths();
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
     let host_uid = unsafe { libc::geteuid() };
     let host_gid = unsafe { libc::getegid() };
 
-    let mount_overlay_entries = if default_write_access {
+    let mount_overlay_paths = if default_write_access {
         let normalized_read_only_overlays = normalize_existing_overlay_paths(
             &read_only_paths,
             "read_only",
             overlay_context_label(SandboxDefaultAccess::ReadWrite),
         )?;
-        let normalized_deny_overlays = normalize_existing_overlay_paths(
-            &denied_paths,
-            "deny",
-            overlay_context_label(SandboxDefaultAccess::ReadWrite),
-        )?;
-        collect_readwrite_overlay_entries(&normalized_read_only_overlays, &normalized_deny_overlays)
+        collect_readonly_overlay_paths(&normalized_read_only_overlays)
     } else {
-        let normalized_deny_overlays = normalize_existing_overlay_paths(
-            &denied_paths,
-            "deny",
-            overlay_context_label(SandboxDefaultAccess::ReadOnly),
-        )?;
-        collect_deny_overlay_entries(&normalized_deny_overlays)
+        Vec::new()
     };
-    let should_install_mount_overlays = !mount_overlay_entries.is_empty();
+    let should_install_mount_overlays = !mount_overlay_paths.is_empty();
 
     unsafe {
         command.pre_exec(move || {
             if should_install_mount_overlays {
                 install_readwrite_mount_overlays_on_current_process(
-                    &mount_overlay_entries,
+                    &mount_overlay_paths,
                     host_uid,
                     host_gid,
                 )?;
@@ -208,18 +196,6 @@ fn close_fd_ignore_ebadf(fd: i32) -> io::Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadWriteOverlayKind {
-    ReadOnly,
-    Deny,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReadWriteOverlayEntry {
-    path: PathBuf,
-    kind: ReadWriteOverlayKind,
-}
-
 fn normalize_existing_overlay_paths(
     paths: &[PathBuf],
     label: &str,
@@ -242,49 +218,16 @@ fn normalize_existing_overlay_paths(
 fn overlay_context_label(default_access: SandboxDefaultAccess) -> &'static str {
     match default_access {
         SandboxDefaultAccess::ReadWrite => "default_access=ReadWrite",
-        SandboxDefaultAccess::ReadOnly => "default_access=ReadOnly with deny overlays",
+        SandboxDefaultAccess::ReadOnly => "default_access=ReadOnly",
     }
 }
 
-fn collect_readwrite_overlay_entries(
-    read_only_paths: &[PathBuf],
-    denied_paths: &[PathBuf],
-) -> Vec<ReadWriteOverlayEntry> {
-    let mut merged = BTreeMap::new();
-    for path in read_only_paths {
-        merged.insert(path.clone(), ReadWriteOverlayKind::ReadOnly);
-    }
-    for path in denied_paths {
-        merged.insert(path.clone(), ReadWriteOverlayKind::Deny);
-    }
-
-    let mut entries = merged
-        .into_iter()
-        .map(|(path, kind)| ReadWriteOverlayEntry { path, kind })
-        .collect::<Vec<_>>();
-
+fn collect_readonly_overlay_paths(read_only_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut entries = read_only_paths.to_vec();
     entries.sort_by(|left, right| {
-        path_depth(&right.path)
-            .cmp(&path_depth(&left.path))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    entries
-}
-
-fn collect_deny_overlay_entries(denied_paths: &[PathBuf]) -> Vec<ReadWriteOverlayEntry> {
-    let mut entries = denied_paths
-        .iter()
-        .cloned()
-        .map(|path| ReadWriteOverlayEntry {
-            path,
-            kind: ReadWriteOverlayKind::Deny,
-        })
-        .collect::<Vec<_>>();
-
-    entries.sort_by(|left, right| {
-        path_depth(&right.path)
-            .cmp(&path_depth(&left.path))
-            .then_with(|| left.path.cmp(&right.path))
+        path_depth(right)
+            .cmp(&path_depth(left))
+            .then_with(|| left.cmp(right))
     });
     entries
 }
@@ -294,7 +237,7 @@ fn path_depth(path: &Path) -> usize {
 }
 
 fn install_readwrite_mount_overlays_on_current_process(
-    overlays: &[ReadWriteOverlayEntry],
+    overlays: &[PathBuf],
     host_uid: libc::uid_t,
     host_gid: libc::gid_t,
 ) -> io::Result<()> {
@@ -304,19 +247,9 @@ fn install_readwrite_mount_overlays_on_current_process(
 
     enter_overlay_mount_namespace(host_uid, host_gid)?;
 
-    let scratch_root = create_overlay_scratch_root()?;
-    for (index, overlay) in overlays.iter().enumerate() {
-        match overlay.kind {
-            ReadWriteOverlayKind::ReadOnly => {
-                apply_readonly_bind_mount(&overlay.path)?;
-            }
-            ReadWriteOverlayKind::Deny => {
-                apply_deny_bind_mount(&overlay.path, &scratch_root, index)?;
-            }
-        }
+    for overlay in overlays {
+        apply_readonly_bind_mount(overlay)?;
     }
-
-    let _ = fs::remove_dir(&scratch_root);
     Ok(())
 }
 
@@ -446,50 +379,11 @@ fn mark_mount_tree_private() -> io::Result<()> {
     Ok(())
 }
 
-fn create_overlay_scratch_root() -> io::Result<PathBuf> {
-    let mut scratch = std::env::temp_dir();
-    let pid = unsafe { libc::getpid() };
-    scratch.push(format!("procwarden-linux-overlay-{pid}"));
-    if scratch.exists() {
-        let _ = fs::remove_dir_all(&scratch);
-    }
-    fs::create_dir_all(&scratch)?;
-    Ok(scratch)
-}
-
 fn apply_readonly_bind_mount(target: &Path) -> io::Result<()> {
     let metadata = fs::metadata(target)?;
     let recursive = metadata.is_dir();
     bind_mount(target, target, recursive)?;
     remount_bind_readonly(target, recursive)
-}
-
-fn apply_deny_bind_mount(target: &Path, scratch_root: &Path, index: usize) -> io::Result<()> {
-    let metadata = fs::metadata(target)?;
-    let recursive = metadata.is_dir();
-
-    let placeholder = if recursive {
-        let dir = scratch_root.join(format!("deny-dir-{index}"));
-        fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000))?;
-        dir
-    } else {
-        let file = scratch_root.join(format!("deny-file-{index}"));
-        fs::File::create(&file)?;
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o000))?;
-        file
-    };
-
-    bind_mount(&placeholder, target, recursive)?;
-    remount_bind_readonly(target, recursive)?;
-
-    if recursive {
-        let _ = fs::remove_dir(&placeholder);
-    } else {
-        let _ = fs::remove_file(&placeholder);
-    }
-
-    Ok(())
 }
 
 fn bind_mount(source: &Path, target: &Path, recursive: bool) -> io::Result<()> {

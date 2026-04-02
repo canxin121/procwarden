@@ -47,10 +47,8 @@ pub struct Fixture {
     pub runtime_cwd: PathBuf,
     pub ro_dir: PathBuf,
     pub rw_dir: PathBuf,
-    pub deny_dir: PathBuf,
     pub outside_dir: PathBuf,
     pub ro_seed: PathBuf,
-    pub deny_seed: PathBuf,
     pub outside_seed: PathBuf,
 }
 
@@ -62,33 +60,22 @@ impl Fixture {
         let runtime_cwd_raw = workspace.path().join("runtime-cwd");
         let ro_dir_raw = workspace.path().join("readonly");
         let rw_dir_raw = workspace.path().join("readwrite");
-        let deny_dir_raw = workspace.path().join("deny");
         let outside_dir_raw = outside.path().join("outside");
 
-        for dir in [
-            &runtime_cwd_raw,
-            &ro_dir_raw,
-            &rw_dir_raw,
-            &deny_dir_raw,
-            &outside_dir_raw,
-        ] {
+        for dir in [&runtime_cwd_raw, &ro_dir_raw, &rw_dir_raw, &outside_dir_raw] {
             fs::create_dir_all(dir).expect("fixture directory should be created");
         }
 
         let ro_seed_raw = ro_dir_raw.join("seed-ro.txt");
-        let deny_seed_raw = deny_dir_raw.join("seed-deny.txt");
         let outside_seed_raw = outside_dir_raw.join("seed-outside.txt");
         fs::write(&ro_seed_raw, "readonly-seed").expect("readonly seed should be created");
-        fs::write(&deny_seed_raw, "deny-seed").expect("deny seed should be created");
         fs::write(&outside_seed_raw, "outside-seed").expect("outside seed should be created");
 
         let runtime_cwd = normalize_path(&runtime_cwd_raw);
         let ro_dir = normalize_path(&ro_dir_raw);
         let rw_dir = normalize_path(&rw_dir_raw);
-        let deny_dir = normalize_path(&deny_dir_raw);
         let outside_dir = normalize_path(&outside_dir_raw);
         let ro_seed = normalize_path(&ro_seed_raw);
-        let deny_seed = normalize_path(&deny_seed_raw);
         let outside_seed = normalize_path(&outside_seed_raw);
 
         Self {
@@ -97,10 +84,8 @@ impl Fixture {
             runtime_cwd,
             ro_dir,
             rw_dir,
-            deny_dir,
             outside_dir,
             ro_seed,
-            deny_seed,
             outside_seed,
         }
     }
@@ -256,19 +241,6 @@ pub fn execute_case(
     manager
         .execute(request, policy)
         .unwrap_or_else(|error| panic!("{context}: manager execution failed: {error:?}"))
-}
-
-pub fn assert_denied_or_failed(
-    manager: &SandboxManager,
-    request: &SandboxCommandRequest,
-    policy: &SandboxPolicy,
-    context: &str,
-) {
-    match manager.execute(request, policy) {
-        Ok(output) => assert_failure(&output, context),
-        Err(SandboxError::Denied(_)) | Err(SandboxError::InvalidRequest(_)) => {}
-        Err(error) => panic!("{context}: unexpected manager error: {error:?}"),
-    }
 }
 
 pub fn assert_success(output: &SandboxExecOutput, context: &str) {

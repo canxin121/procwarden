@@ -21,7 +21,6 @@
   - 构造函数：
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
-    - `SandboxPathPermission::deny(path)`
 - `default_access: SandboxDefaultAccess`
   - `ReadOnly | ReadWrite`
   - 表示未命中 `path_permissions` 时的默认访问策略
@@ -61,7 +60,6 @@ let policy = SandboxPolicy {
     path_permissions: vec![
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
-        SandboxPathPermission::deny(PathBuf::from("/tmp/job-123/secrets")),
     ],
     default_access: SandboxDefaultAccess::ReadOnly,
     network_access: false,
@@ -106,15 +104,12 @@ println!("exit = {}", output.exit_code);
 Linux 文件系统限制在 `pre_exec` 中设置，当前后端分成两条执行路径：
 
 - `default_access == ReadWrite`
-  - 若不存在 `read_only` 或 `deny` 覆盖路径，则保持文件系统默认可访问。
-  - 若存在 `read_only` 或 `deny` 覆盖路径，则通过私有 mount namespace 中的 bind-mount overlay 实现覆盖。
+  - 若不存在 `read_only` 覆盖路径，则保持文件系统默认可访问。
+  - 若存在 `read_only` 覆盖路径，则通过私有 mount namespace 中的 bind-mount overlay 实现覆盖。
   - 所有 overlay 目标路径都必须已经存在，否则返回 `SandboxError::InvalidRequest`。
   - 若宿主环境无法创建所需的 user/mount namespace，则返回 `SandboxError::Unavailable`，不会静默弱化策略。
 - `default_access == ReadOnly`
-  - 若不存在 `deny` 覆盖路径，则安装 Landlock ruleset，提供全局读权限，并通过 `read_write` 路径提供显式写 carve-out。
-  - 若存在任意 `deny` 覆盖路径，则先安装 deny bind-mount overlay，再安装 Landlock ruleset。
-  - 被 deny 的 overlay 目标路径都必须已经存在。
-  - 若宿主环境无法创建所需的 user/mount namespace，则返回 `SandboxError::Unavailable`。
+  - 安装 Landlock ruleset，提供全局读权限，并通过 `read_write` 路径提供显式写 carve-out。
 
 后端内部映射关系：
 
@@ -151,8 +146,8 @@ Landlock 路径下的规则细节：
 ### 高层执行流程
 
 1. 规范化部分环境默认值（如 `/dev/null` 风格值映射到 `NUL`、设置非交互 pager 默认值）。
-2. 从 policy 构建 allow/deny 路径计划。
-3. 对 allow/deny 路径做校验和清洗。
+2. 从 policy 构建 ACL 覆盖计划。
+3. 对覆盖路径做校验和清洗。
 4. 解析可执行文件路径。
 5. 创建 AppContainer 上下文（SID/profile）。
 6. 当当前进程非管理员时，请求一次 UAC 提权，并启动一个统一提权 helper 管理 ACL + 可选网络阻断生命周期。
@@ -176,15 +171,12 @@ Windows ACL 输入随后还会通过 `ensure_safe_allow_path` 再做一次清洗
 
 policy 按“默认 + 覆盖”转换为 ACL 计划：
 
-- `allow_readonly_paths = read_only_paths`
-- `allow_readwrite_paths = read_write_paths`
-- `deny_readwrite_paths = denied_paths`
 - 当 `default_access == ReadOnly` 时，后端还会给推断出的执行范围增加只读权限，例如 `cwd`、可执行文件路径、可执行文件父目录，以及命令参数中解析出的路径。
+- 当 `default_access == ReadOnly` 时，显式 `read_write` 路径会在这个只读范围上增加可写 carve-out。
 - 当 `default_access == ReadWrite` 时，这些推断出的执行范围默认变成可读写，而显式 `read_only` 路径会额外生成 deny-write 覆盖。
 
 随后：
 
-- 对 `deny_readwrite_paths` 增加 deny read/write/execute ACE。
 - 对 `default_access == ReadWrite` 下的 read-only 覆盖路径增加 deny-write ACE。
 - 对 `allow_readonly_paths` 增加 allow read/execute ACE。
 - 对 `allow_readwrite_paths` 增加 allow read/write/execute ACE。
@@ -248,8 +240,8 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 - `network_access == false` 时添加 `(deny network*)`
 - 该 deny 覆盖本地与外部网络访问（例如 loopback 与远端地址）。
 - 再映射默认权限：
-  - `ReadWrite`：对显式 `read_only` 路径生成 `file-write*` deny；对显式 `deny` 路径生成 `file-read*` 与 `file-write*` deny。
-  - `ReadOnly`：先发出全局 `(deny file-write*)`，再加入显式 `read_write` carve-out allow，最后再追加显式 `deny` 路径规则，保证 deny 仍然能覆盖 carve-out。
+  - `ReadWrite`：对显式 `read_only` 路径生成 `file-write*` deny。
+  - `ReadOnly`：先发出全局 `(deny file-write*)`，再加入显式 `read_write` carve-out allow。
 
 每条路径规则会同时输出 `(literal "...")` 与 `(subpath "...")` 条件。
 
@@ -265,7 +257,7 @@ fail-closed，返回 `SandboxError::InvalidRequest`。
 下面两张表把两个策略维度拆开写：
 
 - `default_access`：未命中 `path_permissions` 时的默认策略
-- `path_permissions`：显式路径覆盖规则（`read_only`、`read_write`、`deny`）
+- `path_permissions`：显式路径覆盖规则（`read_only`、`read_write`）
 
 其中“Accepted”表示后端接受该请求形状；“可用”表示当前可以作为稳定文档 contract
 依赖；“依赖宿主能力”表示策略形状本身受支持，但 Linux 宿主还必须具备所需的
@@ -280,9 +272,6 @@ mount-namespace 能力。
   - “可用”意味着 manager 侧路径校验已通过，并且宿主还能创建所需的 user/mount namespace。
   - 如果 namespace 能力缺失，执行会 fail-closed，返回 `SandboxError::Unavailable`。
   - 这不是降级模式；后端不会在弱化约束后继续执行。
-- 对 macOS 中标记为“非重叠路径时可用”的行：
-  - “可用”意味着 manager 侧 canonicalize 已经成功，而且策略没有依赖那些顺序容易歧义的重叠 carve-out / deny 路径。
-  - 这不是降级模式；重叠路径只是策略形状 caveat，不是运行时 downgrade 信号。
 
 ### Linux
 
@@ -291,18 +280,15 @@ mount-namespace 能力。
 | `ReadWrite` | 无 | Accepted | 可用 | 全局可读写模式 |
 | `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不增加权限；manager 会在分发到后端前把它归一化掉 |
 | `ReadWrite` | 仅 `read_only` | Accepted | 依赖宿主能力 | 通过 mount-namespace overlay 实现；overlay 目标路径必须已存在 |
-| `ReadWrite` | 仅 `deny` | Accepted | 依赖宿主能力 | 同上 |
-| `ReadWrite` | `read_only + deny` | Accepted | 依赖宿主能力 | 同上 |
+| `ReadWrite` | `read_only + read_write` | Accepted | 依赖宿主能力 | `read_write` 冗余，会被归一化掉；`read_only` 仍需要 mount-namespace overlay |
 | `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
 | `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | 默认已允许读、拒绝写；manager 会把这些条目归一化掉 |
 | `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 显式写 carve-out |
-| `ReadOnly` | 仅 `deny` | Accepted | 依赖宿主能力 | deny 路径通过 overlay 实现，且目标路径必须已存在 |
 | `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，会被归一化掉；`read_write` 提供写 carve-out |
-| `ReadOnly` | 任意包含 `deny` 的形状 | Accepted | 依赖宿主能力 | 包括 `read_write + deny` 和 `read_only + read_write + deny`；deny 路径通过 overlay 实现，且目标路径必须已存在 |
 
 Linux 额外前提：
 
-- 任何需要 deny/read-only bind overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
+- 任何需要 read-only bind overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
 - 依赖 overlay 的减法规则目前只适用于“已经存在的路径对象”。这不仅是当前后端契约，也来自所用内核原语的边界：bind mount 需要已有 mount point，而如果只在私有 mount namespace 里临时创建这个目标，那个文件或目录仍然会真实出现在共享的宿主文件系统上。
 
 ### macOS
@@ -312,20 +298,15 @@ Linux 额外前提：
 | `ReadWrite` | 无 | Accepted | 可用 | 全局可读写模式 |
 | `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不改变行为；manager 会在生成 SBPL 前把它归一化掉 |
 | `ReadWrite` | 仅 `read_only` | Accepted | 可用 | 会在这些路径下拒绝写入 |
-| `ReadWrite` | 仅 `deny` | Accepted | 可用 | 会在这些路径下拒绝读写 |
-| `ReadWrite` | `read_only + deny` | Accepted | 非重叠路径时可用 | macOS 上常见的减法场景 |
+| `ReadWrite` | `read_only + read_write` | Accepted | 可用 | `read_write` 冗余，会被归一化掉；`read_only` 仍会在对应路径下拒绝写入 |
 | `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
 | `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | `read_only` 相对全局只读默认策略不增加限制；manager 会把它归一化掉 |
 | `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 写 carve-out 会针对 canonicalize 后的路径发出 |
-| `ReadOnly` | 仅 `deny` | Accepted | 可用 | 对选中路径拒绝读写 |
 | `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，会被归一化掉；`read_write` 提供写 carve-out |
-| `ReadOnly` | `read_write + deny` | Accepted | 非重叠路径时可用 | “可写 carve-out + deny 路径”；显式 deny 规则会在 carve-out 之后发出 |
-| `ReadOnly` | `read_only + read_write + deny` | Accepted | 非重叠路径时可用 | 同上 |
 
 macOS 额外前提：
 
 - manager 现在会在生成 SBPL 之前，把所有已存在的 policy 路径 canonicalize，并对缺失或无法 canonicalize 的条目直接返回 `SandboxError::InvalidRequest`。
-- 当 `read_write` carve-out 和 `deny` 混用时，优先使用互不重叠的 canonical 路径；Seatbelt 仍按输出顺序评估规则，重叠过多的策略不适合作为稳定 contract。
 - 当前 API 不再提供严格的全局 allowlist / `NoAccess` 模式；macOS 只支持“全局只读”或“全局读写”再叠加路径覆盖。
 
 ---
@@ -351,7 +332,7 @@ macOS 额外前提：
 - `macos-latest` 当前能跑通保留下来的 macOS 公共矩阵，也就是 `ReadOnly` / `ReadWrite` 默认策略加路径覆盖的这些行。
 - 2026 年 4 月 1 日针对 `NoAccess` 的历史调查 run 在 `macos-latest` 上失败过，例如 [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152)（分支 `macos-noaccess-investigation`）。这也是为什么该模式已经从公开 API 中移除，并且不再出现在当前矩阵里。
 - 现在 CI 还会额外跑一个 hosted-runner probe（`cargo run --quiet --bin ci_matrix_probe`），并把结果写入 GitHub Actions step summary。
-- 在 `windows-latest` 上，这个 probe 现在还会记录 Windows 文件系统支持矩阵的实际结果，以及按策略形状分组的 wall-clock timing 样本。这样后续 run 不只知道“能不能跑”，还能判断 hosted runner 上的性能是否已经慢到不适合实际使用。
+- 在 `windows-latest` 上，这个 probe 现在会记录当前公开 `read_only` / `read_write` 覆盖模型下的 Windows 文件系统支持矩阵，以及按策略形状分组的 wall-clock timing 样本。这样后续 run 不只知道“能不能跑”，还能判断 hosted runner 上的性能是否已经慢到不适合实际使用。
 
 ### Windows hosted runner 结果（`windows-latest`）
 
@@ -401,7 +382,7 @@ run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/2388826
 
 当前覆盖重点：
 
-- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite` / `ReadOnly + deny` 组合，以及 Linux 对“overlay target 必须已存在”的 fail-closed 覆盖。
+- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite + read_only` 组合，以及 Linux 对“overlay target 必须已存在”的 fail-closed 覆盖。
 - `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为。
 - `tests/network_access_control.rs`：覆盖 `network_access == false` 时对 loopback 与外部 TCP 的阻断。
 - `src/platform/macos.rs` 单元测试：覆盖 `ReadWrite` 与 `ReadOnly` 两类 SBPL 生成顺序。

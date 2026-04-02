@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Component;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,23 +34,10 @@ pub(super) fn execute(
     let allow_readonly_paths = sanitize_policy_paths(acl_plan.allow_readonly_paths)?;
     let allow_readwrite_paths = sanitize_policy_paths(acl_plan.allow_readwrite_paths)?;
     let deny_write_paths = sanitize_policy_paths(acl_plan.deny_write_paths)?;
-    let deny_readwrite_paths = sanitize_policy_paths(acl_plan.deny_readwrite_paths)?;
-
-    if command_references_denied_path(request, &deny_readwrite_paths) {
-        return Err(SandboxError::Denied(
-            "command arguments reference a path denied by sandbox policy".to_string(),
-        ));
-    }
-
-    let allow_readonly_paths =
-        filter_paths_not_under_denied_roots(allow_readonly_paths, &deny_readwrite_paths);
-    let allow_readwrite_paths =
-        filter_paths_not_under_denied_roots(allow_readwrite_paths, &deny_readwrite_paths);
     let acl_plan = resolve_acl_conflicts(AclPlan {
         allow_readonly_paths,
         allow_readwrite_paths,
         deny_write_paths,
-        deny_readwrite_paths,
     });
 
     let appcontainer = token::create_appcontainer_context_with_network(policy.network_access)?;
@@ -81,7 +67,6 @@ pub(super) fn execute(
                 allow_readonly_paths: elevated_plan.allow_readonly_paths,
                 allow_readwrite_paths: elevated_plan.allow_readwrite_paths,
                 deny_write_paths: elevated_plan.deny_write_paths,
-                deny_readwrite_paths: elevated_plan.deny_readwrite_paths,
             },
         )?);
     } else {
@@ -100,7 +85,6 @@ pub(super) fn execute(
                     allow_readonly_paths: acl_plan.allow_readonly_paths,
                     allow_readwrite_paths: acl_plan.allow_readwrite_paths,
                     deny_write_paths: acl_plan.deny_write_paths,
-                    deny_readwrite_paths: acl_plan.deny_readwrite_paths,
                 },
                 sid,
             )?
@@ -148,36 +132,25 @@ struct AclPlan {
     allow_readonly_paths: Vec<PathBuf>,
     allow_readwrite_paths: Vec<PathBuf>,
     deny_write_paths: Vec<PathBuf>,
-    deny_readwrite_paths: Vec<PathBuf>,
 }
 
 fn collect_acl_plan(policy: &SandboxPolicy, default_access_scope_paths: Vec<PathBuf>) -> AclPlan {
     let allow_readonly_paths = policy.read_only_paths();
     let allow_readwrite_paths = policy.read_write_paths();
-    let deny_readwrite_paths = policy.denied_paths();
 
     match policy.default_access {
-        crate::SandboxDefaultAccess::ReadOnly => {
-            let mut default_readonly_paths = default_access_scope_paths;
-            default_readonly_paths.extend(allow_readonly_paths);
-            AclPlan {
-                allow_readonly_paths: default_readonly_paths,
-                allow_readwrite_paths,
-                deny_write_paths: Vec::new(),
-                deny_readwrite_paths,
-            }
-        }
+        crate::SandboxDefaultAccess::ReadOnly => AclPlan {
+            allow_readonly_paths: default_access_scope_paths,
+            allow_readwrite_paths,
+            deny_write_paths: Vec::new(),
+        },
         crate::SandboxDefaultAccess::ReadWrite => {
-            let mut default_readwrite_paths = filter_paths_not_under_denied_roots(
-                default_access_scope_paths,
-                &allow_readonly_paths,
-            );
+            let mut default_readwrite_paths = default_access_scope_paths;
             default_readwrite_paths.extend(allow_readwrite_paths);
             AclPlan {
                 deny_write_paths: allow_readonly_paths.clone(),
                 allow_readonly_paths,
                 allow_readwrite_paths: default_readwrite_paths,
-                deny_readwrite_paths,
             }
         }
     }
@@ -342,21 +315,11 @@ fn runtime_bootstrap_readonly_paths(
 }
 
 fn resolve_acl_conflicts(mut plan: AclPlan) -> AclPlan {
-    let deny_readwrite_keys = build_casefolded_path_set(&plan.deny_readwrite_paths);
-    plan.allow_readonly_paths
-        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
-    plan.allow_readwrite_paths
-        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
-    plan.deny_write_paths
-        .retain(|path| !deny_readwrite_keys.contains(&casefolded_path(path)));
-
     let readwrite_keys = build_casefolded_path_set(&plan.allow_readwrite_paths);
     plan.allow_readonly_paths
         .retain(|path| !readwrite_keys.contains(&casefolded_path(path)));
-    plan.deny_write_paths.retain(|path| {
-        let key = casefolded_path(path);
-        !deny_readwrite_keys.contains(&key) && !readwrite_keys.contains(&key)
-    });
+    plan.deny_write_paths
+        .retain(|path| !readwrite_keys.contains(&casefolded_path(path)));
 
     plan
 }
@@ -370,53 +333,4 @@ fn build_casefolded_path_set(paths: &[PathBuf]) -> HashSet<String> {
 
 fn casefolded_path(path: &std::path::Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
-}
-
-fn filter_paths_not_under_denied_roots(
-    paths: Vec<PathBuf>,
-    denied_roots: &[PathBuf],
-) -> Vec<PathBuf> {
-    paths
-        .into_iter()
-        .filter(|path| {
-            !denied_roots
-                .iter()
-                .any(|denied| is_same_or_descendant(path, denied))
-        })
-        .collect()
-}
-
-fn is_same_or_descendant(path: &std::path::Path, denied_root: &std::path::Path) -> bool {
-    let path_components = path.components().collect::<Vec<_>>();
-    let denied_components = denied_root.components().collect::<Vec<_>>();
-    if denied_components.len() > path_components.len() {
-        return false;
-    }
-
-    denied_components
-        .iter()
-        .zip(path_components.iter())
-        .all(|(left, right)| component_eq_case_insensitive(left, right))
-}
-
-fn component_eq_case_insensitive(left: &Component<'_>, right: &Component<'_>) -> bool {
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-
-fn command_references_denied_path(
-    request: &SandboxCommandRequest,
-    denied_roots: &[PathBuf],
-) -> bool {
-    request
-        .command
-        .iter()
-        .skip(1)
-        .flat_map(|argument| command_argument_path_candidates(argument, &request.cwd))
-        .any(|candidate| {
-            denied_roots
-                .iter()
-                .any(|denied| is_same_or_descendant(&candidate, denied))
-        })
 }
