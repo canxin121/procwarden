@@ -513,7 +513,7 @@ fn render_windows_matrix_result(
 
 #[cfg(target_os = "windows")]
 fn sanitize_probe_message(message: &str) -> String {
-    message.replace('\n', " ").replace('\r', " ")
+    message.replace(['\n', '\r'], " ")
 }
 
 #[cfg(target_os = "windows")]
