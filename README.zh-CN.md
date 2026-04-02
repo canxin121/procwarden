@@ -316,9 +316,9 @@ macOS 额外前提：
 上面的矩阵描述的是平台 contract。GitHub Actions 的结果只是这个 contract 之上的观测层，
 不能直接替代 contract 本身。
 
-截至 2026 年 4 月 2 日，当前这轮 Windows 调查里一个关键的三平台全绿 CI run 是：
+截至 2026 年 4 月 2 日，当前公开策略模型下一个关键的三平台全绿 CI run 是：
 
-- [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558)，`windows-matrix-investigation` 分支，标题 "Fix Windows target clippy lint in matrix probe"
+- [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166)，`windows-matrix-investigation` 分支，标题 "Allow Linux host-capability skips in readonly overlay test"
 
 之前对 Linux/macOS 调查仍然有参考价值的历史全绿 run：
 
@@ -327,8 +327,9 @@ macOS 额外前提：
 
 这些 run 说明了什么：
 
-- `ubuntu-latest` 当前能跑通 Linux 矩阵，包括那些文档里仍然标为“依赖宿主能力”的行。
-- 但这并不意味着这些 Linux 行就可以改标为普遍“可用”：它们的 contract 仍然依赖 user/mount namespace 支持，换一台 Linux 宿主仍可能 fail-closed，返回 `SandboxError::Unavailable`。
+- `ubuntu-latest` 当前能跑通 Linux 的 CI 套件，但 hosted-runner probe 明确报告了 `linux.overlay_subtractive=unavailable`。
+- 换句话说，Linux 里那个“`ReadWrite` + 生效的 `read_only` overlay”行，在 GitHub Hosted Ubuntu 上当前会以 `SandboxError::Unavailable` fail-closed；只有不依赖 overlay 的 Linux 形状能在这个 runner 上稳定通过。
+- 这仍然符合文档 contract：这些 Linux 行在具备能力的宿主上仍然受支持，但不能被改标成普遍“可用”，因为它们本来就依赖 user/mount namespace 支持。
 - `macos-latest` 当前能跑通保留下来的 macOS 公共矩阵，也就是 `ReadOnly` / `ReadWrite` 默认策略加路径覆盖的这些行。
 - 2026 年 4 月 1 日针对 `NoAccess` 的历史调查 run 在 `macos-latest` 上失败过，例如 [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152)（分支 `macos-noaccess-investigation`）。这也是为什么该模式已经从公开 API 中移除，并且不再出现在当前矩阵里。
 - 现在 CI 还会额外跑一个 hosted-runner probe（`cargo run --quiet --bin ci_matrix_probe`），并把结果写入 GitHub Actions step summary。
@@ -336,7 +337,7 @@ macOS 额外前提：
 
 ### Windows hosted runner 结果（`windows-latest`）
 
-run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558)
+run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166)
 给出了当前公开 API 在 GitHub Hosted Windows 上第一轮干净的三平台观测：
 
 | 探针维度 | 实际结果 | 解释 |
@@ -352,7 +353,7 @@ run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/2388826
 - 当前 `windows-latest` runner 不是这个后端的可用运行环境。
 - 限制因素是宿主的 WFP 可用性，不是本 crate 的路径权限矩阵实现。
 - 由于该 runner 进程本身已经是管理员，因此“先普通进程启动，再自动提权到防火墙 helper”这条回退路径不会被触发。
-- 整个 `windows-latest` job 大约耗时 80 秒，但 hosted-runner diagnostics 这一步只耗时约 1 秒；没有证据表明策略执行是“很慢”，因为请求在 WFP 设置阶段就已经终止了。
+- 整个 `windows-latest` job 大约耗时 58 秒，但 hosted-runner diagnostics 这一步只耗时约 1 秒；没有证据表明策略执行是“很慢”，因为请求在 WFP 设置阶段就已经终止了。
 
 ---
 

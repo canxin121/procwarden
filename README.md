@@ -317,10 +317,9 @@ macOS-specific caveats:
 The matrix above describes the platform contract. GitHub Actions results are an observation layer on
 top of that contract, not a replacement for it.
 
-As of April 2, 2026, a key fully green three-platform CI run for the current Windows
-investigation is:
+As of April 2, 2026, a key fully green three-platform CI run for the current public policy model is:
 
-- [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558) on `windows-matrix-investigation` ("Fix Windows target clippy lint in matrix probe")
+- [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166) on `windows-matrix-investigation` ("Allow Linux host-capability skips in readonly overlay test")
 
 Historical green runs that were still useful for the Linux/macOS investigation:
 
@@ -329,8 +328,9 @@ Historical green runs that were still useful for the Linux/macOS investigation:
 
 What those runs tell us:
 
-- `ubuntu-latest` currently passes the Linux matrix, including the rows still documented as Host-capability-dependent.
-- That does not let us relabel those Linux rows as universally Usable: the contract still depends on user/mount namespace support, and other Linux hosts may still fail closed with `SandboxError::Unavailable`.
+- `ubuntu-latest` currently passes the Linux CI suite, but the hosted-runner probe reports `linux.overlay_subtractive=unavailable`.
+- In other words, the Linux host-capability-dependent row (`ReadWrite` with effective `read_only` overlays) is currently fail-closed on GitHub-hosted Ubuntu with `SandboxError::Unavailable`, while non-overlay Linux shapes still pass there.
+- That still matches the documented contract: those Linux rows remain supported on capable hosts, but they are not universally Usable because user/mount namespace support is host-dependent.
 - `macos-latest` currently passes the remaining public macOS matrix for the `ReadOnly` / `ReadWrite` defaults with path overlays.
 - Historical `NoAccess` investigation runs on April 1, 2026 failed on `macos-latest`, for example [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152) on branch `macos-noaccess-investigation`. That mode has since been removed from the public API and is intentionally no longer part of the matrix.
 - CI now also runs a dedicated hosted-runner probe (`cargo run --quiet --bin ci_matrix_probe`) and writes its findings into the GitHub Actions step summary.
@@ -338,7 +338,7 @@ What those runs tell us:
 
 ### Windows hosted-runner result (`windows-latest`)
 
-Run [`23888267558`](https://github.com/canxin121/procwarden/actions/runs/23888267558) gives the
+Run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166) gives the
 first clean three-platform observation for the current public API on GitHub-hosted Windows:
 
 | Probe dimension | Observed result | Interpretation |
@@ -354,7 +354,7 @@ Practical conclusion for GitHub-hosted Windows:
 - The current `windows-latest` runner is not a usable environment for this backend.
 - The limiting factor is host WFP availability, not the path-permission matrix implementation in this crate.
 - Because the process is already elevated on that runner, the non-elevated auto-elevation firewall fallback path is never taken.
-- The full `windows-latest` CI job took about 80 seconds, but the hosted-runner diagnostics step took about 1 second; there is no evidence of long per-policy execution time because requests abort during WFP setup.
+- The full `windows-latest` CI job took about 58 seconds, but the hosted-runner diagnostics step took about 1 second; there is no evidence of long per-policy execution time because requests abort during WFP setup.
 
 ---
 
