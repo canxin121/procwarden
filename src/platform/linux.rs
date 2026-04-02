@@ -27,7 +27,9 @@ use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
-use crate::{SandboxAccess, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+use crate::{
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxPolicy,
+};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
@@ -48,11 +50,9 @@ pub(super) fn execute(
         .envs(request.env.clone());
     configure_piped_stdio(&mut command);
 
-    let default_read_access = policy.default_read_access();
     let default_write_access = policy.default_write_access();
     let read_only_paths = policy.read_only_paths();
     let denied_paths = policy.denied_paths();
-    let readable_roots = policy.readable_paths();
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
     let host_uid = unsafe { libc::geteuid() };
@@ -62,28 +62,19 @@ pub(super) fn execute(
         let normalized_read_only_overlays = normalize_existing_overlay_paths(
             &read_only_paths,
             "read_only",
-            overlay_context_label(SandboxAccess::ReadWrite),
+            overlay_context_label(SandboxDefaultAccess::ReadWrite),
         )?;
         let normalized_deny_overlays = normalize_existing_overlay_paths(
             &denied_paths,
             "deny",
-            overlay_context_label(SandboxAccess::ReadWrite),
+            overlay_context_label(SandboxDefaultAccess::ReadWrite),
         )?;
         collect_readwrite_overlay_entries(&normalized_read_only_overlays, &normalized_deny_overlays)
-    } else if default_read_access {
+    } else {
         let normalized_deny_overlays = normalize_existing_overlay_paths(
             &denied_paths,
             "deny",
-            overlay_context_label(SandboxAccess::ReadOnly),
-        )?;
-        collect_deny_overlay_entries(&normalized_deny_overlays)
-    } else {
-        let overlapping_denied =
-            collect_overlapping_denied_paths(&denied_paths, &readable_roots, &writable_roots)?;
-        let normalized_deny_overlays = normalize_existing_overlay_paths(
-            &overlapping_denied,
-            "deny",
-            "default_access=NoAccess with overlapping deny overlays",
+            overlay_context_label(SandboxDefaultAccess::ReadOnly),
         )?;
         collect_deny_overlay_entries(&normalized_deny_overlays)
     };
@@ -99,11 +90,7 @@ pub(super) fn execute(
                 )?;
             }
             if !default_write_access {
-                install_filesystem_landlock_rules_on_current_thread(
-                    default_read_access,
-                    &readable_roots,
-                    &writable_roots,
-                )?;
+                install_filesystem_landlock_rules_on_current_thread(&writable_roots)?;
             }
             if !network_access {
                 install_network_seccomp_filter_on_current_thread()?;
@@ -126,41 +113,6 @@ pub(super) fn execute(
     } else {
         execution
     }
-}
-
-fn collect_overlapping_denied_paths(
-    denied_paths: &[PathBuf],
-    readable_roots: &[PathBuf],
-    writable_roots: &[PathBuf],
-) -> Result<Vec<PathBuf>, SandboxError> {
-    if denied_paths.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let normalized_denied = denied_paths
-        .iter()
-        .map(|path| normalize_scope_path(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut allow_roots = Vec::with_capacity(readable_roots.len() + writable_roots.len());
-    allow_roots.extend(readable_roots.iter().cloned());
-    allow_roots.extend(writable_roots.iter().cloned());
-    if allow_roots.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let normalized_allowed = allow_roots
-        .iter()
-        .map(|path| normalize_scope_path(path))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(normalized_denied
-        .into_iter()
-        .filter(|denied| {
-            normalized_allowed
-                .iter()
-                .any(|allowed| paths_overlap(denied, allowed))
-        })
-        .collect())
 }
 
 fn normalize_scope_path(path: &Path) -> Result<PathBuf, SandboxError> {
@@ -190,10 +142,6 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
 }
 
 fn close_non_stdio_fds_on_current_process() -> io::Result<()> {
@@ -291,11 +239,10 @@ fn normalize_existing_overlay_paths(
     Ok(normalized)
 }
 
-fn overlay_context_label(default_access: SandboxAccess) -> &'static str {
+fn overlay_context_label(default_access: SandboxDefaultAccess) -> &'static str {
     match default_access {
-        SandboxAccess::ReadWrite => "default_access=ReadWrite",
-        SandboxAccess::ReadOnly => "default_access=ReadOnly with deny overlays",
-        SandboxAccess::NoAccess => unreachable!("NoAccess uses a dedicated overlap-only context"),
+        SandboxDefaultAccess::ReadWrite => "default_access=ReadWrite",
+        SandboxDefaultAccess::ReadOnly => "default_access=ReadOnly with deny overlays",
     }
 }
 
@@ -602,8 +549,6 @@ fn c_path(path: &Path) -> io::Result<CString> {
 }
 
 fn install_filesystem_landlock_rules_on_current_thread(
-    default_read_access: bool,
-    readable_roots: &[PathBuf],
     writable_roots: &[PathBuf],
 ) -> io::Result<()> {
     let abi = ABI::V5;
@@ -617,19 +562,9 @@ fn install_filesystem_landlock_rules_on_current_thread(
         .create()
         .map_err(to_io_error)?;
 
-    if default_read_access {
-        ruleset = ruleset
-            .add_rules(landlock::path_beneath_rules(&["/"], access_ro))
-            .map_err(to_io_error)?;
-    } else if !readable_roots.is_empty() {
-        let refs = readable_roots
-            .iter()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>();
-        ruleset = ruleset
-            .add_rules(landlock::path_beneath_rules(&refs, access_ro))
-            .map_err(to_io_error)?;
-    }
+    ruleset = ruleset
+        .add_rules(landlock::path_beneath_rules(&["/"], access_ro))
+        .map_err(to_io_error)?;
 
     ruleset = ruleset
         .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))

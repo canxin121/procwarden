@@ -5,7 +5,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use procwarden::SandboxError;
-use procwarden::{SandboxAccess, SandboxManager, SandboxPathPermission};
+use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxPathPermission};
 
 use common::{
     Fixture, assert_failure, connect_command, execute_case, policy, sandbox_request,
@@ -22,7 +22,7 @@ fn network_enabled_is_explicitly_rejected_on_windows() {
     let manager = SandboxManager::new();
 
     let test_policy = policy(
-        SandboxAccess::NoAccess,
+        SandboxDefaultAccess::ReadOnly,
         true,
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
@@ -52,7 +52,7 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
     let manager = SandboxManager::new();
 
     let test_policy = policy(
-        SandboxAccess::NoAccess,
+        SandboxDefaultAccess::ReadOnly,
         false,
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),

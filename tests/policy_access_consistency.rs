@@ -2,105 +2,12 @@ mod common;
 
 use std::fs;
 
-use procwarden::{SandboxAccess, SandboxError, SandboxManager, SandboxPathPermission};
+use procwarden::{SandboxDefaultAccess, SandboxError, SandboxManager, SandboxPathPermission};
 
 use common::{
-    Fixture, assert_denied_or_failed, assert_failure, assert_success, execute_case,
-    no_access_policy_with_runtime_roots, policy, read_command, sandbox_request,
-    should_skip_windows_wfp_unavailable, write_command,
+    Fixture, assert_denied_or_failed, assert_failure, assert_success, execute_case, policy,
+    read_command, sandbox_request, should_skip_windows_wfp_unavailable, write_command,
 };
-
-#[test]
-fn default_no_access_enforces_readonly_readwrite_and_outside_denial() {
-    let fixture = Fixture::new("policy-noaccess");
-    let manager = SandboxManager::new();
-
-    let test_policy = no_access_policy_with_runtime_roots(
-        false,
-        vec![
-            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
-            SandboxPathPermission::read_only(fixture.ro_dir.clone()),
-            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
-        ],
-    );
-
-    let read_ro_request =
-        sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500);
-    let read_ro_result = manager.execute(&read_ro_request, &test_policy);
-    if should_skip_windows_wfp_unavailable(&read_ro_result) {
-        eprintln!(
-            "skip policy_access_consistency default_no_access test because Windows WFP is unsupported in this environment"
-        );
-        return;
-    }
-    let read_ro = read_ro_result.unwrap_or_else(|error| {
-        panic!("default_no_access read readonly seed: manager execution failed: {error:?}")
-    });
-    assert_success(&read_ro, "default_no_access read readonly seed");
-
-    let ro_write_target = fixture.ro_dir.join("blocked-noaccess.txt");
-    let write_ro = execute_case(
-        &manager,
-        &sandbox_request(
-            write_command(&ro_write_target, "blocked"),
-            &fixture.runtime_cwd,
-            2_500,
-        ),
-        &test_policy,
-        "default_no_access write readonly path",
-    );
-    assert_failure(&write_ro, "default_no_access write readonly path");
-    assert!(
-        !ro_write_target.exists(),
-        "default_no_access write readonly path should not create file"
-    );
-
-    let rw_write_target = fixture.rw_dir.join("allowed-noaccess.txt");
-    let write_rw = execute_case(
-        &manager,
-        &sandbox_request(
-            write_command(&rw_write_target, "allowed-noaccess"),
-            &fixture.runtime_cwd,
-            2_500,
-        ),
-        &test_policy,
-        "default_no_access write readwrite path",
-    );
-    assert_success(&write_rw, "default_no_access write readwrite path");
-    assert_eq!(
-        fs::read_to_string(&rw_write_target).expect("readwrite target should exist"),
-        "allowed-noaccess"
-    );
-
-    let read_outside = execute_case(
-        &manager,
-        &sandbox_request(
-            read_command(&fixture.outside_seed),
-            &fixture.runtime_cwd,
-            2_500,
-        ),
-        &test_policy,
-        "default_no_access read outside path",
-    );
-    assert_failure(&read_outside, "default_no_access read outside path");
-
-    let outside_write_target = fixture.outside_dir.join("blocked-noaccess.txt");
-    let write_outside = execute_case(
-        &manager,
-        &sandbox_request(
-            write_command(&outside_write_target, "blocked-outside"),
-            &fixture.runtime_cwd,
-            2_500,
-        ),
-        &test_policy,
-        "default_no_access write outside path",
-    );
-    assert_failure(&write_outside, "default_no_access write outside path");
-    assert!(
-        !outside_write_target.exists(),
-        "default_no_access write outside path should not create file"
-    );
-}
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -109,7 +16,7 @@ fn default_read_only_enforces_readwrite_carveout_and_deny_override() {
     let manager = SandboxManager::new();
 
     let test_policy = policy(
-        SandboxAccess::ReadOnly,
+        SandboxDefaultAccess::ReadOnly,
         false,
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
@@ -215,7 +122,7 @@ fn default_read_only_enforces_readwrite_carveout_and_deny_override() {
     let manager = SandboxManager::new();
 
     let test_policy = policy(
-        SandboxAccess::ReadOnly,
+        SandboxDefaultAccess::ReadOnly,
         false,
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
@@ -314,7 +221,7 @@ fn default_read_write_enforces_readonly_and_deny_overrides() {
     let manager = SandboxManager::new();
 
     let test_policy = policy(
-        SandboxAccess::ReadWrite,
+        SandboxDefaultAccess::ReadWrite,
         false,
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
@@ -404,30 +311,4 @@ fn default_read_write_enforces_readonly_and_deny_overrides() {
         "default_read_write read readonly path",
     );
     assert_success(&read_ro, "default_read_write read readonly path");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn linux_no_access_without_runtime_roots_does_not_bootstrap_basic_read_command() {
-    let fixture = Fixture::new("policy-noaccess-missing-runtime-roots");
-    let manager = SandboxManager::new();
-
-    let test_policy = policy(
-        SandboxAccess::NoAccess,
-        false,
-        vec![
-            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
-            SandboxPathPermission::read_only(fixture.ro_dir.clone()),
-        ],
-    );
-
-    let result = manager.execute(
-        &sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd, 2_500),
-        &test_policy,
-    );
-
-    assert!(
-        !matches!(result, Ok(output) if output.exit_code == 0),
-        "linux NoAccess shell/bootstrap commands should not succeed without runtime roots"
-    );
 }

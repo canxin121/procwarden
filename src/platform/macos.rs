@@ -1,9 +1,10 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::{SandboxAccess, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy};
+use crate::{
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxPolicy,
+};
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
 
@@ -43,17 +44,16 @@ pub(super) fn execute(
 
 fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
     let mut lines = vec!["(version 1)".to_string(), "(allow default)".to_string()];
-    let read_only_paths = dedupe_paths(policy.read_only_paths());
-    let read_write_paths = dedupe_paths(policy.read_write_paths());
-    let readable_paths = dedupe_paths(policy.readable_paths());
-    let denied_paths = dedupe_paths(policy.denied_paths());
+    let read_only_paths = policy.read_only_paths();
+    let read_write_paths = policy.read_write_paths();
+    let denied_paths = policy.denied_paths();
 
     if !policy.network_access {
         lines.push("(deny network*)".to_string());
     }
 
     match policy.default_access {
-        SandboxAccess::ReadWrite => {
+        SandboxDefaultAccess::ReadWrite => {
             for read_only in read_only_paths {
                 push_path_rule(&mut lines, "deny", "file-write*", &read_only);
             }
@@ -62,29 +62,8 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
                 push_path_rule(&mut lines, "deny", "file-write*", &denied);
             }
         }
-        SandboxAccess::ReadOnly => {
+        SandboxDefaultAccess::ReadOnly => {
             lines.push("(deny file-write*)".to_string());
-            for writable in read_write_paths {
-                push_path_rule(&mut lines, "allow", "file-write*", &writable);
-            }
-            for denied in denied_paths {
-                push_path_rule(&mut lines, "deny", "file-read*", &denied);
-                push_path_rule(&mut lines, "deny", "file-write*", &denied);
-            }
-        }
-        SandboxAccess::NoAccess => {
-            lines.push("(deny file-read*)".to_string());
-            lines.push("(deny file-write*)".to_string());
-
-            // Traversing an allowlisted path under a global file-read deny still needs literal
-            // reads of each ancestor directory, including `/`.
-            for ancestor in readable_path_ancestors(&readable_paths) {
-                push_literal_rule(&mut lines, "allow", "file-read*", &ancestor);
-            }
-
-            for readable in readable_paths {
-                push_path_rule(&mut lines, "allow", "file-read*", &readable);
-            }
             for writable in read_write_paths {
                 push_path_rule(&mut lines, "allow", "file-write*", &writable);
             }
@@ -104,11 +83,6 @@ fn push_path_rule(lines: &mut Vec<String>, action: &str, operation: &str, path: 
     lines.push(format!("({action} {operation} (subpath {path}))"));
 }
 
-fn push_literal_rule(lines: &mut Vec<String>, action: &str, operation: &str, path: &Path) {
-    let path = quote_sbpl_string(path);
-    lines.push(format!("({action} {operation} (literal {path}))"));
-}
-
 fn quote_sbpl_string(path: &Path) -> String {
     let mut escaped = String::from("\"");
     for ch in path.to_string_lossy().chars() {
@@ -121,38 +95,6 @@ fn quote_sbpl_string(path: &Path) -> String {
     escaped.push('"');
     escaped
 }
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-
-    for path in paths {
-        let key = path.to_string_lossy().to_string();
-        if seen.insert(key) {
-            deduped.push(path);
-        }
-    }
-
-    deduped
-}
-
-fn readable_path_ancestors(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut ancestors = Vec::new();
-    let mut seen = HashSet::new();
-
-    for path in paths {
-        for ancestor in path.ancestors().skip(1) {
-            let ancestor = ancestor.to_path_buf();
-            let key = ancestor.to_string_lossy().to_string();
-            if seen.insert(key) {
-                ancestors.push(ancestor);
-            }
-        }
-    }
-
-    ancestors
-}
-
 fn execute_command(
     argv: &[String],
     cwd: &Path,
@@ -175,7 +117,7 @@ fn execute_command(
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{SandboxAccess, SandboxPathPermission, SandboxPolicy};
+    use crate::{SandboxDefaultAccess, SandboxPathPermission, SandboxPolicy};
 
     use super::build_sbpl_profile;
 
@@ -184,7 +126,7 @@ mod tests {
         let writable = PathBuf::from("/private/tmp/procwarden/rw");
         let denied = PathBuf::from("/private/tmp/procwarden/deny");
         let profile = build_sbpl_profile(&SandboxPolicy {
-            default_access: SandboxAccess::ReadOnly,
+            default_access: SandboxDefaultAccess::ReadOnly,
             network_access: false,
             path_permissions: vec![
                 SandboxPathPermission::read_write(writable.clone()),
@@ -212,29 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn no_access_profile_denies_globally_before_allowlist_and_reapplies_explicit_denies() {
-        let readable = PathBuf::from("/private/tmp/procwarden/ro");
+    fn read_only_profile_emits_global_write_deny_without_global_read_deny() {
         let writable = PathBuf::from("/private/tmp/procwarden/rw");
         let denied = PathBuf::from("/private/tmp/procwarden/deny");
         let profile = build_sbpl_profile(&SandboxPolicy {
-            default_access: SandboxAccess::NoAccess,
+            default_access: SandboxDefaultAccess::ReadOnly,
             network_access: false,
             path_permissions: vec![
-                SandboxPathPermission::read_only(readable.clone()),
                 SandboxPathPermission::read_write(writable.clone()),
                 SandboxPathPermission::deny(denied.clone()),
             ],
         });
 
-        assert_line_before(
-            &profile,
-            "(deny file-read*)",
-            "(allow file-read* (literal \"/\"))",
-        );
-        assert_line_before(
-            &profile,
-            "(allow file-read* (literal \"/private\"))",
-            &format!("(allow file-read* (literal \"{}\"))", readable.display()),
+        assert!(
+            !profile.contains("(deny file-read*)"),
+            "read-only default should not emit a global read deny"
         );
         assert_line_before(
             &profile,
@@ -251,7 +185,7 @@ mod tests {
                 "(deny file-write* (subpath \"{}\"))",
                 denied.display()
             )),
-            "no-access profile should reapply explicit deny after allowlist rules"
+            "read-only profile should reapply explicit deny after write carveouts"
         );
     }
 
@@ -260,7 +194,7 @@ mod tests {
         let read_only = PathBuf::from("/private/tmp/procwarden/ro");
         let denied = PathBuf::from("/private/tmp/procwarden/deny");
         let profile = build_sbpl_profile(&SandboxPolicy {
-            default_access: SandboxAccess::ReadWrite,
+            default_access: SandboxDefaultAccess::ReadWrite,
             network_access: false,
             path_permissions: vec![
                 SandboxPathPermission::read_only(read_only.clone()),

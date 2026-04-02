@@ -7,5 +7,5 @@ mod result;
 
 pub use error::SandboxError;
 pub use manager::{SandboxCommandRequest, SandboxManager};
-pub use policy::{SandboxAccess, SandboxPathPermission, SandboxPolicy};
+pub use policy::{SandboxDefaultAccess, SandboxPathAccess, SandboxPathPermission, SandboxPolicy};
 pub use result::SandboxExecOutput;

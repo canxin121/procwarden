@@ -157,13 +157,7 @@ fn collect_acl_plan(policy: &SandboxPolicy, default_access_scope_paths: Vec<Path
     let deny_readwrite_paths = policy.denied_paths();
 
     match policy.default_access {
-        crate::SandboxAccess::NoAccess => AclPlan {
-            allow_readonly_paths,
-            allow_readwrite_paths,
-            deny_write_paths: Vec::new(),
-            deny_readwrite_paths,
-        },
-        crate::SandboxAccess::ReadOnly => {
+        crate::SandboxDefaultAccess::ReadOnly => {
             let mut default_readonly_paths = default_access_scope_paths;
             default_readonly_paths.extend(allow_readonly_paths);
             AclPlan {
@@ -173,7 +167,7 @@ fn collect_acl_plan(policy: &SandboxPolicy, default_access_scope_paths: Vec<Path
                 deny_readwrite_paths,
             }
         }
-        crate::SandboxAccess::ReadWrite => {
+        crate::SandboxDefaultAccess::ReadWrite => {
             let mut default_readwrite_paths = filter_paths_not_under_denied_roots(
                 default_access_scope_paths,
                 &allow_readonly_paths,

@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    SandboxAccess, SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxManager,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxManager,
     SandboxPathPermission, SandboxPolicy,
 };
 
@@ -107,7 +107,7 @@ impl Fixture {
 }
 
 pub fn policy(
-    default_access: SandboxAccess,
+    default_access: SandboxDefaultAccess,
     network_access: bool,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
@@ -327,122 +327,6 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     {
         path.to_path_buf()
     }
-}
-
-pub fn no_access_policy_with_runtime_roots(
-    network_access: bool,
-    path_permissions: Vec<SandboxPathPermission>,
-) -> SandboxPolicy {
-    let mut permissions = runtime_bootstrap_permissions();
-    permissions.extend(path_permissions);
-
-    let mut deduped = Vec::new();
-    for permission in permissions {
-        if deduped.iter().any(|existing: &SandboxPathPermission| {
-            existing.access == permission.access && existing.path == permission.path
-        }) {
-            continue;
-        }
-        deduped.push(permission);
-    }
-
-    policy(SandboxAccess::NoAccess, network_access, deduped)
-}
-
-fn runtime_bootstrap_permissions() -> Vec<SandboxPathPermission> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut permissions = runtime_readable_roots()
-            .into_iter()
-            .map(SandboxPathPermission::read_only)
-            .collect::<Vec<_>>();
-        for device_path in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] {
-            let path = PathBuf::from(device_path);
-            if path.exists() {
-                permissions.push(SandboxPathPermission::read_write(path));
-            }
-        }
-        permissions
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        runtime_readable_roots()
-            .into_iter()
-            .map(SandboxPathPermission::read_only)
-            .collect::<Vec<_>>()
-    }
-}
-
-fn runtime_readable_roots() -> Vec<PathBuf> {
-    #[cfg(target_os = "linux")]
-    let candidates = vec![
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/lib"),
-        PathBuf::from("/lib64"),
-        PathBuf::from("/usr/lib"),
-        PathBuf::from("/usr/lib64"),
-        PathBuf::from("/usr/libexec"),
-    ];
-
-    #[cfg(target_os = "macos")]
-    let candidates = {
-        let mut roots = vec![
-            PathBuf::from("/bin"),
-            PathBuf::from("/dev"),
-            PathBuf::from("/etc"),
-            PathBuf::from("/private/etc"),
-            PathBuf::from("/private/var/db/timezone"),
-            PathBuf::from("/usr/bin"),
-            PathBuf::from("/usr/lib"),
-            PathBuf::from("/usr/share"),
-            PathBuf::from("/usr/share/icu"),
-            PathBuf::from("/usr/share/zoneinfo"),
-            PathBuf::from("/usr/share/zoneinfo.default"),
-            PathBuf::from("/System"),
-            PathBuf::from("/System/Library"),
-        ];
-
-        for tool in ["/bin/sh", "/bin/cat"] {
-            let tool_path = PathBuf::from(tool);
-            if let Some(parent) = tool_path.parent() {
-                roots.push(parent.to_path_buf());
-            }
-            if let Ok(canonical) = fs::canonicalize(&tool_path)
-                && let Some(parent) = canonical.parent()
-            {
-                roots.push(parent.to_path_buf());
-
-                if let Some(usr_root) = parent.parent() {
-                    roots.push(usr_root.join("lib"));
-
-                    if let Some(runtime_root) = usr_root.parent() {
-                        roots.push(runtime_root.join("System/Library"));
-                    }
-                }
-            }
-        }
-
-        roots
-    };
-
-    #[cfg(target_os = "windows")]
-    let candidates: Vec<PathBuf> = Vec::new();
-
-    let mut roots = Vec::new();
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-
-        let normalized = normalize_path(&candidate);
-        if roots.iter().any(|existing| existing == &normalized) {
-            continue;
-        }
-        roots.push(normalized);
-    }
-    roots
 }
 
 fn escape_powershell_single_quoted(path: &Path) -> String {

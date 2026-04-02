@@ -5,6 +5,7 @@ on:
     branches:
       - "**"
   pull_request:
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -53,3 +54,24 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets -- --nocapture
+
+      - name: Run hosted runner diagnostics
+        if: always()
+        shell: bash
+        run: |
+          cargo run --quiet --bin ci_matrix_probe | tee ci-matrix-probe.txt
+          {
+            echo "## Hosted runner diagnostics"
+            echo ""
+            echo '```text'
+            cat ci-matrix-probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hosted runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-matrix-probe-${{ matrix.os }}
+          path: ci-matrix-probe.txt
+          if-no-files-found: ignore

@@ -1,5 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
+#[cfg(target_os = "windows")]
+use std::path::{Component, Prefix};
 use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
@@ -38,10 +40,19 @@ impl PathPolicy {
     }
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn canonicalize_path(path: &Path) -> io::Result<PathBuf> {
     let absolute = absolute_path(path)?;
-    canonicalize_absolute(&absolute)
+    let canonical = absolute.canonicalize()?;
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(strip_windows_verbatim_prefix(&canonical))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(canonical)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -111,17 +122,6 @@ pub(crate) fn is_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "windows")]
-fn canonicalize_absolute(absolute: &Path) -> io::Result<PathBuf> {
-    if let Some((parent, leaf)) = parent_and_leaf(absolute) {
-        let dir = Dir::open_ambient_dir(parent, ambient_authority())?;
-        let relative = dir.canonicalize(leaf)?;
-        Ok(parent.join(relative))
-    } else {
-        absolute.canonicalize()
-    }
-}
-
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -139,4 +139,29 @@ fn path_key(path: &Path, mode: PathKeyMode) -> String {
     match mode {
         PathKeyMode::AsciiCaseInsensitive => path.to_string_lossy().to_ascii_lowercase(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix_component)) = components.next() else {
+        return path.to_path_buf();
+    };
+
+    let mut normalized = match prefix_component.kind() {
+        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:", letter as char)),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut prefix = PathBuf::from(r"\\");
+            prefix.push(server);
+            prefix.push(share);
+            prefix
+        }
+        _ => return path.to_path_buf(),
+    };
+
+    for component in components {
+        normalized.push(component.as_os_str());
+    }
+
+    normalized
 }
