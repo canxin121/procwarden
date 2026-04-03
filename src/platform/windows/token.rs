@@ -363,7 +363,7 @@ impl Drop for AppContainerConfig {
             }
 
             unsafe {
-                let _ = HeapFree(heap, 0, entry.Sid as *mut c_void);
+                let _ = HeapFree(heap, 0, entry.Sid);
             }
         }
 
