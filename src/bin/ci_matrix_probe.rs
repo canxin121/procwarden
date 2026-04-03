@@ -219,45 +219,6 @@ fn probe_windows_network_access_shape(
         render_windows_matrix_result(&runnable)
     );
 
-    let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
-        println!(
-            "windows.network.private_network.host_baseline=skipped(no_reachable_default_gateway_target)"
-        );
-        println!(
-            "windows.network.private_network.enabled=skipped(no_reachable_default_gateway_target)"
-        );
-        println!(
-            "windows.network.private_network.disabled=skipped(no_reachable_default_gateway_target)"
-        );
-        let loopback_enabled = manager.execute(
-            &sandbox_request(
-                windows_network_probe_command("127.0.0.1", 9_431, 1_500)?,
-                &fixture.runtime_cwd,
-            ),
-            &network_enabled_policy,
-        );
-        println!(
-            "windows.network.loopback.same_binary_listener.enabled={}",
-            render_windows_network_probe_result(&loopback_enabled)
-        );
-        return Ok(());
-    };
-
-    println!("windows.network.private_network.target={gateway_ip}:{gateway_port}");
-    println!("windows.network.private_network.host_baseline=connect_ok");
-
-    let private_enabled = manager.execute(
-        &sandbox_request(
-            windows_network_probe_command(&gateway_ip.to_string(), gateway_port, 1_500)?,
-            &fixture.runtime_cwd,
-        ),
-        &network_enabled_policy,
-    );
-    println!(
-        "windows.network.private_network.enabled={}",
-        render_windows_network_probe_result(&private_enabled)
-    );
-
     let loopback_listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("loopback listener bind failed: {error}"))?;
     let loopback_port = loopback_listener
@@ -287,6 +248,34 @@ fn probe_windows_network_access_shape(
     println!(
         "windows.network.loopback.same_binary_listener.disabled={}",
         render_windows_network_probe_result(&loopback_disabled)
+    );
+
+    let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
+        println!(
+            "windows.network.private_network.host_baseline=skipped(no_reachable_default_gateway_target)"
+        );
+        println!(
+            "windows.network.private_network.enabled=skipped(no_reachable_default_gateway_target)"
+        );
+        println!(
+            "windows.network.private_network.disabled=skipped(no_reachable_default_gateway_target)"
+        );
+        return Ok(());
+    };
+
+    println!("windows.network.private_network.target={gateway_ip}:{gateway_port}");
+    println!("windows.network.private_network.host_baseline=connect_ok");
+
+    let private_enabled = manager.execute(
+        &sandbox_request(
+            windows_network_probe_command(&gateway_ip.to_string(), gateway_port, 1_500)?,
+            &fixture.runtime_cwd,
+        ),
+        &network_enabled_policy,
+    );
+    println!(
+        "windows.network.private_network.enabled={}",
+        render_windows_network_probe_result(&private_enabled)
     );
 
     let private_disabled = manager.execute(

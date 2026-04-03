@@ -320,21 +320,25 @@ Linux 额外前提：
 Windows 额外说明：
 
 - 在当前这台真实 Windows 机器上，上面文档化的 Windows 文件系统行现在都能跑通，而且 `ReadOnly + read_write`、`ReadWrite + read_only`、`ReadOnly + deny` 与 `ReadWrite + deny` 的 enforcement 跟进探针也都通过。
+- 在这台机器上，2026-04-03 本地执行 `cargo run --quiet --bin ci_matrix_probe` 时，文档里的 Windows 文件系统形状每次 `manager.execute` 的 wall-clock 样本大致落在 17-24 秒之间。
 - manager 侧仍然要求路径必须已存在，并会在平台分发前 canonicalize；之后 Windows 还会以大小写不敏感的方式再次清洗 ACL 输入，再应用访问调整。
 - 网络行为和上面的文件系统矩阵是独立维度。当前真机网络结论单独列在下面，不和路径矩阵混在一起。
 
 ### Windows `network_access` 真机矩阵
 
-下面这些行描述的是 `windows-matrix-investigation` 分支在当前真机上的观察结果。它们比
-一般 API contract 更窄，因为 Windows 的 loopback 行为目前仍然依赖具体 probe 形状。
+下面这些行描述的是 `windows-matrix-investigation` 分支在当前这台机器上，于 2026-04-03
+重新确认后的真机结果。它们才是这个分支 Windows 实际行为的主要依据；下面 GitHub
+Hosted `windows-latest` 的结果仍然只作为历史观察，因为那个 runner 依旧受 WFP 限制。
+这些行也比一般 API contract 更窄，因为 Windows 的 loopback 行为目前仍然依赖具体
+probe 形状。
 
 | `network_access` | probe 形状 | 实际结果 | 实际状态 | 说明 |
 |---|---|---|---|---|
-| `true` | 对默认网关上第一个可达 TCP 端口（`53` / `80` / `443`）做私网 outbound 探测 | `connect_ok` | 当前机器上可用 | `tests/network_access_control.rs` 与 `ci_matrix_probe` 都已验证 |
-| `true` | 连到“同一可执行文件内部持有的 listener”（`ci_matrix_probe --windows-net-probe`）的 loopback 探测 | `connect_ok` | 当前机器上可用 | 对应 `windows.network.loopback.same_binary_listener.enabled` |
+| `true` | 对默认网关上第一个可达 TCP 端口（`53` / `80` / `443`）做私网 outbound 探测 | `connect_ok` | 当存在可达私网目标时，这台机器上可用 | 由本地 `tests/network_access_control.rs` 套件验证；如果 probe 当时找不到可达默认网关目标，`ci_matrix_probe` 现在会输出 `skipped(no_reachable_default_gateway_target)`，而不是误报失败 |
+| `true` | 连到“同一可执行文件内部持有的 listener”（`ci_matrix_probe --windows-net-probe`）的 loopback 探测 | `connect_ok` | 当前机器上可用 | 已用本地 `ci_matrix_probe` 重新确认；probe 现在会先启动 listener 再测试这一路径 |
 | `true` | 通过 `windows_net_diag` 连接一个通用 host-side listener 的 loopback 探测 | `connect_failed` | 当前后端仍受限 | `tests/network_access_control.rs` 仍把它作为已知剩余限制记录 |
-| `false` | 对同一个默认网关目标做私网 outbound 探测 | `connect_failed(... internet_client ...)` | 阻断行为可用 | 这里是 fail-closed，不会静默降级 |
-| `false` | 对同一可执行文件 listener 的 loopback 探测 | `connect_failed(... timed out ...)` | 阻断行为可用 | 关闭网络时 loopback 仍然被阻断 |
+| `false` | 对同一个默认网关目标做私网 outbound 探测 | `connect_failed(... internet_client ...)` | 阻断行为可用 | 由本地 `tests/network_access_control.rs` 套件验证；这里是 fail-closed，不会静默降级 |
+| `false` | 对同一可执行文件 listener 的 loopback 探测 | `connect_failed(... timed out ...)` | 阻断行为可用 | 已用本地 `ci_matrix_probe` 重新确认；关闭网络时 loopback 仍然被阻断 |
 
 ### macOS
 

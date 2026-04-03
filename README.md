@@ -321,22 +321,25 @@ Linux-specific caveats:
 Windows-specific caveats:
 
 - On the current real Windows machine, all documented Windows filesystem rows above are runnable, and the follow-up enforcement probes for `ReadOnly + read_write`, `ReadWrite + read_only`, `ReadOnly + deny`, and `ReadWrite + deny` all pass.
+- A local `cargo run --quiet --bin ci_matrix_probe` pass on April 3, 2026 measured roughly 17-24 seconds of wall-clock time per `manager.execute` across the documented Windows filesystem shapes on this machine.
 - Manager-side validation still requires existing paths and canonicalizes them before platform dispatch; Windows then re-sanitizes the ACL inputs case-insensitively before applying access adjustments.
 - Network behavior is a separate dimension from the filesystem matrix above. The current real-machine observations are documented below instead of being folded into the path table.
 
 ### Windows `network_access` real-machine matrix
 
-These rows document current real-machine behavior on the `windows-matrix-investigation` branch. They
-are narrower than a general API contract because Windows loopback behavior still depends on the exact
-probe shape.
+These rows document current real-machine behavior on the `windows-matrix-investigation` branch as
+rechecked locally on April 3, 2026. They are the practical source of truth for Windows behavior on
+this branch; the GitHub-hosted `windows-latest` observations below remain historical because that
+runner is still WFP-limited. These rows are also narrower than a general API contract because
+Windows loopback behavior still depends on the exact probe shape.
 
 | `network_access` | Probe shape | Observed result | Practical status | Notes |
 |---|---|---|---|---|
-| `true` | Private-network outbound probe to the first reachable default-gateway TCP port (`53` / `80` / `443`) | `connect_ok` | Usable on this machine | Verified by both `tests/network_access_control.rs` and `ci_matrix_probe` |
-| `true` | Loopback to a listener hosted by the same executable (`ci_matrix_probe --windows-net-probe`) | `connect_ok` | Usable on this machine | This is what `windows.network.loopback.same_binary_listener.enabled` reports |
+| `true` | Private-network outbound probe to the first reachable default-gateway TCP port (`53` / `80` / `443`) | `connect_ok` | Usable on this machine when a reachable private target exists | Verified by the local `tests/network_access_control.rs` suite; `ci_matrix_probe` now reports `skipped(no_reachable_default_gateway_target)` instead of a false failure when no such target is reachable at probe time |
+| `true` | Loopback to a listener hosted by the same executable (`ci_matrix_probe --windows-net-probe`) | `connect_ok` | Usable on this machine | Rechecked locally with `ci_matrix_probe`; the probe now always starts the listener before testing this path |
 | `true` | Loopback to a generic host-side listener probed via `windows_net_diag` | `connect_failed` | Still blocked on the current backend | `tests/network_access_control.rs` keeps this as the documented remaining limitation |
-| `false` | Private-network outbound probe to the same default-gateway target | `connect_failed(... internet_client ...)` | Usable deny behavior | The process fails closed instead of silently downgrading |
-| `false` | Loopback to the same-binary listener probe | `connect_failed(... timed out ...)` | Usable deny behavior | Loopback remains blocked when networking is disabled |
+| `false` | Private-network outbound probe to the same default-gateway target | `connect_failed(... internet_client ...)` | Usable deny behavior | Verified by the local `tests/network_access_control.rs` suite; the process fails closed instead of silently downgrading |
+| `false` | Loopback to the same-binary listener probe | `connect_failed(... timed out ...)` | Usable deny behavior | Rechecked locally with `ci_matrix_probe`; loopback remains blocked when networking is disabled |
 
 ### macOS
 
