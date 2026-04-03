@@ -91,6 +91,7 @@ fn sanitize_policy_for_execution(policy: &SandboxPolicy) -> Result<SandboxPolicy
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| path_access_key(left.access).cmp(&path_access_key(right.access)))
     });
+    reject_reopened_descendants_under_deny(&path_permissions)?;
     path_permissions = prune_same_access_descendants(path_permissions);
 
     Ok(SandboxPolicy {
@@ -101,10 +102,7 @@ fn sanitize_policy_for_execution(policy: &SandboxPolicy) -> Result<SandboxPolicy
 }
 
 fn sanitize_policy_path(permission: &SandboxPathPermission) -> Result<PathBuf, SandboxError> {
-    let label = match permission.access {
-        SandboxPathAccess::ReadOnly => "read_only",
-        SandboxPathAccess::ReadWrite => "read_write",
-    };
+    let label = path_access_label(permission.access);
 
     sanitize_existing_path(&permission.path, &format!("{label} path"), true)
 }
@@ -148,16 +146,19 @@ fn sanitize_existing_path(
 
 fn path_access_key(access: SandboxPathAccess) -> u8 {
     match access {
-        SandboxPathAccess::ReadOnly => 0,
-        SandboxPathAccess::ReadWrite => 1,
+        SandboxPathAccess::Deny => 0,
+        SandboxPathAccess::ReadOnly => 1,
+        SandboxPathAccess::ReadWrite => 2,
     }
 }
 
 fn explicit_priority(default_access: super::SandboxDefaultAccess, access: SandboxPathAccess) -> u8 {
-    if access == default_access_path_access(default_access) {
-        0
-    } else {
-        1
+    match (default_access, access) {
+        (_, SandboxPathAccess::Deny) => 2,
+        (super::SandboxDefaultAccess::ReadOnly, SandboxPathAccess::ReadOnly)
+        | (super::SandboxDefaultAccess::ReadWrite, SandboxPathAccess::ReadWrite) => 0,
+        (super::SandboxDefaultAccess::ReadOnly, SandboxPathAccess::ReadWrite)
+        | (super::SandboxDefaultAccess::ReadWrite, SandboxPathAccess::ReadOnly) => 1,
     }
 }
 
@@ -169,14 +170,8 @@ fn access_for_priority(
         (_, 0) => None,
         (super::SandboxDefaultAccess::ReadOnly, 1) => Some(SandboxPathAccess::ReadWrite),
         (super::SandboxDefaultAccess::ReadWrite, 1) => Some(SandboxPathAccess::ReadOnly),
+        (_, 2) => Some(SandboxPathAccess::Deny),
         _ => None,
-    }
-}
-
-fn default_access_path_access(default_access: super::SandboxDefaultAccess) -> SandboxPathAccess {
-    match default_access {
-        super::SandboxDefaultAccess::ReadOnly => SandboxPathAccess::ReadOnly,
-        super::SandboxDefaultAccess::ReadWrite => SandboxPathAccess::ReadWrite,
     }
 }
 
@@ -198,6 +193,39 @@ fn prune_same_access_descendants(
     }
 
     normalized
+}
+
+fn reject_reopened_descendants_under_deny(
+    permissions: &[SandboxPathPermission],
+) -> Result<(), SandboxError> {
+    for permission in permissions {
+        if permission.access == SandboxPathAccess::Deny {
+            continue;
+        }
+
+        if let Some(ancestor) = permissions.iter().find(|existing| {
+            existing.access == SandboxPathAccess::Deny
+                && existing.path != permission.path
+                && is_same_or_descendant(&permission.path, &existing.path)
+        }) {
+            return Err(SandboxError::InvalidRequest(format!(
+                "{} path cannot reopen access under deny ancestor {}: {}",
+                path_access_label(permission.access),
+                ancestor.path.display(),
+                permission.path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn path_access_label(access: SandboxPathAccess) -> &'static str {
+    match access {
+        SandboxPathAccess::Deny => "deny",
+        SandboxPathAccess::ReadOnly => "read_only",
+        SandboxPathAccess::ReadWrite => "read_write",
+    }
 }
 
 fn is_same_or_descendant(path: &std::path::Path, ancestor: &std::path::Path) -> bool {
@@ -426,5 +454,87 @@ mod tests {
                 cap_fs::canonicalize_path(&path).expect("path should canonicalize")
             )]
         );
+    }
+
+    #[test]
+    fn deny_wins_same_path_conflicts_before_dispatch() {
+        let temp = TestTempDir::new("conflicting-same-path-deny");
+        let path = temp.path().join("target");
+        fs::create_dir_all(&path).expect("target path should be created");
+
+        let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
+            default_access: SandboxDefaultAccess::ReadOnly,
+            network_access: false,
+            path_permissions: vec![
+                SandboxPathPermission::read_write(path.clone()),
+                SandboxPathPermission::deny(path.clone()),
+            ],
+        })
+        .expect("policy should sanitize successfully");
+
+        assert_eq!(
+            sanitized.path_permissions,
+            vec![SandboxPathPermission::deny(
+                cap_fs::canonicalize_path(&path).expect("path should canonicalize")
+            )]
+        );
+    }
+
+    #[test]
+    fn deny_descendants_are_retained_as_more_restrictive_overlays() {
+        let temp = TestTempDir::new("deny-descendant");
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        fs::create_dir_all(&child).expect("test directories should be created");
+
+        let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
+            default_access: SandboxDefaultAccess::ReadWrite,
+            network_access: false,
+            path_permissions: vec![
+                SandboxPathPermission::read_only(root.clone()),
+                SandboxPathPermission::deny(child.clone()),
+            ],
+        })
+        .expect("policy should sanitize successfully");
+
+        assert_eq!(
+            sanitized.path_permissions,
+            vec![
+                SandboxPathPermission::read_only(
+                    cap_fs::canonicalize_path(&root).expect("root should canonicalize")
+                ),
+                SandboxPathPermission::deny(
+                    cap_fs::canonicalize_path(&child).expect("child should canonicalize")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reopening_inside_deny_fails_closed_before_dispatch() {
+        let temp = TestTempDir::new("deny-reopen");
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        fs::create_dir_all(&child).expect("test directories should be created");
+
+        let error = sanitize_policy_for_execution(&SandboxPolicy {
+            default_access: SandboxDefaultAccess::ReadOnly,
+            network_access: false,
+            path_permissions: vec![
+                SandboxPathPermission::deny(root.clone()),
+                SandboxPathPermission::read_write(child.clone()),
+            ],
+        })
+        .expect_err("reopening inside deny should fail");
+
+        match error {
+            SandboxError::InvalidRequest(message) => {
+                assert!(
+                    message.contains("read_write path cannot reopen access under deny ancestor"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected InvalidRequest for reopen-under-deny, got {other:?}"),
+        }
     }
 }

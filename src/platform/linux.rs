@@ -3,10 +3,12 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use landlock::ABI;
 use landlock::Access;
@@ -51,6 +53,7 @@ pub(super) fn execute(
 
     let default_write_access = policy.default_write_access();
     let read_only_paths = policy.read_only_paths();
+    let deny_paths = policy.denied_paths();
     let writable_roots = policy.writable_paths();
     let network_access = policy.network_access;
     let host_uid = unsafe { libc::geteuid() };
@@ -66,16 +69,25 @@ pub(super) fn execute(
     } else {
         Vec::new()
     };
-    let should_install_mount_overlays = !mount_overlay_paths.is_empty();
+    let normalized_deny_paths = normalize_existing_overlay_paths(
+        &deny_paths,
+        "deny",
+        overlay_context_label(policy.default_access),
+    )?;
+    let deny_overlay_artifacts = prepare_deny_overlay_artifacts(&normalized_deny_paths)?;
+    let deny_overlay_targets = deny_overlay_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.targets.clone())
+        .unwrap_or_default();
+    let should_install_mount_overlays =
+        !mount_overlay_paths.is_empty() || !deny_overlay_targets.is_empty();
 
     unsafe {
         command.pre_exec(move || {
             if should_install_mount_overlays {
-                install_readwrite_mount_overlays_on_current_process(
-                    &mount_overlay_paths,
-                    host_uid,
-                    host_gid,
-                )?;
+                enter_overlay_mount_namespace(host_uid, host_gid)?;
+                apply_readwrite_mount_overlays_on_current_process(&mount_overlay_paths)?;
+                install_deny_mount_overlays_on_current_process(&deny_overlay_targets)?;
             }
             if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(&writable_roots)?;
@@ -236,20 +248,86 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
-fn install_readwrite_mount_overlays_on_current_process(
-    overlays: &[PathBuf],
-    host_uid: libc::uid_t,
-    host_gid: libc::gid_t,
-) -> io::Result<()> {
+#[derive(Clone)]
+struct DenyOverlayTarget {
+    target: PathBuf,
+    placeholder: PathBuf,
+    recursive: bool,
+}
+
+struct DenyOverlayArtifacts {
+    workspace: PathBuf,
+    targets: Vec<DenyOverlayTarget>,
+}
+
+impl Drop for DenyOverlayArtifacts {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.workspace);
+    }
+}
+
+fn apply_readwrite_mount_overlays_on_current_process(overlays: &[PathBuf]) -> io::Result<()> {
     if overlays.is_empty() {
         return Ok(());
     }
 
-    enter_overlay_mount_namespace(host_uid, host_gid)?;
-
     for overlay in overlays {
         apply_readonly_bind_mount(overlay)?;
     }
+    Ok(())
+}
+
+fn prepare_deny_overlay_artifacts(
+    deny_paths: &[PathBuf],
+) -> Result<Option<DenyOverlayArtifacts>, SandboxError> {
+    if deny_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!(
+        "procwarden-linux-deny-overlay-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&workspace).map_err(SandboxError::Io)?;
+
+    let dir_placeholder = workspace.join("empty-dir");
+    fs::create_dir(&dir_placeholder).map_err(SandboxError::Io)?;
+    fs::set_permissions(&dir_placeholder, fs::Permissions::from_mode(0o000))
+        .map_err(SandboxError::Io)?;
+
+    let file_placeholder = workspace.join("empty-file");
+    fs::write(&file_placeholder, []).map_err(SandboxError::Io)?;
+    fs::set_permissions(&file_placeholder, fs::Permissions::from_mode(0o000))
+        .map_err(SandboxError::Io)?;
+
+    let mut targets = Vec::with_capacity(deny_paths.len());
+    for path in deny_paths {
+        let metadata = fs::metadata(path).map_err(SandboxError::Io)?;
+        targets.push(DenyOverlayTarget {
+            target: path.clone(),
+            placeholder: if metadata.is_dir() {
+                dir_placeholder.clone()
+            } else {
+                file_placeholder.clone()
+            },
+            recursive: metadata.is_dir(),
+        });
+    }
+
+    Ok(Some(DenyOverlayArtifacts { workspace, targets }))
+}
+
+fn install_deny_mount_overlays_on_current_process(
+    overlays: &[DenyOverlayTarget],
+) -> io::Result<()> {
+    for overlay in overlays {
+        bind_mount(&overlay.placeholder, &overlay.target, overlay.recursive)?;
+    }
+
     Ok(())
 }
 

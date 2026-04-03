@@ -35,6 +35,7 @@ use super::util::to_wide;
 const SE_KERNEL_OBJECT: u32 = 6;
 const READ_ONLY_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 const READ_WRITE_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+const DENY_ALL_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
 
 pub(super) struct AclRollback {
     sid: *mut c_void,
@@ -43,6 +44,7 @@ pub(super) struct AclRollback {
 
 #[derive(Debug, Clone)]
 pub(super) struct AclAccessPlan {
+    pub(super) deny_access_paths: Vec<PathBuf>,
     pub(super) allow_readonly_paths: Vec<PathBuf>,
     pub(super) allow_readwrite_paths: Vec<PathBuf>,
     pub(super) deny_write_paths: Vec<PathBuf>,
@@ -53,6 +55,13 @@ pub(super) unsafe fn apply_access_plan(
     sid: *mut c_void,
 ) -> Result<AclRollback, SandboxError> {
     let mut rollback = AclRollback::new(sid);
+
+    for path in &plan.deny_access_paths {
+        let added = add_deny_all_access_ace(path, sid)?;
+        if added {
+            rollback.track(path.clone());
+        }
+    }
 
     for path in &plan.deny_write_paths {
         let added = add_deny_write_ace(path, sid)?;
@@ -215,6 +224,13 @@ pub(super) unsafe fn add_deny_write_ace(
     sid: *mut c_void,
 ) -> Result<bool, SandboxError> {
     add_deny_access_ace(path, sid, FILE_GENERIC_WRITE)
+}
+
+pub(super) unsafe fn add_deny_all_access_ace(
+    path: &Path,
+    sid: *mut c_void,
+) -> Result<bool, SandboxError> {
+    add_deny_access_ace(path, sid, DENY_ALL_ACCESS_MASK)
 }
 
 unsafe fn add_deny_access_ace(

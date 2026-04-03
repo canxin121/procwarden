@@ -45,9 +45,11 @@ pub struct Fixture {
     _workspace: TempDir,
     _outside: TempDir,
     pub runtime_cwd: PathBuf,
+    pub deny_dir: PathBuf,
     pub ro_dir: PathBuf,
     pub rw_dir: PathBuf,
     pub outside_dir: PathBuf,
+    pub deny_seed: PathBuf,
     pub ro_seed: PathBuf,
     pub outside_seed: PathBuf,
 }
@@ -58,23 +60,34 @@ impl Fixture {
         let outside = TempDir::new(&format!("{prefix}-outside"));
 
         let runtime_cwd_raw = workspace.path().join("runtime-cwd");
+        let deny_dir_raw = workspace.path().join("denied");
         let ro_dir_raw = workspace.path().join("readonly");
         let rw_dir_raw = workspace.path().join("readwrite");
         let outside_dir_raw = outside.path().join("outside");
 
-        for dir in [&runtime_cwd_raw, &ro_dir_raw, &rw_dir_raw, &outside_dir_raw] {
+        for dir in [
+            &runtime_cwd_raw,
+            &deny_dir_raw,
+            &ro_dir_raw,
+            &rw_dir_raw,
+            &outside_dir_raw,
+        ] {
             fs::create_dir_all(dir).expect("fixture directory should be created");
         }
 
+        let deny_seed_raw = deny_dir_raw.join("seed-deny.txt");
         let ro_seed_raw = ro_dir_raw.join("seed-ro.txt");
         let outside_seed_raw = outside_dir_raw.join("seed-outside.txt");
+        fs::write(&deny_seed_raw, "deny-seed").expect("deny seed should be created");
         fs::write(&ro_seed_raw, "readonly-seed").expect("readonly seed should be created");
         fs::write(&outside_seed_raw, "outside-seed").expect("outside seed should be created");
 
         let runtime_cwd = normalize_path(&runtime_cwd_raw);
+        let deny_dir = normalize_path(&deny_dir_raw);
         let ro_dir = normalize_path(&ro_dir_raw);
         let rw_dir = normalize_path(&rw_dir_raw);
         let outside_dir = normalize_path(&outside_dir_raw);
+        let deny_seed = normalize_path(&deny_seed_raw);
         let ro_seed = normalize_path(&ro_seed_raw);
         let outside_seed = normalize_path(&outside_seed_raw);
 
@@ -82,9 +95,11 @@ impl Fixture {
             _workspace: workspace,
             _outside: outside,
             runtime_cwd,
+            deny_dir,
             ro_dir,
             rw_dir,
             outside_dir,
+            deny_seed,
             ro_seed,
             outside_seed,
         }
@@ -185,25 +200,16 @@ pub fn write_command(target: &Path, payload: &str) -> Vec<String> {
 pub fn connect_command(host: &str, port: u16, timeout_ms: u64) -> Vec<String> {
     #[cfg(windows)]
     {
-        let connect_timeout_s = u64::max(1, timeout_ms.div_ceil(1_000));
-        let max_time_s = connect_timeout_s.saturating_add(2);
-        let scheme = if port == 443 { "https" } else { "http" };
-        let mut command = vec![
-            "curl.exe".to_string(),
-            "--silent".to_string(),
-            "--show-error".to_string(),
-            "--output".to_string(),
-            "NUL".to_string(),
-            "--connect-timeout".to_string(),
-            connect_timeout_s.to_string(),
-            "--max-time".to_string(),
-            max_time_s.to_string(),
-        ];
-        if scheme == "https" {
-            command.push("--insecure".to_string());
-        }
-        command.push(format!("{scheme}://{host}:{port}/"));
-        command
+        let escaped_host = host.replace('\'', "''");
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ $client = New-Object System.Net.Sockets.TcpClient; $async = $client.BeginConnect('{escaped_host}', {port}, $null, $null); if (-not $async.AsyncWaitHandle.WaitOne({timeout_ms}, $false)) {{ $client.Close(); [Console]::Error.WriteLine('timeout'); exit 1 }}; $client.EndConnect($async) | Out-Null; $client.Close(); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }}"
+            ),
+        ]
     }
 
     #[cfg(not(windows))]

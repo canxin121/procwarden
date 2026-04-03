@@ -11,7 +11,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows_sys::Win32::UI::Shell::{
+    SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+};
 
 use crate::SandboxError;
 
@@ -31,7 +33,7 @@ impl ElevatedProcess {
 
         let mut exec_info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
         exec_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        exec_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        exec_info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE;
         exec_info.lpVerb = verb.as_ptr();
         exec_info.lpFile = file_wide.as_ptr();
         exec_info.lpParameters = parameters_wide.as_ptr();

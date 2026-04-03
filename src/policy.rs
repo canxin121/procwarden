@@ -9,6 +9,7 @@ pub enum SandboxDefaultAccess {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SandboxPathAccess {
+    Deny,
     ReadOnly,
     ReadWrite,
 }
@@ -20,6 +21,13 @@ pub struct SandboxPathPermission {
 }
 
 impl SandboxPathPermission {
+    pub fn deny(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: SandboxPathAccess::Deny,
+        }
+    }
+
     pub fn read_only(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -45,6 +53,10 @@ pub struct SandboxPolicy {
 impl SandboxPolicy {
     pub fn read_only_paths(&self) -> Vec<PathBuf> {
         self.collect_paths(|access| matches!(access, SandboxPathAccess::ReadOnly))
+    }
+
+    pub fn denied_paths(&self) -> Vec<PathBuf> {
+        self.collect_paths(|access| matches!(access, SandboxPathAccess::Deny))
     }
 
     pub fn read_write_paths(&self) -> Vec<PathBuf> {

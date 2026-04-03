@@ -17,8 +17,7 @@ struct CombinationCase {
     default_access: SandboxDefaultAccess,
     include_read_only: bool,
     include_read_write: bool,
-    linux_expectation: Expectation,
-    macos_expectation: Expectation,
+    include_deny: bool,
 }
 
 #[test]
@@ -32,64 +31,112 @@ fn policy_shape_matrix_acceptance_contract() {
             default_access: SandboxDefaultAccess::ReadWrite,
             include_read_only: false,
             include_read_write: false,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_write_default_read_write_overlay",
             default_access: SandboxDefaultAccess::ReadWrite,
             include_read_only: false,
             include_read_write: true,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_write_default_read_only_overlay",
             default_access: SandboxDefaultAccess::ReadWrite,
             include_read_only: true,
             include_read_write: false,
-            linux_expectation: Expectation::HostCapabilityDependent,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_write_default_read_only_and_read_write_overlay",
             default_access: SandboxDefaultAccess::ReadWrite,
             include_read_only: true,
             include_read_write: true,
-            linux_expectation: Expectation::HostCapabilityDependent,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
+        },
+        CombinationCase {
+            name: "read_write_default_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadWrite,
+            include_read_only: false,
+            include_read_write: false,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_write_default_read_only_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadWrite,
+            include_read_only: true,
+            include_read_write: false,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_write_default_read_write_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadWrite,
+            include_read_only: false,
+            include_read_write: true,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_write_default_read_only_read_write_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadWrite,
+            include_read_only: true,
+            include_read_write: true,
+            include_deny: true,
         },
         CombinationCase {
             name: "read_only_default_no_overlays",
             default_access: SandboxDefaultAccess::ReadOnly,
             include_read_only: false,
             include_read_write: false,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_only_default_read_only_overlay",
             default_access: SandboxDefaultAccess::ReadOnly,
             include_read_only: true,
             include_read_write: false,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_only_default_read_write_overlay",
             default_access: SandboxDefaultAccess::ReadOnly,
             include_read_only: false,
             include_read_write: true,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
         },
         CombinationCase {
             name: "read_only_default_read_only_and_read_write_overlay",
             default_access: SandboxDefaultAccess::ReadOnly,
             include_read_only: true,
             include_read_write: true,
-            linux_expectation: Expectation::Runnable,
-            macos_expectation: Expectation::Runnable,
+            include_deny: false,
+        },
+        CombinationCase {
+            name: "read_only_default_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadOnly,
+            include_read_only: false,
+            include_read_write: false,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_only_default_read_only_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadOnly,
+            include_read_only: true,
+            include_read_write: false,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_only_default_read_write_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadOnly,
+            include_read_only: false,
+            include_read_write: true,
+            include_deny: true,
+        },
+        CombinationCase {
+            name: "read_only_default_read_only_read_write_and_deny_overlay",
+            default_access: SandboxDefaultAccess::ReadOnly,
+            include_read_only: true,
+            include_read_write: true,
+            include_deny: true,
         },
     ];
 
@@ -100,6 +147,9 @@ fn policy_shape_matrix_acceptance_contract() {
         }
         if case.include_read_write {
             path_permissions.push(SandboxPathPermission::read_write(fixture.rw_dir.clone()));
+        }
+        if case.include_deny {
+            path_permissions.push(SandboxPathPermission::deny(fixture.deny_dir.clone()));
         }
 
         let test_policy = policy(case.default_access, false, path_permissions);
@@ -253,16 +303,29 @@ fn linux_overlay_backed_readonly_paths_require_existing_targets() {
 }
 
 fn expected_for_current_platform(case: &CombinationCase) -> Expectation {
-    let _ = case.linux_expectation;
-    let _ = case.macos_expectation;
-
     #[cfg(target_os = "linux")]
     {
-        case.linux_expectation
+        linux_expectation(case)
     }
 
     #[cfg(target_os = "macos")]
     {
-        case.macos_expectation
+        macos_expectation(case)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_expectation(case: &CombinationCase) -> Expectation {
+    match case.default_access {
+        SandboxDefaultAccess::ReadWrite if case.include_read_only || case.include_deny => {
+            Expectation::HostCapabilityDependent
+        }
+        SandboxDefaultAccess::ReadOnly if case.include_deny => Expectation::HostCapabilityDependent,
+        _ => Expectation::Runnable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_expectation(_case: &CombinationCase) -> Expectation {
+    Expectation::Runnable
 }

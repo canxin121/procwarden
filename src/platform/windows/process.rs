@@ -38,6 +38,7 @@ use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_P
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST;
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::STARTF_USESHOWWINDOW;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
@@ -209,9 +210,11 @@ pub(super) fn run_process_in_appcontainer(
         let mut startup_info_ex: STARTUPINFOEXW = std::mem::zeroed();
         startup_info_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info_ex.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
         startup_info_ex.StartupInfo.hStdInput = in_r;
         startup_info_ex.StartupInfo.hStdOutput = out_w;
         startup_info_ex.StartupInfo.hStdError = err_w;
+        startup_info_ex.StartupInfo.wShowWindow = 0;
         startup_info_ex.lpAttributeList = prepared.attrs.as_mut_ptr();
 
         let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();

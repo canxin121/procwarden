@@ -19,6 +19,7 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
 - `path_permissions: Vec<SandboxPathPermission>`
   - each entry has a `path` and a path-level access mode
   - constructors:
+    - `SandboxPathPermission::deny(path)`
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
 - `default_access: SandboxDefaultAccess`
@@ -39,7 +40,7 @@ and dispatches to platform-specific backends for Linux, macOS, and Windows.
 Before platform dispatch, the manager:
 
 1. Validates request shape (`command` non-empty, executable token non-empty, `cwd` exists and is a directory).
-2. Validates allow-path policy entries (`read_only` / `read_write`) are non-empty and currently exist, otherwise returns `SandboxError::InvalidRequest`.
+2. Validates policy path entries (`deny` / `read_only` / `read_write`) are non-empty and currently exist, otherwise returns `SandboxError::InvalidRequest`.
 3. Sanitizes environment variables (removes dangerous loader/shell injection variables such as `LD_PRELOAD`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `BASH_FUNC_*`).
 
 ---
@@ -58,6 +59,7 @@ let manager = SandboxManager::new();
 
 let policy = SandboxPolicy {
     path_permissions: vec![
+        SandboxPathPermission::deny(PathBuf::from("/workspace/secrets")),
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ],
@@ -242,7 +244,8 @@ Current mapping strategy:
 - this deny applies to local and external network access (for example loopback and remote endpoints).
 - default access is then mapped:
   - `ReadWrite`: explicit `read_only` paths become `file-write*` deny rules.
-  - `ReadOnly`: emit a global `(deny file-write*)`, then explicit `read_write` carve-out allow rules.
+  - any explicit `deny` path emits both `file-read*` and `file-write*` deny rules.
+  - `ReadOnly`: emit a global `(deny file-write*)`, then explicit `read_write` carve-out allow rules, then apply explicit `deny` paths as stronger per-path deny rules.
 
 Path rules are emitted as both `(literal "...")` and `(subpath "...")` filters.
 
@@ -253,12 +256,12 @@ backend builds SBPL rules. That closes the old alias mismatch gap for existing p
 
 ---
 
-## Practical Linux/macOS Path Matrix
+## Practical Linux/Windows/macOS Filesystem Matrix
 
-The matrices below separate the two policy dimensions explicitly:
+The matrices below separate the two filesystem-policy dimensions explicitly:
 
 - `default_access`: the fallback policy for paths not listed in `path_permissions`
-- `path_permissions`: the explicit per-path overrides (`read_only`, `read_write`)
+- `path_permissions`: the explicit per-path overrides (`deny`, `read_only`, `read_write`)
 
 "Accepted" means the backend accepts the request shape. "Usable" means it is a reasonable documented
 contract today. "Host-capability-dependent" means the policy shape is supported, but the Linux host
@@ -269,6 +272,8 @@ Interpretation notes for the current model:
 - There are no filesystem-matrix rows labeled "Conditional" anymore because the global `NoAccess` / allowlist mode has been removed from the public API.
 - All `path_permissions` are validated up front by the manager: the path must be non-empty, must already exist, and is canonicalized before platform dispatch.
 - The manager also normalizes redundant path rules before platform dispatch: default-equivalent entries are dropped, exact-path conflicts collapse to the effective explicit state, and same-access descendants already covered by an ancestor are removed.
+- `deny` is a per-path state only. There is still no global `NoAccess` default mode.
+- Descendants are not allowed to reopen access under an explicit `deny` ancestor. Such shapes fail closed with `SandboxError::InvalidRequest`.
 - For Linux rows labeled "Host-capability-dependent":
   - usable means the host can create the required user/mount namespaces after the manager-level path validation has already succeeded.
   - if namespace support is missing, execution fails closed with `SandboxError::Unavailable`.
@@ -281,16 +286,57 @@ Interpretation notes for the current model:
 | `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
 | `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not add new power over a global write default; manager normalizes them away before backend dispatch |
 | `ReadWrite` | `read_only` only | Accepted | Host-capability-dependent | Implemented via mount-namespace overlays; overlay targets must already exist |
+| `ReadWrite` | `deny` only | Accepted | Host-capability-dependent | Implemented via mount-namespace replacement overlays with unreadable placeholders |
 | `ReadWrite` | `read_only + read_write` | Accepted | Host-capability-dependent | `read_write` is redundant and is normalized away; `read_only` still needs mount-namespace overlays |
+| `ReadWrite` | `read_only + deny` | Accepted | Host-capability-dependent | `deny` is stricter than `read_only`; both require overlay support on Linux |
 | `ReadOnly` | none | Accepted | Usable | Global read-only mode |
 | `ReadOnly` | `read_only` only | Accepted | Usable but redundant | The default already allows reads and denies writes; manager normalizes these entries away |
 | `ReadOnly` | `read_write` only | Accepted | Usable | Explicit write carve-outs |
+| `ReadOnly` | `deny` only | Accepted | Host-capability-dependent | Implemented via mount-namespace replacement overlays with unreadable placeholders |
 | `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant and is normalized away; `read_write` adds writable carve-outs |
+| `ReadOnly` | `read_write + deny` | Accepted | Host-capability-dependent | `deny` can further restrict a writable carve-out; Linux still needs overlay support |
 
 Linux-specific caveats:
 
-- Any Linux policy shape that requires read-only bind overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
+- Any Linux policy shape that requires read-only or deny overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
 - Overlay-backed subtractive rules currently apply only to already-existing path objects. This is a backend contract on top of the kernel primitives we use: bind mounts need an existing mount point, and creating that target inside only a private mount namespace would still create it on the shared host filesystem.
+
+### Windows
+
+| `default_access` | `path_permissions` shape | Backend result | Practical status | Notes |
+|---|---|---|---|---|
+| `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode inside the current AppContainer-backed model |
+| `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not add new power over a global write default; manager normalizes them away before backend dispatch |
+| `ReadWrite` | `read_only` only | Accepted | Usable | Implemented by subtractive write denial on the matched paths |
+| `ReadWrite` | `deny` only | Accepted | Usable | Implemented by per-path deny ACLs on the matched paths |
+| `ReadWrite` | `read_only + read_write` | Accepted | Usable | `read_write` is redundant and is normalized away; `read_only` still subtracts writes under those paths |
+| `ReadWrite` | `read_only + deny` | Accepted | Usable | `deny` is stricter than `read_only`; Windows applies both as path ACL adjustments |
+| `ReadOnly` | none | Accepted | Usable | Global read-only mode |
+| `ReadOnly` | `read_only` only | Accepted | Usable but redundant | The default already allows reads and denies writes; manager normalizes these entries away |
+| `ReadOnly` | `read_write` only | Accepted | Usable | Explicit writable carve-outs |
+| `ReadOnly` | `deny` only | Accepted | Usable | Explicit no-read/no-write carve-outs inside an otherwise readable default |
+| `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant and is normalized away; `read_write` adds writable carve-outs |
+| `ReadOnly` | `read_write + deny` | Accepted | Usable | `deny` can further restrict a writable carve-out |
+
+Windows-specific caveats:
+
+- On the current real Windows machine, all documented Windows filesystem rows above are runnable, and the follow-up enforcement probes for `ReadOnly + read_write`, `ReadWrite + read_only`, `ReadOnly + deny`, and `ReadWrite + deny` all pass.
+- Manager-side validation still requires existing paths and canonicalizes them before platform dispatch; Windows then re-sanitizes the ACL inputs case-insensitively before applying access adjustments.
+- Network behavior is a separate dimension from the filesystem matrix above. The current real-machine observations are documented below instead of being folded into the path table.
+
+### Windows `network_access` real-machine matrix
+
+These rows document current real-machine behavior on the `windows-matrix-investigation` branch. They
+are narrower than a general API contract because Windows loopback behavior still depends on the exact
+probe shape.
+
+| `network_access` | Probe shape | Observed result | Practical status | Notes |
+|---|---|---|---|---|
+| `true` | Private-network outbound probe to the first reachable default-gateway TCP port (`53` / `80` / `443`) | `connect_ok` | Usable on this machine | Verified by both `tests/network_access_control.rs` and `ci_matrix_probe` |
+| `true` | Loopback to a listener hosted by the same executable (`ci_matrix_probe --windows-net-probe`) | `connect_ok` | Usable on this machine | This is what `windows.network.loopback.same_binary_listener.enabled` reports |
+| `true` | Loopback to a generic host-side listener probed via `windows_net_diag` | `connect_failed` | Still blocked on the current backend | `tests/network_access_control.rs` keeps this as the documented remaining limitation |
+| `false` | Private-network outbound probe to the same default-gateway target | `connect_failed(... internet_client ...)` | Usable deny behavior | The process fails closed instead of silently downgrading |
+| `false` | Loopback to the same-binary listener probe | `connect_failed(... timed out ...)` | Usable deny behavior | Loopback remains blocked when networking is disabled |
 
 ### macOS
 
@@ -299,11 +345,15 @@ Linux-specific caveats:
 | `ReadWrite` | none | Accepted | Usable | Unrestricted filesystem mode |
 | `ReadWrite` | `read_write` only | Accepted | Usable but redundant | `read_write` entries do not change a global write default; manager normalizes them away before SBPL generation |
 | `ReadWrite` | `read_only` only | Accepted | Usable | Denies writes under those paths |
+| `ReadWrite` | `deny` only | Accepted | Usable | Emits per-path `file-read*` and `file-write*` deny rules |
 | `ReadWrite` | `read_only + read_write` | Accepted | Usable | `read_write` is redundant and is normalized away; `read_only` still subtracts writes under those paths |
+| `ReadWrite` | `read_only + deny` | Accepted | Usable | `deny` is stricter than `read_only`; both are emitted as subtractive SBPL rules |
 | `ReadOnly` | none | Accepted | Usable | Global read-only mode |
 | `ReadOnly` | `read_only` only | Accepted | Usable but redundant | `read_only` entries do not add new restrictions over a global read-only default; manager normalizes them away |
 | `ReadOnly` | `read_write` only | Accepted | Usable | Writable carve-outs are emitted against canonicalized paths |
+| `ReadOnly` | `deny` only | Accepted | Usable | Per-path read/write deny rules on top of the readable default |
 | `ReadOnly` | `read_only + read_write` | Accepted | Usable | `read_only` is redundant and is normalized away; `read_write` adds writable carve-outs |
+| `ReadOnly` | `read_write + deny` | Accepted | Usable | `deny` can further restrict a writable carve-out |
 
 macOS-specific caveats:
 
@@ -334,27 +384,30 @@ What those runs tell us:
 - `macos-latest` currently passes the remaining public macOS matrix for the `ReadOnly` / `ReadWrite` defaults with path overlays.
 - Historical `NoAccess` investigation runs on April 1, 2026 failed on `macos-latest`, for example [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152) on branch `macos-noaccess-investigation`. That mode has since been removed from the public API and is intentionally no longer part of the matrix.
 - CI now also runs a dedicated hosted-runner probe (`cargo run --quiet --bin ci_matrix_probe`) and writes its findings into the GitHub Actions step summary.
-- On `windows-latest`, that probe now records the remaining Windows filesystem support matrix for the public `read_only` / `read_write` overlay model plus per-policy wall-clock timing samples so we can tell whether the backend is merely functional or too slow to be practical on hosted runners.
+- On `windows-latest`, that probe now records the remaining Windows filesystem support matrix for the public `deny` / `read_only` / `read_write` path model plus per-policy wall-clock timing samples so we can tell whether the backend is merely functional or too slow to be practical on hosted runners.
 
-### Windows hosted-runner result (`windows-latest`)
+### Historical Windows hosted-runner result (`windows-latest`, April 2, 2026)
 
-Run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166) gives the
-first clean three-platform observation for the current public API on GitHub-hosted Windows:
+Run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166) captured a
+useful hosted-runner snapshot before `network_access=true` was made runnable on this branch. It is
+still relevant for `windows-latest` WFP availability, but it should not be read as the current
+Windows contract:
 
 | Probe dimension | Observed result | Interpretation |
 |---|---|---|
 | Host process elevation | `windows.host_process_elevated=true` | The runner process was already elevated |
-| `network_access=true` | `invalid_request` | Current Windows backend contract only supports `network_access=false` |
+| `network_access=true` at that commit | `invalid_request` | Historical frontloaded reject in the branch state from April 2, 2026; no longer the current branch behavior |
 | Any probed `network_access=false` policy shape | `windows_error(FwpmEngineOpen0 failed: 50 ...)` | WFP dynamic-session setup is unsupported on this host, so execution fails before process launch |
 | Enforcement follow-up probes | `wfp_unavailable` | No downgrade occurred; the backend failed closed instead of running with weaker network isolation |
 | Per-shape timing samples | `windows.timing.skipped_reason=wfp_unavailable` | There is no "very slow but usable" result here; the runner is effectively unusable for Windows backend execution |
 
-Practical conclusion for GitHub-hosted Windows:
+Practical conclusion for that historical hosted-runner snapshot:
 
-- The current `windows-latest` runner is not a usable environment for this backend.
-- The limiting factor is host WFP availability, not the path-permission matrix implementation in this crate.
-- Because the process is already elevated on that runner, the non-elevated auto-elevation firewall fallback path is never taken.
-- The full `windows-latest` CI job took about 58 seconds, but the hosted-runner diagnostics step took about 1 second; there is no evidence of long per-policy execution time because requests abort during WFP setup.
+- Treat this as a historical `windows-latest` observation, not as the current Windows backend contract.
+- The limiting factor on that hosted runner was host WFP availability, not the path-permission matrix implementation in this crate.
+- Because the process was already elevated on that runner, the non-elevated auto-elevation firewall fallback path was never taken there.
+- The full `windows-latest` CI job took about 58 seconds, but the hosted-runner diagnostics step took about 1 second; there was no evidence of long per-policy execution time because requests aborted during WFP setup.
+- A fresh GitHub-hosted rerun is still needed before claiming an updated `windows-latest` result for the current branch state.
 
 ---
 
@@ -384,9 +437,9 @@ Practical conclusion for GitHub-hosted Windows:
 
 Current automated coverage emphasis:
 
-- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite + read_only` cases and Linux existing-overlay-target fail-closed coverage.
-- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes.
-- `tests/network_access_control.rs`: loopback and external TCP deny checks when `network_access == false`.
+- `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite + read_only`, Linux/macOS `deny` rows, and Linux existing-overlay-target fail-closed coverage.
+- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including explicit `deny` path enforcement.
+- `tests/network_access_control.rs`: Windows real-machine probes for `network_access == true` private-network TCP allow, the current loopback limitation against a generic host listener, and `network_access == false` loopback/private-network deny behavior.
 - `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite` and `ReadOnly` profiles.
 
 ---

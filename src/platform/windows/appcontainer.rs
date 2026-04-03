@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Component;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
 
 use super::{acl, elevated_ops, elevation, process, token, util, wfp};
+
+static ELEVATED_OPS_EXECUTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) fn execute(
     request: &SandboxCommandRequest,
@@ -31,10 +35,12 @@ pub(super) fn execute(
         &executable,
     )?)?;
     let acl_plan = collect_acl_plan(policy, default_access_scope_paths);
+    let deny_access_paths = sanitize_policy_paths(acl_plan.deny_access_paths)?;
     let allow_readonly_paths = sanitize_policy_paths(acl_plan.allow_readonly_paths)?;
     let allow_readwrite_paths = sanitize_policy_paths(acl_plan.allow_readwrite_paths)?;
     let deny_write_paths = sanitize_policy_paths(acl_plan.deny_write_paths)?;
     let acl_plan = resolve_acl_conflicts(AclPlan {
+        deny_access_paths,
         allow_readonly_paths,
         allow_readwrite_paths,
         deny_write_paths,
@@ -42,10 +48,18 @@ pub(super) fn execute(
 
     let appcontainer = token::create_appcontainer_context_with_network(policy.network_access)?;
     let sid = appcontainer.sid();
+    if policy.network_access {
+        appcontainer.register_network_binary(&executable)?;
+    }
 
     let optional_bootstrap_paths =
         sanitize_optional_existing_paths(runtime_bootstrap_readonly_paths(request, &executable))?;
-    let use_elevated_ops = !elevation::current_process_is_elevated()?;
+    let use_elevated_ops = !elevation::current_process_is_elevated()? || policy.network_access;
+    let _elevated_ops_lock = if use_elevated_ops {
+        Some(lock_elevated_ops_execution())
+    } else {
+        None
+    };
 
     let mut elevated_ops_guard = None;
     let mut network_guard = None;
@@ -62,8 +76,14 @@ pub(super) fn execute(
         elevated_ops_guard = Some(elevated_ops::ElevatedOpsGuard::spawn(
             &elevated_ops::ElevatedOpsSpec {
                 sid_string: util::sid_to_string(sid)?,
+                appcontainer_name: appcontainer.profile_name().to_string(),
                 executable: executable.clone(),
-                block_network: !policy.network_access,
+                network_rule_mode: if policy.network_access {
+                    elevated_ops::NetworkRuleMode::Allow
+                } else {
+                    elevated_ops::NetworkRuleMode::Block
+                },
+                deny_access_paths: elevated_plan.deny_access_paths,
                 allow_readonly_paths: elevated_plan.allow_readonly_paths,
                 allow_readwrite_paths: elevated_plan.allow_readwrite_paths,
                 deny_write_paths: elevated_plan.deny_write_paths,
@@ -82,6 +102,7 @@ pub(super) fn execute(
         acl_rollback = Some(unsafe {
             acl::apply_access_plan(
                 &acl::AclAccessPlan {
+                    deny_access_paths: acl_plan.deny_access_paths,
                     allow_readonly_paths: acl_plan.allow_readonly_paths,
                     allow_readwrite_paths: acl_plan.allow_readwrite_paths,
                     deny_write_paths: acl_plan.deny_write_paths,
@@ -118,36 +139,50 @@ pub(super) fn execute(
 }
 
 fn validate_policy_shape(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-    if policy.network_access {
-        return Err(SandboxError::InvalidRequest(
-            "windows backend cannot safely enforce network_access=true with current AppContainer profile configuration; use network_access=false".to_string(),
-        ));
-    }
-
+    let _ = policy;
     Ok(())
+}
+
+fn lock_elevated_ops_execution() -> std::sync::MutexGuard<'static, ()> {
+    ELEVATED_OPS_EXECUTION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[derive(Clone)]
 struct AclPlan {
+    deny_access_paths: Vec<PathBuf>,
     allow_readonly_paths: Vec<PathBuf>,
     allow_readwrite_paths: Vec<PathBuf>,
     deny_write_paths: Vec<PathBuf>,
 }
 
 fn collect_acl_plan(policy: &SandboxPolicy, default_access_scope_paths: Vec<PathBuf>) -> AclPlan {
-    let allow_readonly_paths = policy.read_only_paths();
-    let allow_readwrite_paths = policy.read_write_paths();
+    let deny_access_paths = policy.denied_paths();
+    let allow_readonly_paths =
+        filter_paths_not_under_roots(policy.read_only_paths(), &deny_access_paths);
+    let mut restricted_roots = allow_readonly_paths.clone();
+    restricted_roots.extend(deny_access_paths.clone());
+    let allow_readwrite_paths =
+        filter_paths_not_under_roots(policy.read_write_paths(), &deny_access_paths);
 
     match policy.default_access {
         crate::SandboxDefaultAccess::ReadOnly => AclPlan {
-            allow_readonly_paths: default_access_scope_paths,
+            deny_access_paths,
+            allow_readonly_paths: filter_paths_not_under_roots(
+                default_access_scope_paths,
+                &restricted_roots,
+            ),
             allow_readwrite_paths,
             deny_write_paths: Vec::new(),
         },
         crate::SandboxDefaultAccess::ReadWrite => {
-            let mut default_readwrite_paths = default_access_scope_paths;
+            let mut default_readwrite_paths =
+                filter_paths_not_under_roots(default_access_scope_paths, &restricted_roots);
             default_readwrite_paths.extend(allow_readwrite_paths);
             AclPlan {
+                deny_access_paths,
                 deny_write_paths: allow_readonly_paths.clone(),
                 allow_readonly_paths,
                 allow_readwrite_paths: default_readwrite_paths,
@@ -333,4 +368,96 @@ fn build_casefolded_path_set(paths: &[PathBuf]) -> HashSet<String> {
 
 fn casefolded_path(path: &std::path::Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
+}
+
+fn filter_paths_not_under_roots(paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| !roots.iter().any(|root| is_same_or_descendant(path, root)))
+        .collect()
+}
+
+fn is_same_or_descendant(path: &std::path::Path, ancestor: &std::path::Path) -> bool {
+    let path_components = path.components().collect::<Vec<_>>();
+    let ancestor_components = ancestor.components().collect::<Vec<_>>();
+    if ancestor_components.len() > path_components.len() {
+        return false;
+    }
+
+    ancestor_components
+        .iter()
+        .zip(path_components.iter())
+        .all(|(left, right)| component_eq_case_insensitive(left, right))
+}
+
+fn component_eq_case_insensitive(left: &Component<'_>, right: &Component<'_>) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_acl_plan, filter_paths_not_under_roots};
+    use crate::{SandboxDefaultAccess, SandboxPathPermission, SandboxPolicy};
+    use std::path::PathBuf;
+
+    #[test]
+    fn readwrite_default_readonly_roots_are_excluded_from_readwrite_scope() {
+        let readonly_root = PathBuf::from(r"C:\Temp\Readonly");
+        let readonly_child = readonly_root.join("child.txt");
+        let outside = PathBuf::from(r"C:\Temp\Outside");
+
+        let plan = collect_acl_plan(
+            &SandboxPolicy {
+                path_permissions: vec![SandboxPathPermission::read_only(readonly_root.clone())],
+                default_access: SandboxDefaultAccess::ReadWrite,
+                network_access: false,
+            },
+            vec![outside.clone(), readonly_root.clone(), readonly_child],
+        );
+
+        assert!(plan.deny_access_paths.is_empty());
+        assert_eq!(plan.allow_readonly_paths, vec![readonly_root.clone()]);
+        assert_eq!(plan.deny_write_paths, vec![readonly_root]);
+        assert_eq!(plan.allow_readwrite_paths, vec![outside]);
+    }
+
+    #[test]
+    fn deny_roots_are_excluded_from_all_allow_scopes() {
+        let denied_root = PathBuf::from(r"C:\Temp\Denied");
+        let denied_child = denied_root.join("child.txt");
+        let writable_root = PathBuf::from(r"C:\Temp\Writable");
+        let outside = PathBuf::from(r"C:\Temp\Outside");
+
+        let plan = collect_acl_plan(
+            &SandboxPolicy {
+                path_permissions: vec![
+                    SandboxPathPermission::deny(denied_root.clone()),
+                    SandboxPathPermission::read_write(writable_root.clone()),
+                ],
+                default_access: SandboxDefaultAccess::ReadOnly,
+                network_access: false,
+            },
+            vec![outside.clone(), denied_root.clone(), denied_child],
+        );
+
+        assert_eq!(plan.deny_access_paths, vec![denied_root]);
+        assert_eq!(plan.allow_readonly_paths, vec![outside]);
+        assert_eq!(plan.allow_readwrite_paths, vec![writable_root]);
+        assert!(plan.deny_write_paths.is_empty());
+    }
+
+    #[test]
+    fn readonly_root_filter_is_case_insensitive_and_descendant_aware() {
+        let filtered = filter_paths_not_under_roots(
+            vec![
+                PathBuf::from(r"c:\temp\readonly\child.txt"),
+                PathBuf::from(r"C:\Temp\Other\child.txt"),
+            ],
+            &[PathBuf::from(r"C:\Temp\Readonly")],
+        );
+
+        assert_eq!(filtered, vec![PathBuf::from(r"C:\Temp\Other\child.txt")]);
+    }
 }

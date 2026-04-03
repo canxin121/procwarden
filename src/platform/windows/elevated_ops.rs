@@ -15,18 +15,21 @@ use super::elevation::{self, ElevatedProcess};
 const ELEVATED_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const ELEVATED_HELPER_STOP_TIMEOUT_MS: u32 = 5_000;
 const ELEVATED_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FIREWALL_RULE_PREFIX: &str = "procwarden-elevated-all";
 
 const ELEVATED_OPS_HELPER_SCRIPT: &str = r#"
 param(
     [Parameter(Mandatory=$true)][string]$Sid,
+    [Parameter(Mandatory=$true)][string]$AppContainerName,
     [Parameter(Mandatory=$true)][string]$SpecFile,
     [Parameter(Mandatory=$true)][string]$StopFile,
     [Parameter(Mandatory=$true)][string]$ReadyFile,
     [Parameter(Mandatory=$true)][string]$ProgressFile,
+    [Parameter(Mandatory=$true)][int]$ParentPid,
     [Parameter(Mandatory=$true)][string]$Executable,
     [Parameter(Mandatory=$true)][string]$OutRule,
     [Parameter(Mandatory=$true)][string]$InRule,
-    [Parameter(Mandatory=$true)][int]$BlockNetwork
+    [Parameter(Mandatory=$true)][int]$NetworkRuleMode
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,8 +48,51 @@ function Invoke-Netsh([string[]]$Arguments) {
     }
 }
 
+function Apply-FirewallRule([string]$Direction, [string]$Action) {
+    Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$(if ($Direction -eq 'out') { $OutRule } else { $InRule })", "dir=$Direction", "action=$Action", "program=$Executable", "enable=yes", "profile=any")
+}
+
+function Set-LoopbackExemption([string]$Operation, [string]$AppContainer) {
+    & CheckNetIsolation.exe LoopbackExempt $Operation "-n=$AppContainer" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "CheckNetIsolation LoopbackExempt $Operation failed with exit code ${LASTEXITCODE}"
+    }
+}
+
+function Test-ParentProcessAlive([int]$ProcessId) {
+    try {
+        $null = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Remove-Stale-ProcwardenFirewallRules {
+    try {
+        foreach ($line in (& netsh advfirewall firewall show rule name=all 2>$null)) {
+            if ($line -notlike 'Rule Name:*procwarden-elevated-all-*') {
+                continue
+            }
+
+            $ruleName = $line.Substring($line.IndexOf(':') + 1).Trim()
+            if ($ruleName -notmatch '^procwarden-elevated-all-(\d+)-\d+-(in|out)$') {
+                continue
+            }
+
+            & netsh advfirewall firewall delete rule name="$ruleName" | Out-Null
+            Log-Progress ("removed_stale_firewall_rule|" + $ruleName)
+        }
+    }
+    catch {
+        Log-Progress ("skip_stale_firewall_cleanup|" + $_.Exception.Message)
+    }
+}
+
 function Rule-Permission([string]$Kind, [bool]$IsDirectory) {
     switch ($Kind) {
+        "dn" { return $(if ($IsDirectory) { "(OI)(CI)(F)" } else { "(F)" }) }
         "ro" { return $(if ($IsDirectory) { "(OI)(CI)(RX)" } else { "(RX)" }) }
         "rw" { return $(if ($IsDirectory) { "(OI)(CI)(M)" } else { "(M)" }) }
         "dw" { return $(if ($IsDirectory) { "(OI)(CI)(W)" } else { "(W)" }) }
@@ -56,6 +102,7 @@ function Rule-Permission([string]$Kind, [bool]$IsDirectory) {
 
 function Rule-AccessMode([string]$Kind) {
     switch ($Kind) {
+        "dn" { return "/deny" }
         "ro" { return "/grant" }
         "rw" { return "/grant" }
         "dw" { return "/deny" }
@@ -94,10 +141,13 @@ if (Test-Path -LiteralPath $SpecFile) {
 
 $appliedPaths = New-Object System.Collections.Generic.List[string]
 $firewallEnabled = $false
+$loopbackEnabled = $false
 
 try {
     Set-Content -LiteralPath $ProgressFile -Value "" -NoNewline -Encoding utf8
     Log-Progress ("sid=" + $Sid)
+    Log-Progress ("appcontainer_name=" + $AppContainerName)
+    Log-Progress ("parent_pid=" + $ParentPid)
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Log-Progress ("is_admin=" + $isAdmin)
     Log-Progress ("entries=" + $entries.Count)
@@ -132,18 +182,31 @@ try {
         }
     }
 
-    if ($BlockNetwork -ne 0) {
+    if ($NetworkRuleMode -ne 0) {
+        $firewallAction = if ($NetworkRuleMode -eq 1) { "block" } elseif ($NetworkRuleMode -eq 2) { "allow" } else { throw "unknown network rule mode: $NetworkRuleMode" }
+        Remove-Stale-ProcwardenFirewallRules
         Log-Progress "begin|network"
-        Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$OutRule", "dir=out", "action=block", "program=$Executable", "enable=yes", "profile=any")
-        Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$InRule", "dir=in", "action=block", "program=$Executable", "enable=yes", "profile=any")
+        Apply-FirewallRule -Direction "out" -Action $firewallAction
+        Apply-FirewallRule -Direction "in" -Action $firewallAction
         $firewallEnabled = $true
         Log-Progress "end|network"
+    }
+
+    if ($NetworkRuleMode -eq 2) {
+        Log-Progress "begin|loopback"
+        Set-LoopbackExemption -Operation "-a" -AppContainer $AppContainerName
+        $loopbackEnabled = $true
+        Log-Progress "end|loopback"
     }
 
     Set-Content -LiteralPath $ReadyFile -Value "ok" -NoNewline -Encoding ascii
     Log-Progress "ready"
 
     while (-not (Test-Path -LiteralPath $StopFile)) {
+        if (-not (Test-ParentProcessAlive -ProcessId $ParentPid)) {
+            Log-Progress "parent_exited"
+            break
+        }
         Start-Sleep -Milliseconds 200
     }
 }
@@ -159,8 +222,11 @@ finally {
     }
 
     if ($firewallEnabled) {
-        & netsh advfirewall firewall delete rule name="$OutRule" program="$Executable" | Out-Null
-        & netsh advfirewall firewall delete rule name="$InRule" program="$Executable" | Out-Null
+        & netsh advfirewall firewall delete rule name="$OutRule" | Out-Null
+        & netsh advfirewall firewall delete rule name="$InRule" | Out-Null
+    }
+    if ($loopbackEnabled) {
+        & CheckNetIsolation.exe LoopbackExempt -d "-n=$AppContainerName" | Out-Null
     }
     Log-Progress "cleanup_end"
 }
@@ -169,11 +235,31 @@ finally {
 #[derive(Debug, Clone)]
 pub(super) struct ElevatedOpsSpec {
     pub(super) sid_string: String,
+    pub(super) appcontainer_name: String,
     pub(super) executable: PathBuf,
-    pub(super) block_network: bool,
+    pub(super) network_rule_mode: NetworkRuleMode,
+    pub(super) deny_access_paths: Vec<PathBuf>,
     pub(super) allow_readonly_paths: Vec<PathBuf>,
     pub(super) allow_readwrite_paths: Vec<PathBuf>,
     pub(super) deny_write_paths: Vec<PathBuf>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NetworkRuleMode {
+    None,
+    Block,
+    Allow,
+}
+
+impl NetworkRuleMode {
+    fn as_int(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Block => 1,
+            Self::Allow => 2,
+        }
+    }
 }
 
 pub(super) struct ElevatedOpsGuard {
@@ -193,7 +279,7 @@ impl ElevatedOpsGuard {
         let ready_file = workspace_dir.join("ready.signal");
         let progress_file = workspace_dir.join("progress.log");
         let rule_prefix = format!(
-            "procwarden-elevated-all-{}-{}",
+            "{FIREWALL_RULE_PREFIX}-{}-{}",
             std::process::id(),
             random::<u32>()
         );
@@ -219,11 +305,13 @@ impl ElevatedOpsGuard {
             &stop_file,
             &ready_file,
             &progress_file,
+            std::process::id(),
+            &spec.appcontainer_name,
             &spec.executable,
             &out_rule_name,
             &in_rule_name,
             &spec.sid_string,
-            spec.block_network,
+            spec.network_rule_mode,
         );
 
         let process = match ElevatedProcess::shell_execute_runas(&powershell_exe, &parameters) {
@@ -311,30 +399,37 @@ fn elevated_powershell_parameters(
     stop_file: &Path,
     ready_file: &Path,
     progress_file: &Path,
+    parent_pid: u32,
+    appcontainer_name: &str,
     executable: &Path,
     out_rule_name: &str,
     in_rule_name: &str,
     sid_string: &str,
-    block_network: bool,
+    network_rule_mode: NetworkRuleMode,
 ) -> String {
     format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -SpecFile {} -StopFile {} -ReadyFile {} -ProgressFile {} -Executable {} -OutRule {} -InRule {} -BlockNetwork {}",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -AppContainerName {} -SpecFile {} -StopFile {} -ReadyFile {} -ProgressFile {} -ParentPid {} -Executable {} -OutRule {} -InRule {} -NetworkRuleMode {}",
         elevation::quote_windows_arg(&script_path.to_string_lossy()),
         elevation::quote_windows_arg(sid_string),
+        elevation::quote_windows_arg(appcontainer_name),
         elevation::quote_windows_arg(&spec_path.to_string_lossy()),
         elevation::quote_windows_arg(&stop_file.to_string_lossy()),
         elevation::quote_windows_arg(&ready_file.to_string_lossy()),
         elevation::quote_windows_arg(&progress_file.to_string_lossy()),
+        parent_pid,
         elevation::quote_windows_arg(&executable.to_string_lossy()),
         elevation::quote_windows_arg(out_rule_name),
         elevation::quote_windows_arg(in_rule_name),
-        if block_network { "1" } else { "0" },
+        network_rule_mode.as_int(),
     )
 }
 
 fn serialize_acl_spec(spec: &ElevatedOpsSpec) -> String {
     let mut lines = Vec::new();
 
+    for path in &spec.deny_access_paths {
+        lines.push(format!("dn\t{}", path.to_string_lossy()));
+    }
     for path in &spec.deny_write_paths {
         lines.push(format!("dw\t{}", path.to_string_lossy()));
     }

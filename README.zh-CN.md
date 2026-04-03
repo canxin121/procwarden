@@ -19,6 +19,7 @@
 - `path_permissions: Vec<SandboxPathPermission>`
   - 每一项都包含 `path` 和路径级访问模式
   - 构造函数：
+    - `SandboxPathPermission::deny(path)`
     - `SandboxPathPermission::read_only(path)`
     - `SandboxPathPermission::read_write(path)`
 - `default_access: SandboxDefaultAccess`
@@ -39,7 +40,7 @@
 在进入平台后端前，manager 会先做：
 
 1. 请求校验（`command` 非空、可执行 token 非空、`cwd` 必须存在且为目录）。
-2. 策略 allow 路径校验（`read_only` / `read_write` 路径必须非空且当前存在，否则返回 `SandboxError::InvalidRequest`）。
+2. 策略路径校验（`deny` / `read_only` / `read_write` 路径必须非空且当前存在，否则返回 `SandboxError::InvalidRequest`）。
 3. 环境变量净化（移除高风险加载/注入变量，如 `LD_PRELOAD`、`LD_*`、`DYLD_*`、`BASH_ENV`、`ENV`、`BASH_FUNC_*`）。
 
 ---
@@ -58,6 +59,7 @@ let manager = SandboxManager::new();
 
 let policy = SandboxPolicy {
     path_permissions: vec![
+        SandboxPathPermission::deny(PathBuf::from("/workspace/secrets")),
         SandboxPathPermission::read_only(PathBuf::from("/opt/shared")),
         SandboxPathPermission::read_write(PathBuf::from("/tmp/job-123")),
     ],
@@ -241,7 +243,8 @@ crate 会把 `SandboxPolicy` 编译为内联 SBPL profile，然后执行：
 - 该 deny 覆盖本地与外部网络访问（例如 loopback 与远端地址）。
 - 再映射默认权限：
   - `ReadWrite`：对显式 `read_only` 路径生成 `file-write*` deny。
-  - `ReadOnly`：先发出全局 `(deny file-write*)`，再加入显式 `read_write` carve-out allow。
+  - 显式 `deny` 路径会同时生成 `file-read*` 与 `file-write*` deny。
+  - `ReadOnly`：先发出全局 `(deny file-write*)`，再加入显式 `read_write` carve-out allow，最后再叠加显式 `deny` 路径。
 
 每条路径规则会同时输出 `(literal "...")` 与 `(subpath "...")` 条件。
 
@@ -252,12 +255,12 @@ fail-closed，返回 `SandboxError::InvalidRequest`。
 
 ---
 
-## Linux/macOS 实际可用矩阵
+## Linux/Windows/macOS 实际可用文件系统矩阵
 
-下面两张表把两个策略维度拆开写：
+下面这些表把两个文件系统策略维度拆开写：
 
 - `default_access`：未命中 `path_permissions` 时的默认策略
-- `path_permissions`：显式路径覆盖规则（`read_only`、`read_write`）
+- `path_permissions`：显式路径覆盖规则（`deny`、`read_only`、`read_write`）
 
 其中“Accepted”表示后端接受该请求形状；“可用”表示当前可以作为稳定文档 contract
 依赖；“依赖宿主能力”表示策略形状本身受支持，但 Linux 宿主还必须具备所需的
@@ -268,6 +271,8 @@ mount-namespace 能力。
 - 现在的文件系统矩阵里已经没有“有条件可用”行，因为公开 API 已经移除了全局 `NoAccess` / allowlist 模式。
 - 所有 `path_permissions` 都会先经过 manager 前置校验：路径不能为空、必须已经存在，并且会在平台分发前 canonicalize。
 - manager 还会在平台分发前做冗余规则归一化：与默认权限等价的条目会被删除；同一路径上的冲突会折叠成真正生效的显式状态；已经被同 access 祖先覆盖的子路径条目也会被移除。
+- `deny` 只作为“路径级显式状态”存在；当前 API 仍然没有全局 `NoAccess` 默认模式。
+- 不允许在显式 `deny` 祖先路径下面再用子路径重新放开权限；这种形状会 fail-closed，返回 `SandboxError::InvalidRequest`。
 - 对 Linux 中标记为“依赖宿主能力”的行：
   - “可用”意味着 manager 侧路径校验已通过，并且宿主还能创建所需的 user/mount namespace。
   - 如果 namespace 能力缺失，执行会 fail-closed，返回 `SandboxError::Unavailable`。
@@ -280,16 +285,56 @@ mount-namespace 能力。
 | `ReadWrite` | 无 | Accepted | 可用 | 全局可读写模式 |
 | `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不增加权限；manager 会在分发到后端前把它归一化掉 |
 | `ReadWrite` | 仅 `read_only` | Accepted | 依赖宿主能力 | 通过 mount-namespace overlay 实现；overlay 目标路径必须已存在 |
+| `ReadWrite` | 仅 `deny` | Accepted | 依赖宿主能力 | 通过 mount-namespace 替换 overlay 加不可读占位对象实现 |
 | `ReadWrite` | `read_only + read_write` | Accepted | 依赖宿主能力 | `read_write` 冗余，会被归一化掉；`read_only` 仍需要 mount-namespace overlay |
+| `ReadWrite` | `read_only + deny` | Accepted | 依赖宿主能力 | `deny` 比 `read_only` 更强；两者在 Linux 上都依赖 overlay |
 | `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
 | `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | 默认已允许读、拒绝写；manager 会把这些条目归一化掉 |
 | `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 显式写 carve-out |
+| `ReadOnly` | 仅 `deny` | Accepted | 依赖宿主能力 | 通过 mount-namespace 替换 overlay 加不可读占位对象实现 |
 | `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，会被归一化掉；`read_write` 提供写 carve-out |
+| `ReadOnly` | `read_write + deny` | Accepted | 依赖宿主能力 | `deny` 可以进一步收紧写 carve-out；Linux 仍依赖 overlay |
 
 Linux 额外前提：
 
-- 任何需要 read-only bind overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
+- 任何需要 read-only 或 deny overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
 - 依赖 overlay 的减法规则目前只适用于“已经存在的路径对象”。这不仅是当前后端契约，也来自所用内核原语的边界：bind mount 需要已有 mount point，而如果只在私有 mount namespace 里临时创建这个目标，那个文件或目录仍然会真实出现在共享的宿主文件系统上。
+
+### Windows
+
+| `default_access` | `path_permissions` 形状 | 后端结果 | 实际状态 | 说明 |
+|---|---|---|---|---|
+| `ReadWrite` | 无 | Accepted | 可用 | 当前 AppContainer 模型下的全局可读写文件系统模式 |
+| `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不增加权限；manager 会在分发到后端前把它归一化掉 |
+| `ReadWrite` | 仅 `read_only` | Accepted | 可用 | 通过对命中路径施加减法式写拒绝来实现 |
+| `ReadWrite` | 仅 `deny` | Accepted | 可用 | 通过对命中路径施加 deny-read/write/execute ACL 来实现 |
+| `ReadWrite` | `read_only + read_write` | Accepted | 可用 | `read_write` 冗余，会被归一化掉；`read_only` 仍会在对应路径下减掉写权限 |
+| `ReadWrite` | `read_only + deny` | Accepted | 可用 | `deny` 比 `read_only` 更强；Windows 会把两者都下发成路径 ACL 调整 |
+| `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
+| `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | 默认已允许读、拒绝写；manager 会把这些条目归一化掉 |
+| `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 显式写 carve-out |
+| `ReadOnly` | 仅 `deny` | Accepted | 可用 | 在默认可读范围里显式扣掉“不可读/不可写”的路径 |
+| `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，会被归一化掉；`read_write` 提供写 carve-out |
+| `ReadOnly` | `read_write + deny` | Accepted | 可用 | `deny` 可以进一步收紧写 carve-out |
+
+Windows 额外说明：
+
+- 在当前这台真实 Windows 机器上，上面文档化的 Windows 文件系统行现在都能跑通，而且 `ReadOnly + read_write`、`ReadWrite + read_only`、`ReadOnly + deny` 与 `ReadWrite + deny` 的 enforcement 跟进探针也都通过。
+- manager 侧仍然要求路径必须已存在，并会在平台分发前 canonicalize；之后 Windows 还会以大小写不敏感的方式再次清洗 ACL 输入，再应用访问调整。
+- 网络行为和上面的文件系统矩阵是独立维度。当前真机网络结论单独列在下面，不和路径矩阵混在一起。
+
+### Windows `network_access` 真机矩阵
+
+下面这些行描述的是 `windows-matrix-investigation` 分支在当前真机上的观察结果。它们比
+一般 API contract 更窄，因为 Windows 的 loopback 行为目前仍然依赖具体 probe 形状。
+
+| `network_access` | probe 形状 | 实际结果 | 实际状态 | 说明 |
+|---|---|---|---|---|
+| `true` | 对默认网关上第一个可达 TCP 端口（`53` / `80` / `443`）做私网 outbound 探测 | `connect_ok` | 当前机器上可用 | `tests/network_access_control.rs` 与 `ci_matrix_probe` 都已验证 |
+| `true` | 连到“同一可执行文件内部持有的 listener”（`ci_matrix_probe --windows-net-probe`）的 loopback 探测 | `connect_ok` | 当前机器上可用 | 对应 `windows.network.loopback.same_binary_listener.enabled` |
+| `true` | 通过 `windows_net_diag` 连接一个通用 host-side listener 的 loopback 探测 | `connect_failed` | 当前后端仍受限 | `tests/network_access_control.rs` 仍把它作为已知剩余限制记录 |
+| `false` | 对同一个默认网关目标做私网 outbound 探测 | `connect_failed(... internet_client ...)` | 阻断行为可用 | 这里是 fail-closed，不会静默降级 |
+| `false` | 对同一可执行文件 listener 的 loopback 探测 | `connect_failed(... timed out ...)` | 阻断行为可用 | 关闭网络时 loopback 仍然被阻断 |
 
 ### macOS
 
@@ -298,11 +343,15 @@ Linux 额外前提：
 | `ReadWrite` | 无 | Accepted | 可用 | 全局可读写模式 |
 | `ReadWrite` | 仅 `read_write` | Accepted | 可用但冗余 | 默认已全局可写，额外 `read_write` 不改变行为；manager 会在生成 SBPL 前把它归一化掉 |
 | `ReadWrite` | 仅 `read_only` | Accepted | 可用 | 会在这些路径下拒绝写入 |
+| `ReadWrite` | 仅 `deny` | Accepted | 可用 | 会对这些路径发出 `file-read*` 与 `file-write*` deny |
 | `ReadWrite` | `read_only + read_write` | Accepted | 可用 | `read_write` 冗余，会被归一化掉；`read_only` 仍会在对应路径下拒绝写入 |
+| `ReadWrite` | `read_only + deny` | Accepted | 可用 | `deny` 比 `read_only` 更强；两者都会以减法式 SBPL 规则发出 |
 | `ReadOnly` | 无 | Accepted | 可用 | 全局只读模式 |
 | `ReadOnly` | 仅 `read_only` | Accepted | 可用但冗余 | `read_only` 相对全局只读默认策略不增加限制；manager 会把它归一化掉 |
 | `ReadOnly` | 仅 `read_write` | Accepted | 可用 | 写 carve-out 会针对 canonicalize 后的路径发出 |
+| `ReadOnly` | 仅 `deny` | Accepted | 可用 | 在默认可读范围上再叠加每路径读/写 deny |
 | `ReadOnly` | `read_only + read_write` | Accepted | 可用 | `read_only` 冗余，会被归一化掉；`read_write` 提供写 carve-out |
+| `ReadOnly` | `read_write + deny` | Accepted | 可用 | `deny` 可以进一步收紧写 carve-out |
 
 macOS 额外前提：
 
@@ -333,27 +382,30 @@ macOS 额外前提：
 - `macos-latest` 当前能跑通保留下来的 macOS 公共矩阵，也就是 `ReadOnly` / `ReadWrite` 默认策略加路径覆盖的这些行。
 - 2026 年 4 月 1 日针对 `NoAccess` 的历史调查 run 在 `macos-latest` 上失败过，例如 [`23848403152`](https://github.com/canxin121/procwarden/actions/runs/23848403152)（分支 `macos-noaccess-investigation`）。这也是为什么该模式已经从公开 API 中移除，并且不再出现在当前矩阵里。
 - 现在 CI 还会额外跑一个 hosted-runner probe（`cargo run --quiet --bin ci_matrix_probe`），并把结果写入 GitHub Actions step summary。
-- 在 `windows-latest` 上，这个 probe 现在会记录当前公开 `read_only` / `read_write` 覆盖模型下的 Windows 文件系统支持矩阵，以及按策略形状分组的 wall-clock timing 样本。这样后续 run 不只知道“能不能跑”，还能判断 hosted runner 上的性能是否已经慢到不适合实际使用。
+- 在 `windows-latest` 上，这个 probe 现在会记录当前公开 `deny` / `read_only` / `read_write` 路径模型下的 Windows 文件系统支持矩阵，以及按策略形状分组的 wall-clock timing 样本。这样后续 run 不只知道“能不能跑”，还能判断 hosted runner 上的性能是否已经慢到不适合实际使用。
 
-### Windows hosted runner 结果（`windows-latest`）
+### 历史 Windows hosted runner 结果（`windows-latest`，2026-04-02）
 
 run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/23893105166)
-给出了当前公开 API 在 GitHub Hosted Windows 上第一轮干净的三平台观测：
+记录了一个有参考价值的 hosted-runner 历史快照，但它发生在这个分支把
+`network_access=true` 修到可运行之前。它对 `windows-latest` 的 WFP 可用性仍有参考价值，
+但不能再直接当成当前 Windows contract：
 
 | 探针维度 | 实际结果 | 解释 |
 |---|---|---|
 | 宿主进程是否已提权 | `windows.host_process_elevated=true` | runner 进程本身已经是管理员 |
-| `network_access=true` | `invalid_request` | 当前 Windows 后端 contract 只支持 `network_access=false` |
+| 当时的 `network_access=true` | `invalid_request` | 这是 2026-04-02 那个分支状态下的历史前置拒绝，不再代表当前分支行为 |
 | 任意探测到的 `network_access=false` 策略形状 | `windows_error(FwpmEngineOpen0 failed: 50 ...)` | 宿主不支持 WFP 动态会话初始化，进程在真正启动前就失败 |
 | enforcement 跟进探测 | `wfp_unavailable` | 没有发生降级；后端是 fail-closed，而不是带着更弱网络隔离继续跑 |
 | 分策略 timing 样本 | `windows.timing.skipped_reason=wfp_unavailable` | 这里不存在“很慢但能用”的结论；这个 runner 对 Windows 后端来说实际上不可用 |
 
-对 GitHub Hosted Windows 的实际结论：
+对这个历史 hosted-runner 快照，更准确的结论是：
 
-- 当前 `windows-latest` runner 不是这个后端的可用运行环境。
-- 限制因素是宿主的 WFP 可用性，不是本 crate 的路径权限矩阵实现。
-- 由于该 runner 进程本身已经是管理员，因此“先普通进程启动，再自动提权到防火墙 helper”这条回退路径不会被触发。
+- 应把它视为 `windows-latest` 的历史观测，而不是当前 Windows 后端 contract。
+- 当时的限制因素是宿主的 WFP 可用性，不是本 crate 的路径权限矩阵实现。
+- 由于该 runner 进程本身已经是管理员，因此那次运行里“先普通进程启动，再自动提权到防火墙 helper”这条回退路径不会被触发。
 - 整个 `windows-latest` job 大约耗时 58 秒，但 hosted-runner diagnostics 这一步只耗时约 1 秒；没有证据表明策略执行是“很慢”，因为请求在 WFP 设置阶段就已经终止了。
+- 如果要声明当前分支在 `windows-latest` 上的最新结果，仍然需要重新跑一轮新的 hosted-runner probe。
 
 ---
 
@@ -383,9 +435,9 @@ run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/2389310
 
 当前覆盖重点：
 
-- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite + read_only` 组合，以及 Linux 对“overlay target 必须已存在”的 fail-closed 覆盖。
-- `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为。
-- `tests/network_access_control.rs`：覆盖 `network_access == false` 时对 loopback 与外部 TCP 的阻断。
+- `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite + read_only`、Linux/macOS 的 `deny` 形状，以及 Linux 对“overlay target 必须已存在”的 fail-closed 覆盖。
+- `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为，包括显式 `deny` 路径的 enforcement。
+- `tests/network_access_control.rs`：覆盖 Windows 真机下 `network_access == true` 时的私网 TCP 放行、对通用 host listener 的当前 loopback 限制，以及 `network_access == false` 时对 loopback / 私网 TCP 的阻断。
 - `src/platform/macos.rs` 单元测试：覆盖 `ReadWrite` 与 `ReadOnly` 两类 SBPL 生成顺序。
 
 ---

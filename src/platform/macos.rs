@@ -44,6 +44,7 @@ pub(super) fn execute(
 
 fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
     let mut lines = vec!["(version 1)".to_string(), "(allow default)".to_string()];
+    let deny_paths = policy.denied_paths();
     let read_only_paths = policy.read_only_paths();
     let read_write_paths = policy.read_write_paths();
 
@@ -56,11 +57,19 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
             for read_only in read_only_paths {
                 push_path_rule(&mut lines, "deny", "file-write*", &read_only);
             }
+            for denied in deny_paths {
+                push_path_rule(&mut lines, "deny", "file-read*", &denied);
+                push_path_rule(&mut lines, "deny", "file-write*", &denied);
+            }
         }
         SandboxDefaultAccess::ReadOnly => {
             lines.push("(deny file-write*)".to_string());
             for writable in read_write_paths {
                 push_path_rule(&mut lines, "allow", "file-write*", &writable);
+            }
+            for denied in deny_paths {
+                push_path_rule(&mut lines, "deny", "file-read*", &denied);
+                push_path_rule(&mut lines, "deny", "file-write*", &denied);
             }
         }
     }
@@ -167,6 +176,51 @@ mod tests {
         assert!(
             !profile.contains("(allow file-write*"),
             "read-write default should not need write allow carveouts"
+        );
+    }
+
+    #[test]
+    fn deny_paths_emit_read_and_write_denies() {
+        let denied = PathBuf::from("/private/tmp/procwarden/deny");
+        let profile = build_sbpl_profile(&SandboxPolicy {
+            default_access: SandboxDefaultAccess::ReadWrite,
+            network_access: false,
+            path_permissions: vec![SandboxPathPermission::deny(denied.clone())],
+        });
+
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read* (literal \"{}\"))",
+                denied.display()
+            )),
+            "deny paths should emit read deny rules"
+        );
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (literal \"{}\"))",
+                denied.display()
+            )),
+            "deny paths should emit write deny rules"
+        );
+    }
+
+    #[test]
+    fn deny_rules_follow_write_carveouts_in_readonly_profiles() {
+        let writable = PathBuf::from("/private/tmp/procwarden/rw");
+        let denied = writable.join("blocked");
+        let profile = build_sbpl_profile(&SandboxPolicy {
+            default_access: SandboxDefaultAccess::ReadOnly,
+            network_access: false,
+            path_permissions: vec![
+                SandboxPathPermission::read_write(writable.clone()),
+                SandboxPathPermission::deny(denied.clone()),
+            ],
+        });
+
+        assert_line_before(
+            &profile,
+            &format!("(allow file-write* (literal \"{}\"))", writable.display()),
+            &format!("(deny file-write* (literal \"{}\"))", denied.display()),
         );
     }
 
