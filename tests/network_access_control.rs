@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -48,7 +50,6 @@ fn default_gateway_private_probe_target() -> Option<(Ipv4Addr, u16)> {
     None
 }
 
-#[cfg(target_os = "windows")]
 fn windows_net_diag_command(host: &str, port: u16, timeout_ms: u64) -> Vec<String> {
     vec![
         std::env::var("CARGO_BIN_EXE_windows_net_diag")
@@ -59,7 +60,6 @@ fn windows_net_diag_command(host: &str, port: u16, timeout_ms: u64) -> Vec<Strin
     ]
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 fn network_enabled_allows_private_network_tcp_connect() {
     let fixture = Fixture::new("network-enabled-allowed");
@@ -94,7 +94,6 @@ fn network_enabled_allows_private_network_tcp_connect() {
     );
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 fn network_enabled_still_blocks_loopback_tcp_connect() {
     let fixture = Fixture::new("network-enabled-loopback");
@@ -201,7 +200,6 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
     );
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 #[ignore = "diagnostic helper for Windows network debugging"]
 fn debug_network_enabled_diagnose_connect_failure() {
