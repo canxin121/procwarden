@@ -7,6 +7,7 @@ use procwarden::{SandboxDefaultAccess, SandboxError, SandboxManager, SandboxPath
 use common::{Fixture, assert_success, policy, sandbox_request};
 
 #[derive(Clone, Copy)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 enum Expectation {
     Runnable,
     HostCapabilityDependent,
