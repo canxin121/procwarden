@@ -1,31 +1,38 @@
 # procwarden
 - 中文文档（简体中文）：[README.zh-CN.md](./README.zh-CN.md)
 
-`procwarden` is a cross-platform Rust crate for running a command under a simple sandbox policy on Linux, macOS, and Windows.
+`procwarden` runs a command under a small filesystem and network sandbox on Linux, macOS, and Windows.
 
-The public entry point is:
+Public entry point:
 
 - `SandboxManager::execute(&SandboxCommandRequest, &SandboxPolicy)`
 
-## 5-Minute Tutorial
+## Quick Tutorial
 
-Use `procwarden` in four steps:
+Use `procwarden` in five decisions:
 
-1. Pick a default filesystem mode.
-2. Add explicit path overrides.
-3. Decide whether networking is allowed.
-4. Execute the command.
+1. Build the environment explicitly.
+2. Pick the default filesystem mode.
+3. Pick the network mode.
+4. Add only the path overrides you really need.
+5. Execute the command.
 
-Practical rule of thumb:
+Practical defaults:
 
-- Use `SandboxDefaultAccess::ReadOnly` when you want a safe default and only a few writable paths.
-- Use `SandboxDefaultAccess::ReadWrite` when you want normal write access and only need to subtract access from a few paths.
+- `SandboxDefaultAccess::ReadOnly`: safest starting point when only a few paths need to be writable.
+- `SandboxDefaultAccess::ReadWrite`: use when the process mostly behaves like a normal process and you only need to subtract access from a few paths.
 
 Path override meanings:
 
 - `SandboxPathPermission::read_write(path)`: writable carve-out
 - `SandboxPathPermission::read_only(path)`: readable but not writable
-- `SandboxPathPermission::deny(path)`: not readable and not writable
+- `SandboxPathPermission::deny(path)`: neither readable nor writable
+
+Network mode meanings:
+
+- `SandboxNetworkMode::Disabled`: deny IP networking
+- `SandboxNetworkMode::OutboundOnly`: allow outbound IP traffic and deny inbound IP traffic
+- `SandboxNetworkMode::Bidirectional`: do not impose a procwarden network direction limit
 
 Example:
 
@@ -33,8 +40,8 @@ Example:
 use std::collections::HashMap;
 
 use procwarden::{
-    SandboxCommandRequest, SandboxDefaultAccess, SandboxManager, SandboxPathPermission,
-    SandboxPolicy,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxManager, SandboxNetworkMode,
+    SandboxPathPermission, SandboxPolicy,
 };
 
 let manager = SandboxManager::new();
@@ -46,7 +53,7 @@ if let Ok(path) = std::env::var("PATH") {
 
 let policy = SandboxPolicy {
     default_access: SandboxDefaultAccess::ReadOnly,
-    network_access: false,
+    network_mode: SandboxNetworkMode::Disabled,
     path_permissions: vec![
         SandboxPathPermission::read_write("/tmp/procwarden-job"),
         SandboxPathPermission::deny("/workspace/secrets"),
@@ -65,131 +72,54 @@ assert_eq!(output.exit_code, 0);
 # Ok::<(), procwarden::SandboxError>(())
 ```
 
-Practical notes:
+Practical rules:
 
-- `env` is explicit. `procwarden` does not automatically inherit the parent process environment.
-- If your command relies on command lookup, pass at least `PATH`.
-- If your command needs a writable scratch directory, create it first and add it as `read_write`.
-
-## Rules You Need To Know
-
-- `cwd` must already exist and must be a directory.
-- Every `path_permissions` path must already exist.
+- `procwarden` does not automatically inherit the parent process environment.
+- If your command relies on lookup, pass at least `PATH`.
+- If the command needs writable scratch space, create it first and add it as `read_write`.
+- If a rule is equal to the default mode, the manager normalizes the redundant rule away.
+- `cwd` and every `path_permissions` path must already exist.
 - Paths are canonicalized before backend dispatch.
-- Redundant rules are removed automatically before execution.
-- A descendant path cannot reopen access under a `deny` ancestor.
-- `timeout_ms` kills long-running commands and normalizes timeout exit code to `124`.
-- `network_access = false` means "deny IP networking", not just "deny public internet".
+- A descendant path cannot reopen access inside a denied ancestor.
+- `timeout_ms` kills the command and normalizes timeout exit code to `124`.
+- `SandboxNetworkMode::Disabled` means "deny IP networking", not "deny public internet only".
 
-## Filesystem Matrices
+## Support Matrix
 
-These tables describe practical filesystem behavior. They intentionally focus on the public policy model:
+The tables below keep only the policy shapes that actually change behavior.
 
-- `default_access`: fallback behavior for paths not listed in `path_permissions`
-- `path_permissions`: explicit per-path overrides
+Shared note:
 
-Shared meanings:
+- `ReadOnly + read_only` is redundant and normalized away.
+- `ReadWrite + read_write` is redundant and normalized away.
 
-- `Usable`: verified and expected to work
-- `Usable but redundant`: accepted, but the extra rule does not change effective behavior after manager normalization
+### Filesystem
 
-### Linux
+| Platform | `ReadOnly` | `ReadOnly + read_write` | `ReadOnly + deny` | `ReadWrite` | `ReadWrite + read_only` | `ReadWrite + deny` | Conditions |
+|---|---|---|---|---|---|---|---|
+| Linux | Usable | Usable | Usable with condition | Usable | Usable with condition | Usable with condition | Rechecked locally on 2026-04-04 on `Linux 6.17.0-19-generic` `x86_64`. Any effective subtractive rule (`deny`, or `read_only` under `ReadWrite`) needs user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) and existing target paths. If unavailable, procwarden fails closed with `SandboxError::Unavailable`. |
+| macOS | Usable with condition | Usable with condition | Usable with condition | Usable with condition | Usable with condition | Usable with condition | Requires `/usr/bin/sandbox-exec`, or `PROCWARDEN_MACOS_SANDBOX_EXEC` pointing to a working replacement. |
+| Windows | Usable | Usable | Usable | Usable | Usable | Usable | Implemented with AppContainer plus ACL changes. Treat the matrix as something to validate on a real Windows host, not only on `windows-latest`. Existing paths are canonicalized before backend dispatch and sanitized again before ACL application. |
 
-Verified locally on April 4, 2026 on:
+### Network
 
-- `Linux 6.17.0-19-generic`
-- non-root user
-- `kernel.unprivileged_userns_clone=1`
-- `user.max_user_namespaces=479289`
-
-Linux rows differ by host capability, so the condition is listed per row.
-
-| `default_access` | `path_permissions` shape | Status on tested Linux host | Condition to expect the same result elsewhere |
-|---|---|---|---|
-| `ReadWrite` | none | Usable | None |
-| `ReadWrite` | `read_write` only | Usable but redundant | None |
-| `ReadWrite` | `read_only` only | Usable | Requires user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) |
-| `ReadWrite` | `deny` only | Usable | Requires user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) |
-| `ReadWrite` | `read_only + read_write` | Usable but redundant | Same condition as `ReadWrite + read_only`; `read_write` is normalized away |
-| `ReadWrite` | `read_only + deny` | Usable | Requires user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) |
-| `ReadOnly` | none | Usable | None |
-| `ReadOnly` | `read_only` only | Usable but redundant | None |
-| `ReadOnly` | `read_write` only | Usable | None |
-| `ReadOnly` | `deny` only | Usable | Requires user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) |
-| `ReadOnly` | `read_only + read_write` | Usable | None. `read_only` is normalized away |
-| `ReadOnly` | `read_write + deny` | Usable | Requires user/mount namespace support (`CLONE_NEWUSER` + `CLONE_NEWNS`, or equivalent `CAP_SYS_ADMIN`) |
-
-Linux-specific conditions:
-
-- Any Linux row that needs subtractive overlays (`read_only` under `ReadWrite`, or any effective `deny`) also requires the target path to already exist.
-- If namespace support is missing, execution fails closed with `SandboxError::Unavailable`.
-
-### macOS
-
-Verified on GitHub Actions `macos-latest` on April 4, 2026 in run `23970597090`.
-
-Shared macOS condition:
-
-- `/usr/bin/sandbox-exec` must exist, or `PROCWARDEN_MACOS_SANDBOX_EXEC` must point to a valid replacement
-
-| `default_access` | `path_permissions` shape | Status on current macOS runner |
-|---|---|---|
-| `ReadWrite` | none | Usable |
-| `ReadWrite` | `read_write` only | Usable but redundant |
-| `ReadWrite` | `read_only` only | Usable |
-| `ReadWrite` | `deny` only | Usable |
-| `ReadWrite` | `read_only + read_write` | Usable |
-| `ReadWrite` | `read_only + deny` | Usable |
-| `ReadOnly` | none | Usable |
-| `ReadOnly` | `read_only` only | Usable but redundant |
-| `ReadOnly` | `read_write` only | Usable |
-| `ReadOnly` | `deny` only | Usable |
-| `ReadOnly` | `read_only + read_write` | Usable |
-| `ReadOnly` | `read_write + deny` | Usable |
-
-macOS-specific conditions:
-
-- Existing policy paths are canonicalized before SBPL rules are generated.
-- Alias paths such as `/var/...` and `/private/var/...` are normalized up front when the target exists.
-
-### Windows
-
-Latest verified on a real Windows machine on April 3, 2026.
-
-This table is filesystem-only. On Windows, `network_access = false` is a separate host-dependent concern and is called out in the network notes below.
-
-| `default_access` | `path_permissions` shape | Status on latest verified Windows machine |
-|---|---|---|
-| `ReadWrite` | none | Usable |
-| `ReadWrite` | `read_write` only | Usable but redundant |
-| `ReadWrite` | `read_only` only | Usable |
-| `ReadWrite` | `deny` only | Usable |
-| `ReadWrite` | `read_only + read_write` | Usable |
-| `ReadWrite` | `read_only + deny` | Usable |
-| `ReadOnly` | none | Usable |
-| `ReadOnly` | `read_only` only | Usable but redundant |
-| `ReadOnly` | `read_write` only | Usable |
-| `ReadOnly` | `deny` only | Usable |
-| `ReadOnly` | `read_only + read_write` | Usable |
-| `ReadOnly` | `read_write + deny` | Usable |
-
-Windows-specific conditions:
-
-- Filesystem rows above are based on a real Windows machine, not a GitHub-hosted runner.
-- Existing paths are canonicalized before backend dispatch and then sanitized again for ACL application.
-
-## Network Notes
-
-- Linux: `network_access = false` uses seccomp and blocks IP networking, including loopback, private network traffic, and external network traffic.
-- macOS: `network_access = false` maps to Seatbelt `(deny network*)`.
-- Windows: `network_access = false` is the most host-dependent path. On the latest verified real Windows machine it was usable, but on hosts without working WFP setup or helper fallback, execution fails closed instead of silently allowing network access.
+| Platform | `Disabled` | `OutboundOnly` | `Bidirectional` | Conditions |
+|---|---|---|---|---|
+| Linux | Usable | Usable | Usable | Rechecked locally on 2026-04-04. `Disabled` blocks loopback, private-network, and external IP networking. `OutboundOnly` allows outbound connect and blocks listener setup. Restricted modes depend on seccomp support for `x86_64` or `aarch64`; if unavailable, procwarden fails closed. |
+| macOS | Usable with condition | Usable with condition | Usable with condition | Requires `/usr/bin/sandbox-exec`, or `PROCWARDEN_MACOS_SANDBOX_EXEC` pointing to a working replacement. `Disabled` maps to `(deny network*)`. `OutboundOnly` maps to `(deny network-bind)` plus `(deny network-inbound)`. |
+| Windows | Usable with condition | Usable with condition | Usable with condition | Implemented with AppContainer and network filters. `Disabled` fails closed if the WFP or elevated-helper path is unavailable. `OutboundOnly` and `Bidirectional` depend on the elevated firewall-helper path. Private-network outbound access is the main verified path. Loopback is still host-dependent on the current backend, so treat Windows network control as conditional, especially for loopback and listener behavior. |
 
 ## Recheck On Your Host
 
-If you want to verify the current matrix on your own machine, run:
-
 ```bash
 cargo test --test policy_combination_matrix -- --nocapture
+cargo test --test network_mode_control -- --nocapture
 cargo test --workspace --all-targets -- --nocapture
 cargo run --quiet --bin ci_matrix_probe
+```
+
+On Windows, also run:
+
+```bash
+cargo test --test windows_network_mode_control -- --nocapture
 ```

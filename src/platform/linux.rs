@@ -29,7 +29,8 @@ use seccompiler::TargetArch;
 use seccompiler::apply_filter;
 
 use crate::{
-    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxPolicy,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput,
+    SandboxNetworkMode, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -55,7 +56,7 @@ pub(super) fn execute(
     let read_only_paths = policy.read_only_paths();
     let deny_paths = policy.denied_paths();
     let writable_roots = policy.writable_paths();
-    let network_access = policy.network_access;
+    let network_mode = policy.network_mode;
     let host_uid = unsafe { libc::geteuid() };
     let host_gid = unsafe { libc::getegid() };
 
@@ -92,8 +93,8 @@ pub(super) fn execute(
             if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(&writable_roots)?;
             }
-            if !network_access {
-                install_network_seccomp_filter_on_current_thread()?;
+            if !matches!(network_mode, SandboxNetworkMode::Bidirectional) {
+                install_network_seccomp_filter_on_current_thread(network_mode)?;
             }
             close_non_stdio_fds_on_current_process()?;
             Ok(())
@@ -564,42 +565,56 @@ fn install_filesystem_landlock_rules_on_current_thread(
     Ok(())
 }
 
-fn install_network_seccomp_filter_on_current_thread() -> io::Result<()> {
+fn install_network_seccomp_filter_on_current_thread(
+    network_mode: SandboxNetworkMode,
+) -> io::Result<()> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     let mut deny_syscall = |number: i64| {
         rules.insert(number, vec![]);
     };
 
-    deny_syscall(libc::SYS_connect);
-    deny_syscall(libc::SYS_accept);
-    deny_syscall(libc::SYS_accept4);
-    deny_syscall(libc::SYS_bind);
-    deny_syscall(libc::SYS_listen);
-    deny_syscall(libc::SYS_getpeername);
-    deny_syscall(libc::SYS_getsockname);
-    deny_syscall(libc::SYS_shutdown);
-    deny_syscall(libc::SYS_sendto);
-    deny_syscall(libc::SYS_sendmsg);
-    deny_syscall(libc::SYS_sendmmsg);
-    deny_syscall(libc::SYS_recvmsg);
-    deny_syscall(libc::SYS_recvmmsg);
-    deny_syscall(libc::SYS_getsockopt);
-    deny_syscall(libc::SYS_setsockopt);
     deny_syscall(libc::SYS_ptrace);
 
-    let unix_only = SeccompRule::new(vec![
-        SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Ne,
-            libc::AF_UNIX as u64,
-        )
-        .map_err(to_io_error)?,
-    ])
-    .map_err(to_io_error)?;
-    rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
-    rules.insert(libc::SYS_socketpair, vec![unix_only]);
+    match network_mode {
+        SandboxNetworkMode::Disabled => {
+            deny_syscall(libc::SYS_connect);
+            deny_syscall(libc::SYS_accept);
+            deny_syscall(libc::SYS_accept4);
+            deny_syscall(libc::SYS_bind);
+            deny_syscall(libc::SYS_listen);
+            deny_syscall(libc::SYS_getpeername);
+            deny_syscall(libc::SYS_getsockname);
+            deny_syscall(libc::SYS_shutdown);
+            deny_syscall(libc::SYS_sendto);
+            deny_syscall(libc::SYS_sendmsg);
+            deny_syscall(libc::SYS_sendmmsg);
+            deny_syscall(libc::SYS_recvmsg);
+            deny_syscall(libc::SYS_recvmmsg);
+            deny_syscall(libc::SYS_getsockopt);
+            deny_syscall(libc::SYS_setsockopt);
+
+            let unix_only = SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(to_io_error)?,
+            ])
+            .map_err(to_io_error)?;
+            rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
+            rules.insert(libc::SYS_socketpair, vec![unix_only]);
+        }
+        SandboxNetworkMode::OutboundOnly => {
+            deny_syscall(libc::SYS_accept);
+            deny_syscall(libc::SYS_accept4);
+            deny_syscall(libc::SYS_bind);
+            deny_syscall(libc::SYS_listen);
+        }
+        SandboxNetworkMode::Bidirectional => return Ok(()),
+    }
 
     let arch = if cfg!(target_arch = "x86_64") {
         TargetArch::x86_64

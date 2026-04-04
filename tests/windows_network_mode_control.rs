@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::time::Duration;
 
-use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxPathPermission};
+use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxNetworkMode, SandboxPathPermission};
 
 use common::{
     Fixture, assert_failure, assert_success, execute_case, policy, sandbox_request,
@@ -61,19 +61,19 @@ fn windows_net_diag_command(host: &str, port: u16, timeout_ms: u64) -> Vec<Strin
 }
 
 #[test]
-fn network_enabled_allows_private_network_tcp_connect() {
-    let fixture = Fixture::new("network-enabled-allowed");
+fn network_bidirectional_allows_private_network_tcp_connect() {
+    let fixture = Fixture::new("network-bidirectional-allowed");
     let manager = SandboxManager::new();
     let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
         eprintln!(
-            "skip network_enabled test because no reachable default-gateway TCP target is available"
+            "skip network_bidirectional test because no reachable default-gateway TCP target is available"
         );
         return;
     };
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        true,
+        SandboxNetworkMode::Bidirectional,
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -86,22 +86,57 @@ fn network_enabled_allows_private_network_tcp_connect() {
             2_500,
         ),
         &test_policy,
-        "network_enabled private-network connect",
+        "network_bidirectional private-network connect",
     );
     assert_success(
         &private_network_output,
-        "network_enabled private-network connect",
+        "network_bidirectional private-network connect",
     );
 }
 
 #[test]
-fn network_enabled_still_blocks_loopback_tcp_connect() {
-    let fixture = Fixture::new("network-enabled-loopback");
+fn network_outbound_only_allows_private_network_tcp_connect() {
+    let fixture = Fixture::new("network-outbound-only-private");
+    let manager = SandboxManager::new();
+    let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
+        eprintln!(
+            "skip network_outbound_only private-network probe because no reachable default-gateway TCP target is available"
+        );
+        return;
+    };
+
+    let test_policy = policy(
+        SandboxDefaultAccess::ReadOnly,
+        SandboxNetworkMode::OutboundOnly,
+        vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    );
+
+    let private_network_output = execute_case(
+        &manager,
+        &sandbox_request(
+            windows_net_diag_command(&gateway_ip.to_string(), gateway_port, 1_500),
+            &fixture.runtime_cwd,
+            2_500,
+        ),
+        &test_policy,
+        "network_outbound_only private-network connect",
+    );
+    assert_success(
+        &private_network_output,
+        "network_outbound_only private-network connect",
+    );
+}
+
+#[test]
+fn network_bidirectional_still_blocks_loopback_tcp_connect() {
+    let fixture = Fixture::new("network-bidirectional-loopback");
     let manager = SandboxManager::new();
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        true,
+        SandboxNetworkMode::Bidirectional,
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -122,19 +157,19 @@ fn network_enabled_still_blocks_loopback_tcp_connect() {
             2_500,
         ),
         &test_policy,
-        "network_enabled loopback connect",
+        "network_bidirectional loopback connect",
     );
-    assert_failure(&loopback_output, "network_enabled loopback connect");
+    assert_failure(&loopback_output, "network_bidirectional loopback connect");
     assert!(
         !accepted_rx
             .recv_timeout(Duration::from_secs(3))
             .unwrap_or(false),
-        "network_enabled loopback connect should not reach listener on the current Windows backend"
+        "network_bidirectional loopback connect should not reach listener on the current Windows backend"
     );
 }
 
 #[test]
-fn network_disabled_blocks_loopback_and_external_tcp_connect() {
+fn network_disabled_blocks_loopback_and_private_tcp_connect() {
     let fixture = Fixture::new("network-disabled");
     let manager = SandboxManager::new();
     let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
@@ -146,7 +181,7 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        false,
+        SandboxNetworkMode::Disabled,
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -202,8 +237,8 @@ fn network_disabled_blocks_loopback_and_external_tcp_connect() {
 
 #[test]
 #[ignore = "diagnostic helper for Windows network debugging"]
-fn debug_network_enabled_diagnose_connect_failure() {
-    let fixture = Fixture::new("network-enabled-debug");
+fn debug_network_bidirectional_diagnose_connect_failure() {
+    let fixture = Fixture::new("network-bidirectional-debug");
     let manager = SandboxManager::new();
     let Some((gateway_ip, gateway_port)) = default_gateway_private_probe_target() else {
         eprintln!(
@@ -228,12 +263,12 @@ fn debug_network_enabled_diagnose_connect_failure() {
         ),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            true,
+            SandboxNetworkMode::Bidirectional,
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
         ),
-        "debug network enabled connect failure",
+        "debug network bidirectional connect failure",
     );
 
     eprintln!("stdout:\n{}", output.stdout);

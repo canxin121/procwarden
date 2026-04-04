@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use procwarden::{
     SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxManager,
-    SandboxPathPermission, SandboxPolicy,
+    SandboxNetworkMode, SandboxPathPermission, SandboxPolicy,
 };
 
 pub struct TempDir {
@@ -108,13 +108,13 @@ impl Fixture {
 
 pub fn policy(
     default_access: SandboxDefaultAccess,
-    network_access: bool,
+    network_mode: SandboxNetworkMode,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
     SandboxPolicy {
         path_permissions,
         default_access,
-        network_access,
+        network_mode,
     }
 }
 
@@ -234,6 +234,46 @@ finally:
             host.to_string(),
             port.to_string(),
             timeout_ms.to_string(),
+        ]
+    }
+}
+
+pub fn listen_command(host: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let escaped_host = host.replace('\'', "''");
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('{escaped_host}'), 0); $listener.Start(); $listener.Stop(); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script = r#"import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind((sys.argv[1], 0))
+    sock.listen(1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    sock.close()
+"#;
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            host.to_string(),
         ]
     }
 }

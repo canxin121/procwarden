@@ -97,7 +97,7 @@ fn sanitize_policy_for_execution(policy: &SandboxPolicy) -> Result<SandboxPolicy
     Ok(SandboxPolicy {
         path_permissions,
         default_access: policy.default_access,
-        network_access: policy.network_access,
+        network_mode: policy.network_mode,
     })
 }
 
@@ -294,7 +294,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{SandboxDefaultAccess, SandboxPathPermission, SandboxPolicy};
+    use crate::{SandboxDefaultAccess, SandboxNetworkMode, SandboxPathPermission, SandboxPolicy};
 
     use super::{SandboxError, cap_fs, sanitize_policy_for_execution};
 
@@ -337,7 +337,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_write(alias_path),
                 SandboxPathPermission::read_write(real_path.clone()),
@@ -360,7 +360,7 @@ mod tests {
 
         let error = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![SandboxPathPermission::read_only(missing_path.clone())],
         })
         .expect_err("missing path should fail validation");
@@ -389,7 +389,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_only(root.clone()),
                 SandboxPathPermission::read_write(root.clone()),
@@ -415,7 +415,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_write(root.clone()),
                 SandboxPathPermission::read_only(root.clone()),
@@ -440,7 +440,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_only(path.clone()),
                 SandboxPathPermission::read_write(path.clone()),
@@ -464,7 +464,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_write(path.clone()),
                 SandboxPathPermission::deny(path.clone()),
@@ -489,7 +489,7 @@ mod tests {
 
         let sanitized = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_only(root.clone()),
                 SandboxPathPermission::deny(child.clone()),
@@ -519,7 +519,7 @@ mod tests {
 
         let error = sanitize_policy_for_execution(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::deny(root.clone()),
                 SandboxPathPermission::read_write(child.clone()),

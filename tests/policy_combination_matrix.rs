@@ -2,7 +2,9 @@
 
 mod common;
 
-use procwarden::{SandboxDefaultAccess, SandboxError, SandboxManager, SandboxPathPermission};
+use procwarden::{
+    SandboxDefaultAccess, SandboxError, SandboxManager, SandboxNetworkMode, SandboxPathPermission,
+};
 
 use common::{Fixture, assert_success, policy, sandbox_request};
 
@@ -153,7 +155,11 @@ fn policy_shape_matrix_acceptance_contract() {
             path_permissions.push(SandboxPathPermission::deny(fixture.deny_dir.clone()));
         }
 
-        let test_policy = policy(case.default_access, false, path_permissions);
+        let test_policy = policy(
+            case.default_access,
+            SandboxNetworkMode::Disabled,
+            path_permissions,
+        );
         let result = manager.execute(
             &sandbox_request(
                 vec![
@@ -206,7 +212,7 @@ fn linux_read_write_default_with_read_only_overlay_is_enforced_when_overlays_are
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadWrite,
-        false,
+        SandboxNetworkMode::Disabled,
         vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
     );
 
@@ -272,7 +278,7 @@ fn linux_overlay_backed_readonly_paths_require_existing_targets() {
 
     let read_write_missing_readonly_policy = policy(
         SandboxDefaultAccess::ReadWrite,
-        false,
+        SandboxNetworkMode::Disabled,
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_only(missing_readonly_target),

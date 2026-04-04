@@ -19,7 +19,7 @@ use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 
-use crate::SandboxError;
+use crate::{SandboxError, SandboxNetworkMode};
 
 use super::util::{format_last_error, to_wide};
 
@@ -127,7 +127,7 @@ impl Drop for AppContainerContext {
 }
 
 pub(super) fn create_appcontainer_context_with_network(
-    network_access: bool,
+    network_mode: SandboxNetworkMode,
 ) -> Result<AppContainerContext, SandboxError> {
     let profile_name = format!(
         "procwarden_{}_{}",
@@ -136,7 +136,7 @@ pub(super) fn create_appcontainer_context_with_network(
     );
     let wide_name = to_wide(&profile_name);
 
-    let (_capability_sids, capability_entries) = network_capabilities(network_access)?;
+    let (_capability_sids, capability_entries) = network_capabilities(network_mode)?;
 
     let mut sid_ptr: PSID = std::ptr::null_mut();
     let create_hr = unsafe {
@@ -176,7 +176,7 @@ pub(super) fn create_appcontainer_context_with_network(
         loopback_exemption: None,
     };
 
-    if network_access {
+    if matches!(network_mode, SandboxNetworkMode::Bidirectional) {
         appcontainer.loopback_exemption =
             Some(LoopbackExemptionGuard::install(appcontainer.sid.raw())?);
     }
@@ -199,9 +199,9 @@ impl Drop for OwnedCapabilitySid {
 }
 
 fn network_capabilities(
-    network_access: bool,
+    network_mode: SandboxNetworkMode,
 ) -> Result<(Vec<OwnedCapabilitySid>, Vec<SID_AND_ATTRIBUTES>), SandboxError> {
-    if !network_access {
+    if !network_mode.allows_ip_network() {
         return Ok((Vec::new(), Vec::new()));
     }
 

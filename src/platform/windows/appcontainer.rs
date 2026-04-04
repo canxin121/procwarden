@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
+use crate::{
+    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxNetworkMode, SandboxPolicy,
+    cap_fs,
+};
 
 use super::{acl, elevated_ops, elevation, process, token, util, wfp};
 
@@ -46,15 +49,16 @@ pub(super) fn execute(
         deny_write_paths,
     });
 
-    let appcontainer = token::create_appcontainer_context_with_network(policy.network_access)?;
+    let appcontainer = token::create_appcontainer_context_with_network(policy.network_mode)?;
     let sid = appcontainer.sid();
-    if policy.network_access {
+    if policy.network_mode.allows_ip_network() {
         appcontainer.register_network_binary(&executable)?;
     }
 
     let optional_bootstrap_paths =
         sanitize_optional_existing_paths(runtime_bootstrap_readonly_paths(request, &executable))?;
-    let use_elevated_ops = !elevation::current_process_is_elevated()? || policy.network_access;
+    let use_elevated_ops = !elevation::current_process_is_elevated()?
+        || !matches!(policy.network_mode, SandboxNetworkMode::Disabled);
     let _elevated_ops_lock = if use_elevated_ops {
         Some(lock_elevated_ops_execution())
     } else {
@@ -78,10 +82,12 @@ pub(super) fn execute(
                 sid_string: util::sid_to_string(sid)?,
                 appcontainer_name: appcontainer.profile_name().to_string(),
                 executable: executable.clone(),
-                network_rule_mode: if policy.network_access {
-                    elevated_ops::NetworkRuleMode::Allow
-                } else {
-                    elevated_ops::NetworkRuleMode::Block
+                network_rule_mode: match policy.network_mode {
+                    SandboxNetworkMode::Disabled => elevated_ops::NetworkRuleMode::BlockAll,
+                    SandboxNetworkMode::OutboundOnly => elevated_ops::NetworkRuleMode::OutboundOnly,
+                    SandboxNetworkMode::Bidirectional => {
+                        elevated_ops::NetworkRuleMode::Bidirectional
+                    }
                 },
                 deny_access_paths: elevated_plan.deny_access_paths,
                 allow_readonly_paths: elevated_plan.allow_readonly_paths,
@@ -90,7 +96,7 @@ pub(super) fn execute(
             },
         )?);
     } else {
-        network_guard = if policy.network_access {
+        network_guard = if policy.network_mode.allows_ip_network() {
             None
         } else {
             Some(wfp::install_block_all_network_filters(&executable, sid)?)
@@ -119,7 +125,7 @@ pub(super) fn execute(
         &request.cwd,
         env_map,
         request.timeout_ms,
-        policy.network_access,
+        policy.network_mode,
     )?;
 
     drop(elevated_ops_guard);
@@ -399,7 +405,7 @@ fn component_eq_case_insensitive(left: &Component<'_>, right: &Component<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::{collect_acl_plan, filter_paths_not_under_roots};
-    use crate::{SandboxDefaultAccess, SandboxPathPermission, SandboxPolicy};
+    use crate::{SandboxDefaultAccess, SandboxNetworkMode, SandboxPathPermission, SandboxPolicy};
     use std::path::PathBuf;
 
     #[test]
@@ -412,7 +418,7 @@ mod tests {
             &SandboxPolicy {
                 path_permissions: vec![SandboxPathPermission::read_only(readonly_root.clone())],
                 default_access: SandboxDefaultAccess::ReadWrite,
-                network_access: false,
+                network_mode: SandboxNetworkMode::Disabled,
             },
             vec![outside.clone(), readonly_root.clone(), readonly_child],
         );
@@ -437,7 +443,7 @@ mod tests {
                     SandboxPathPermission::read_write(writable_root.clone()),
                 ],
                 default_access: SandboxDefaultAccess::ReadOnly,
-                network_access: false,
+                network_mode: SandboxNetworkMode::Disabled,
             },
             vec![outside.clone(), denied_root.clone(), denied_child],
         );

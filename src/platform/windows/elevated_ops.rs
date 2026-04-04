@@ -183,16 +183,32 @@ try {
     }
 
     if ($NetworkRuleMode -ne 0) {
-        $firewallAction = if ($NetworkRuleMode -eq 1) { "block" } elseif ($NetworkRuleMode -eq 2) { "allow" } else { throw "unknown network rule mode: $NetworkRuleMode" }
+        switch ($NetworkRuleMode) {
+            1 {
+                $outboundAction = "block"
+                $inboundAction = "block"
+            }
+            2 {
+                $outboundAction = "allow"
+                $inboundAction = "block"
+            }
+            3 {
+                $outboundAction = "allow"
+                $inboundAction = "allow"
+            }
+            default {
+                throw "unknown network rule mode: $NetworkRuleMode"
+            }
+        }
         Remove-Stale-ProcwardenFirewallRules
         Log-Progress "begin|network"
-        Apply-FirewallRule -Direction "out" -Action $firewallAction
-        Apply-FirewallRule -Direction "in" -Action $firewallAction
+        Apply-FirewallRule -Direction "out" -Action $outboundAction
+        Apply-FirewallRule -Direction "in" -Action $inboundAction
         $firewallEnabled = $true
         Log-Progress "end|network"
     }
 
-    if ($NetworkRuleMode -eq 2) {
+    if ($NetworkRuleMode -eq 3) {
         Log-Progress "begin|loopback"
         Set-LoopbackExemption -Operation "-a" -AppContainer $AppContainerName
         $loopbackEnabled = $true
@@ -248,16 +264,18 @@ pub(super) struct ElevatedOpsSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkRuleMode {
     None,
-    Block,
-    Allow,
+    BlockAll,
+    OutboundOnly,
+    Bidirectional,
 }
 
 impl NetworkRuleMode {
     fn as_int(self) -> i32 {
         match self {
             Self::None => 0,
-            Self::Block => 1,
-            Self::Allow => 2,
+            Self::BlockAll => 1,
+            Self::OutboundOnly => 2,
+            Self::Bidirectional => 3,
         }
     }
 }

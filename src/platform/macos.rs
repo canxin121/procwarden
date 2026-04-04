@@ -3,7 +3,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::{
-    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxPolicy,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput,
+    SandboxNetworkMode, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -48,8 +49,15 @@ fn build_sbpl_profile(policy: &SandboxPolicy) -> String {
     let read_only_paths = policy.read_only_paths();
     let read_write_paths = policy.read_write_paths();
 
-    if !policy.network_access {
-        lines.push("(deny network*)".to_string());
+    match policy.network_mode {
+        SandboxNetworkMode::Disabled => {
+            lines.push("(deny network*)".to_string());
+        }
+        SandboxNetworkMode::OutboundOnly => {
+            lines.push("(deny network-bind)".to_string());
+            lines.push("(deny network-inbound)".to_string());
+        }
+        SandboxNetworkMode::Bidirectional => {}
     }
 
     match policy.default_access {
@@ -126,7 +134,7 @@ mod tests {
         let writable = PathBuf::from("/private/tmp/procwarden/rw");
         let profile = build_sbpl_profile(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![SandboxPathPermission::read_write(writable.clone())],
         });
 
@@ -142,7 +150,7 @@ mod tests {
         let writable = PathBuf::from("/private/tmp/procwarden/rw");
         let profile = build_sbpl_profile(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![SandboxPathPermission::read_write(writable.clone())],
         });
 
@@ -162,7 +170,7 @@ mod tests {
         let read_only = PathBuf::from("/private/tmp/procwarden/ro");
         let profile = build_sbpl_profile(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![SandboxPathPermission::read_only(read_only.clone())],
         });
 
@@ -184,7 +192,7 @@ mod tests {
         let denied = PathBuf::from("/private/tmp/procwarden/deny");
         let profile = build_sbpl_profile(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadWrite,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![SandboxPathPermission::deny(denied.clone())],
         });
 
@@ -210,7 +218,7 @@ mod tests {
         let denied = writable.join("blocked");
         let profile = build_sbpl_profile(&SandboxPolicy {
             default_access: SandboxDefaultAccess::ReadOnly,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions: vec![
                 SandboxPathPermission::read_write(writable.clone()),
                 SandboxPathPermission::deny(denied.clone()),

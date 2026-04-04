@@ -11,7 +11,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxManager,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxManager, SandboxNetworkMode,
     SandboxPathPermission, SandboxPolicy,
 };
 
@@ -50,7 +50,7 @@ fn probe_frontloaded_missing_path_validation() -> Result<(), Box<dyn Error>> {
 
     let policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![SandboxPathPermission::read_only(missing_path.clone())],
     };
 
@@ -211,7 +211,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_readwrite_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -286,7 +286,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readwrite_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
     };
     let read_deny = manager.execute(
@@ -308,7 +308,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
     };
     let readonly_deny = manager.execute(
@@ -325,7 +325,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_nested_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -378,7 +378,7 @@ fn probe_macos_matrix_contract() -> Result<(), Box<dyn Error>> {
     let manager = SandboxManager::new();
     let policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.alias_rw_dir.clone()),
@@ -429,7 +429,7 @@ fn probe_windows_matrix_and_timings() -> Result<(), Box<dyn Error>> {
         windows_host_process_is_elevated()?
     );
 
-    probe_windows_network_access_shape(&manager, &fixture)?;
+    probe_windows_network_mode_shape(&manager, &fixture)?;
     probe_windows_policy_shape_matrix(&manager, &fixture)?;
     probe_windows_enforcement_cases(&manager, &fixture)?;
     probe_windows_timing_samples(&manager, &fixture)?;
@@ -438,32 +438,57 @@ fn probe_windows_matrix_and_timings() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "windows")]
-fn probe_windows_network_access_shape(
+fn probe_windows_network_mode_shape(
     manager: &SandboxManager,
     fixture: &Fixture,
 ) -> Result<(), Box<dyn Error>> {
-    let network_enabled_policy = SandboxPolicy {
+    let network_bidirectional_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: true,
+        network_mode: SandboxNetworkMode::Bidirectional,
+        path_permissions: vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    };
+    let network_outbound_only_policy = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_mode: SandboxNetworkMode::OutboundOnly,
         path_permissions: vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
     };
     let network_disabled_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
     };
 
-    let runnable = manager.execute(
+    let bidirectional_runnable = manager.execute(
         &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
-        &network_enabled_policy,
+        &network_bidirectional_policy,
     );
     println!(
-        "windows.network_access_true={}",
-        render_windows_matrix_result(&runnable)
+        "windows.network.bidirectional.runnable={}",
+        render_windows_matrix_result(&bidirectional_runnable)
+    );
+
+    let outbound_only_runnable = manager.execute(
+        &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+        &network_outbound_only_policy,
+    );
+    println!(
+        "windows.network.outbound_only.runnable={}",
+        render_windows_matrix_result(&outbound_only_runnable)
+    );
+
+    let disabled_runnable = manager.execute(
+        &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+        &network_disabled_policy,
+    );
+    println!(
+        "windows.network.disabled.runnable={}",
+        render_windows_matrix_result(&disabled_runnable)
     );
 
     let loopback_listener = TcpListener::bind(("127.0.0.1", 0))
@@ -473,16 +498,28 @@ fn probe_windows_network_access_shape(
         .map_err(|error| format!("loopback listener local_addr failed: {error}"))?
         .port();
 
-    let loopback_enabled = manager.execute(
+    let loopback_bidirectional = manager.execute(
         &sandbox_request(
             windows_network_probe_command("127.0.0.1", loopback_port, 1_500)?,
             &fixture.runtime_cwd,
         ),
-        &network_enabled_policy,
+        &network_bidirectional_policy,
     );
     println!(
-        "windows.network.loopback.same_binary_listener.enabled={}",
-        render_windows_network_probe_result(&loopback_enabled)
+        "windows.network.loopback.same_binary_listener.bidirectional={}",
+        render_windows_network_probe_result(&loopback_bidirectional)
+    );
+
+    let loopback_outbound_only = manager.execute(
+        &sandbox_request(
+            windows_network_probe_command("127.0.0.1", loopback_port, 1_500)?,
+            &fixture.runtime_cwd,
+        ),
+        &network_outbound_only_policy,
+    );
+    println!(
+        "windows.network.loopback.same_binary_listener.outbound_only={}",
+        render_windows_network_probe_result(&loopback_outbound_only)
     );
 
     let loopback_disabled = manager.execute(
@@ -502,7 +539,10 @@ fn probe_windows_network_access_shape(
             "windows.network.private_network.host_baseline=skipped(no_reachable_default_gateway_target)"
         );
         println!(
-            "windows.network.private_network.enabled=skipped(no_reachable_default_gateway_target)"
+            "windows.network.private_network.bidirectional=skipped(no_reachable_default_gateway_target)"
+        );
+        println!(
+            "windows.network.private_network.outbound_only=skipped(no_reachable_default_gateway_target)"
         );
         println!(
             "windows.network.private_network.disabled=skipped(no_reachable_default_gateway_target)"
@@ -513,16 +553,28 @@ fn probe_windows_network_access_shape(
     println!("windows.network.private_network.target={gateway_ip}:{gateway_port}");
     println!("windows.network.private_network.host_baseline=connect_ok");
 
-    let private_enabled = manager.execute(
+    let private_bidirectional = manager.execute(
         &sandbox_request(
             windows_network_probe_command(&gateway_ip.to_string(), gateway_port, 1_500)?,
             &fixture.runtime_cwd,
         ),
-        &network_enabled_policy,
+        &network_bidirectional_policy,
     );
     println!(
-        "windows.network.private_network.enabled={}",
-        render_windows_network_probe_result(&private_enabled)
+        "windows.network.private_network.bidirectional={}",
+        render_windows_network_probe_result(&private_bidirectional)
+    );
+
+    let private_outbound_only = manager.execute(
+        &sandbox_request(
+            windows_network_probe_command(&gateway_ip.to_string(), gateway_port, 1_500)?,
+            &fixture.runtime_cwd,
+        ),
+        &network_outbound_only_policy,
+    );
+    println!(
+        "windows.network.private_network.outbound_only={}",
+        render_windows_network_probe_result(&private_outbound_only)
     );
 
     let private_disabled = manager.execute(
@@ -654,7 +706,7 @@ fn probe_windows_enforcement_cases(
 ) -> Result<(), Box<dyn Error>> {
     let read_only_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -693,7 +745,7 @@ fn probe_windows_enforcement_cases(
 
     let read_write_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_only(fixture.ro_dir.clone()),
@@ -727,7 +779,7 @@ fn probe_windows_enforcement_cases(
 
     let read_only_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -743,7 +795,7 @@ fn probe_windows_enforcement_cases(
 
     let read_write_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::deny(fixture.deny_dir.clone()),
@@ -845,7 +897,7 @@ fn benchmark_windows_policy_case(
     let mut samples = Vec::with_capacity(ITERATIONS);
     let policy = SandboxPolicy {
         default_access: case.default_access,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: case.path_permissions.clone(),
     };
 
@@ -1210,7 +1262,7 @@ impl LinuxMatrixCase {
 
         SandboxPolicy {
             default_access: self.default_access,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions,
         }
     }
@@ -1248,7 +1300,7 @@ impl WindowsMatrixCase {
 
         SandboxPolicy {
             default_access: self.default_access,
-            network_access: false,
+            network_mode: SandboxNetworkMode::Disabled,
             path_permissions,
         }
     }
@@ -1280,7 +1332,7 @@ impl WindowsTimingCase {
 fn readwrite_with_readonly_policy(fixture: &Fixture) -> SandboxPolicy {
     SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_access: false,
+        network_mode: SandboxNetworkMode::Disabled,
         path_permissions: vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
     }
 }
