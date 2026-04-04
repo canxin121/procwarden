@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / rust-${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [stable]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt (check)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run policy combination matrix tests
+        run: cargo test --test policy_combination_matrix -- --nocapture
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets -- --nocapture
+
+      - name: Run hosted runner diagnostics
+        if: always()
+        shell: bash
+        run: |
+          cargo run --quiet --bin ci_matrix_probe | tee ci-matrix-probe.txt
+          {
+            echo "## Hosted runner diagnostics"
+            echo ""
+            echo '```text'
+            cat ci-matrix-probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hosted runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-matrix-probe-${{ matrix.os }}
+          path: ci-matrix-probe.txt
+          if-no-files-found: ignore
