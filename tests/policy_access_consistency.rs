@@ -317,3 +317,80 @@ fn default_read_only_enforces_deny_overrides() {
         "default_read_only deny override should not create file"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn default_read_only_readwrite_with_nested_deny_blocks_denied_descendant() {
+    let fixture = Fixture::new("policy-readonly-nested-deny");
+    let manager = SandboxManager::new();
+
+    let nested_deny_dir = fixture.rw_dir.join("nested-deny");
+    fs::create_dir_all(&nested_deny_dir).expect("nested deny dir should be created");
+    let nested_deny_seed = nested_deny_dir.join("seed-nested-deny.txt");
+    fs::write(&nested_deny_seed, "nested-deny-seed").expect("nested deny seed should exist");
+
+    let test_policy = policy(
+        SandboxDefaultAccess::ReadOnly,
+        false,
+        vec![
+            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+            SandboxPathPermission::deny(nested_deny_dir.clone()),
+        ],
+    );
+
+    let write_rw_target = fixture.rw_dir.join("allowed-readonly-nested-deny.txt");
+    let write_rw_request = sandbox_request(
+        write_command(&write_rw_target, "allowed-readonly-nested-deny"),
+        &fixture.runtime_cwd,
+        2_500,
+    );
+    let write_rw = match manager.execute(&write_rw_request, &test_policy) {
+        Ok(output) => output,
+        Err(SandboxError::Unavailable(message))
+            if cfg!(target_os = "linux") && message.contains("mount-namespace support") =>
+        {
+            return;
+        }
+        Err(error) => {
+            panic!(
+                "default_read_only write readwrite carveout with nested deny: manager execution failed: {error:?}"
+            )
+        }
+    };
+    assert_success(
+        &write_rw,
+        "default_read_only write readwrite carveout with nested deny",
+    );
+
+    let read_nested_deny = execute_case(
+        &manager,
+        &sandbox_request(read_command(&nested_deny_seed), &fixture.runtime_cwd, 2_500),
+        &test_policy,
+        "default_read_only read nested denied path",
+    );
+    assert_failure(
+        &read_nested_deny,
+        "default_read_only read nested denied path",
+    );
+
+    let write_nested_deny_target = nested_deny_dir.join("blocked-readonly-nested-deny.txt");
+    let write_nested_deny = execute_case(
+        &manager,
+        &sandbox_request(
+            write_command(&write_nested_deny_target, "blocked-readonly-nested-deny"),
+            &fixture.runtime_cwd,
+            2_500,
+        ),
+        &test_policy,
+        "default_read_only write nested denied path",
+    );
+    assert_failure(
+        &write_nested_deny,
+        "default_read_only write nested denied path",
+    );
+    assert!(
+        !write_nested_deny_target.exists(),
+        "default_read_only nested deny should not create file"
+    );
+}

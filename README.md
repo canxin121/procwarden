@@ -299,6 +299,36 @@ Linux-specific caveats:
 
 - Any Linux policy shape that requires read-only or deny overlays returns `SandboxError::Unavailable` on hosts without the required user/mount namespace support (`CLONE_NEWUSER`/`CLONE_NEWNS` or equivalent `CAP_SYS_ADMIN` capability).
 - Overlay-backed subtractive rules currently apply only to already-existing path objects. This is a backend contract on top of the kernel primitives we use: bind mounts need an existing mount point, and creating that target inside only a private mount namespace would still create it on the shared host filesystem.
+- On capable hosts, directory-scoped `deny` overlays are bind-mounted and then remounted read-only. That closes the "existing entries disappear, but new files can still be created" gap that showed up during the April 4, 2026 local retest.
+
+### Linux real-machine matrix (retested on this host, 2026-04-04)
+
+These rows record the actual behavior on the Linux machine used for the April 4, 2026 retest
+(`Linux 6.17.0-19-generic`, non-root `uid=1000`, `kernel.unprivileged_userns_clone=1`,
+`user.max_user_namespaces=479289`). They are intentionally narrower than the contract table above:
+they describe what this host actually did after the current `main` branch was retested locally.
+
+| `default_access` | `path_permissions` shape | Probe row | Enforcement follow-up | Actual status on this machine | Notes |
+|---|---|---|---|---|---|
+| `ReadWrite` | none | `linux.matrix.readwrite_none=runnable` | N/A | Usable | No overlays required |
+| `ReadWrite` | `read_write` only | `linux.matrix.readwrite_readwrite=runnable` | N/A | Usable but redundant | Manager normalizes the redundant `read_write` entry away before backend dispatch |
+| `ReadWrite` | `read_only` only | `linux.matrix.readwrite_readonly=runnable` | `linux.enforcement.readwrite_readonly=ok` | Usable | Rechecked locally for both writable non-readonly paths and blocked writes inside the readonly path |
+| `ReadWrite` | `deny` only | `linux.matrix.readwrite_deny=runnable` | `linux.enforcement.readwrite_deny=ok` | Usable | Rechecked locally for both denied reads of an existing file and blocked creation of a new file inside the denied directory |
+| `ReadWrite` | `read_only + read_write` | `linux.matrix.readwrite_readonly_readwrite=runnable` | `linux.enforcement.readwrite_readonly=ok` | Usable but redundant | Effective behavior is the same as `ReadWrite` + `read_only` because `read_write` normalizes away |
+| `ReadWrite` | `read_only + deny` | `linux.matrix.readwrite_readonly_deny=runnable` | `linux.enforcement.readwrite_readonly=ok`; `linux.enforcement.readwrite_deny=ok` | Usable | Rechecked locally with both subtractive overlay types active on the same host |
+| `ReadOnly` | none | `linux.matrix.readonly_none=runnable` | N/A | Usable | Global read-only mode |
+| `ReadOnly` | `read_only` only | `linux.matrix.readonly_readonly=runnable` | N/A | Usable but redundant | Manager normalizes the redundant `read_only` entry away before backend dispatch |
+| `ReadOnly` | `read_write` only | `linux.matrix.readonly_readwrite=runnable` | `linux.enforcement.readonly_readwrite=ok` | Usable | Rechecked locally for both successful writes inside the carve-out and blocked writes outside it |
+| `ReadOnly` | `deny` only | `linux.matrix.readonly_deny=runnable` | `linux.enforcement.readonly_deny=ok` | Usable | Rechecked locally for denied reads of an existing file under the denied path |
+| `ReadOnly` | `read_only + read_write` | `linux.matrix.readonly_readonly_readwrite=runnable` | `linux.enforcement.readonly_readwrite=ok` | Usable | Effective behavior is the same as `ReadOnly` + `read_write` because `read_only` normalizes away |
+| `ReadOnly` | `read_write + deny` | `linux.matrix.readonly_readwrite_deny=runnable` | `linux.enforcement.readonly_readwrite_deny=ok` | Usable | Rechecked locally with a nested deny underneath a writable carve-out |
+
+This host-level retest was produced from:
+
+- `cargo run --quiet --bin ci_matrix_probe`
+- `cargo test --test policy_combination_matrix -- --nocapture`
+- `cargo test --test policy_access_consistency -- --nocapture`
+- `cargo test -- --nocapture`
 
 ### Windows
 
@@ -440,7 +470,7 @@ Practical conclusion for that historical hosted-runner snapshot:
 Current automated coverage emphasis:
 
 - `tests/policy_combination_matrix.rs`: default-access/path-permission shape matrix, including Linux overlay-backed `ReadWrite + read_only`, Linux/macOS `deny` rows, and Linux existing-overlay-target fail-closed coverage.
-- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including explicit `deny` path enforcement.
+- `tests/policy_access_consistency.rs`: runtime behavior checks for the main default-policy modes, including explicit `deny` path enforcement and a nested `ReadOnly + read_write + deny` descendant-overrides-carve-out case.
 - `tests/network_access_control.rs`: Windows real-machine probes for `network_access == true` private-network TCP allow, the current loopback limitation against a generic host listener, and `network_access == false` loopback/private-network deny behavior.
 - `src/platform/macos.rs` unit tests: SBPL generation order checks for `ReadWrite` and `ReadOnly` profiles.
 

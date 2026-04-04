@@ -28,6 +28,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     probe_linux_overlay_capability()?;
 
+    #[cfg(target_os = "linux")]
+    probe_linux_policy_shape_matrix()?;
+
+    #[cfg(target_os = "linux")]
+    probe_linux_enforcement_cases()?;
+
     #[cfg(target_os = "macos")]
     probe_macos_matrix_contract()?;
 
@@ -79,41 +85,7 @@ fn probe_linux_overlay_capability() -> Result<(), Box<dyn Error>> {
     match bootstrap {
         Ok(output) => {
             assert_success(&output, "linux bootstrap command")?;
-
-            let write_target = fixture.rw_dir.join("linux-overlay-write.txt");
-            let write_output = manager.execute(
-                &sandbox_request(
-                    write_command(&write_target, "overlay-ok"),
-                    &fixture.runtime_cwd,
-                ),
-                &policy,
-            )?;
-            assert_success(&write_output, "linux writable carve-out")?;
-
-            let readonly_target = fixture.ro_dir.join("linux-overlay-readonly.txt");
-            let readonly_output = manager.execute(
-                &sandbox_request(
-                    write_command(&readonly_target, "blocked"),
-                    &fixture.runtime_cwd,
-                ),
-                &policy,
-            )?;
-            assert_failure(&readonly_output, "linux readonly overlay enforcement")?;
-
-            let deny_policy = SandboxPolicy {
-                default_access: SandboxDefaultAccess::ReadWrite,
-                network_access: false,
-                path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
-            };
-            let deny_output = manager.execute(
-                &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
-                &deny_policy,
-            )?;
-            assert_failure(&deny_output, "linux deny overlay enforcement")?;
-
             println!("linux.overlay_subtractive=available");
-            println!("linux.readwrite_plus_readonly_enforcement=ok");
-            println!("linux.readwrite_plus_deny_enforcement=ok");
             Ok(())
         }
         Err(SandboxError::Unavailable(message)) if message.contains("mount-namespace support") => {
@@ -123,6 +95,281 @@ fn probe_linux_overlay_capability() -> Result<(), Box<dyn Error>> {
         }
         Err(error) => Err(format!("unexpected linux overlay capability result: {error:?}").into()),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_policy_shape_matrix() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new("linux-matrix-contract");
+    let manager = SandboxManager::new();
+
+    let cases = vec![
+        LinuxMatrixCase::new(
+            "readwrite_none",
+            SandboxDefaultAccess::ReadWrite,
+            false,
+            false,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readwrite_readwrite",
+            SandboxDefaultAccess::ReadWrite,
+            false,
+            true,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readwrite_readonly",
+            SandboxDefaultAccess::ReadWrite,
+            true,
+            false,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readwrite_deny",
+            SandboxDefaultAccess::ReadWrite,
+            false,
+            false,
+            true,
+        ),
+        LinuxMatrixCase::new(
+            "readwrite_readonly_readwrite",
+            SandboxDefaultAccess::ReadWrite,
+            true,
+            true,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readwrite_readonly_deny",
+            SandboxDefaultAccess::ReadWrite,
+            true,
+            false,
+            true,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_none",
+            SandboxDefaultAccess::ReadOnly,
+            false,
+            false,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_readonly",
+            SandboxDefaultAccess::ReadOnly,
+            true,
+            false,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_readwrite",
+            SandboxDefaultAccess::ReadOnly,
+            false,
+            true,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_deny",
+            SandboxDefaultAccess::ReadOnly,
+            false,
+            false,
+            true,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_readonly_readwrite",
+            SandboxDefaultAccess::ReadOnly,
+            true,
+            true,
+            false,
+        ),
+        LinuxMatrixCase::new(
+            "readonly_readwrite_deny",
+            SandboxDefaultAccess::ReadOnly,
+            false,
+            true,
+            true,
+        ),
+    ];
+
+    for case in cases {
+        let result = manager.execute(
+            &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+            &case.policy(&fixture),
+        );
+        println!(
+            "linux.matrix.{}={}",
+            case.name,
+            render_linux_matrix_result(&result)
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new("linux-enforcement");
+    let manager = SandboxManager::new();
+
+    let readonly_readwrite_policy = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_access: false,
+        path_permissions: vec![
+            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+        ],
+    };
+
+    let write_rw_target = fixture.rw_dir.join("probe-readonly-rw.txt");
+    let write_rw = manager.execute(
+        &sandbox_request(write_command(&write_rw_target, "ok"), &fixture.runtime_cwd),
+        &readonly_readwrite_policy,
+    )?;
+    assert_success(&write_rw, "linux readonly+readwrite write carve-out")?;
+
+    let write_outside_target = fixture.deny_dir.join("probe-readonly-outside.txt");
+    let write_outside = manager.execute(
+        &sandbox_request(
+            write_command(&write_outside_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
+        &readonly_readwrite_policy,
+    )?;
+    assert_failure(&write_outside, "linux readonly+readwrite outside write")?;
+    println!("linux.enforcement.readonly_readwrite=ok");
+
+    let overlay_bootstrap = manager.execute(
+        &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+        &readwrite_with_readonly_policy(&fixture),
+    );
+    if let Err(SandboxError::Unavailable(message)) = &overlay_bootstrap
+        && message.contains("mount-namespace support")
+    {
+        let reason = sanitize_probe_message(message);
+        println!("linux.readwrite_plus_readonly_enforcement=unavailable({reason})");
+        println!("linux.readwrite_plus_deny_enforcement=unavailable({reason})");
+        println!("linux.enforcement.readwrite_readonly=unavailable({reason})");
+        println!("linux.enforcement.readwrite_deny=unavailable({reason})");
+        println!("linux.enforcement.readonly_deny=unavailable({reason})");
+        println!("linux.enforcement.readonly_readwrite_deny=unavailable({reason})");
+        return Ok(());
+    }
+    let overlay_bootstrap =
+        overlay_bootstrap.map_err(|error| format!("linux overlay bootstrap failed: {error:?}"))?;
+    assert_success(&overlay_bootstrap, "linux overlay bootstrap")?;
+
+    let readwrite_readonly_policy = readwrite_with_readonly_policy(&fixture);
+    let write_other_target = fixture.rw_dir.join("probe-readwrite-outside.txt");
+    let write_other = manager.execute(
+        &sandbox_request(
+            write_command(&write_other_target, "outside-ok"),
+            &fixture.runtime_cwd,
+        ),
+        &readwrite_readonly_policy,
+    )?;
+    assert_success(&write_other, "linux readwrite+readonly other write")?;
+
+    let write_ro_target = fixture.ro_dir.join("probe-readwrite-ro.txt");
+    let write_ro = manager.execute(
+        &sandbox_request(
+            write_command(&write_ro_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
+        &readwrite_readonly_policy,
+    )?;
+    assert_failure(&write_ro, "linux readwrite+readonly readonly override")?;
+    let read_ro = manager.execute(
+        &sandbox_request(read_command(&fixture.ro_seed), &fixture.runtime_cwd),
+        &readwrite_readonly_policy,
+    )?;
+    assert_success(&read_ro, "linux readwrite+readonly read seed")?;
+    println!("linux.enforcement.readwrite_readonly=ok");
+    println!("linux.readwrite_plus_readonly_enforcement=ok");
+
+    let readwrite_deny_policy = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadWrite,
+        network_access: false,
+        path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
+    };
+    let read_deny = manager.execute(
+        &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
+        &readwrite_deny_policy,
+    )?;
+    assert_failure(&read_deny, "linux readwrite+deny denied read")?;
+    let write_deny_target = fixture.deny_dir.join("probe-readwrite-deny.txt");
+    let write_deny = manager.execute(
+        &sandbox_request(
+            write_command(&write_deny_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
+        &readwrite_deny_policy,
+    )?;
+    assert_failure(&write_deny, "linux readwrite+deny denied write")?;
+    println!("linux.enforcement.readwrite_deny=ok");
+    println!("linux.readwrite_plus_deny_enforcement=ok");
+
+    let readonly_deny_policy = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_access: false,
+        path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
+    };
+    let readonly_deny = manager.execute(
+        &sandbox_request(read_command(&fixture.deny_seed), &fixture.runtime_cwd),
+        &readonly_deny_policy,
+    )?;
+    assert_failure(&readonly_deny, "linux readonly+deny denied read")?;
+    println!("linux.enforcement.readonly_deny=ok");
+
+    let nested_deny_dir = fixture.rw_dir.join("nested-deny");
+    fs::create_dir_all(&nested_deny_dir)?;
+    let nested_deny_seed = nested_deny_dir.join("seed-nested-deny.txt");
+    fs::write(&nested_deny_seed, "nested-deny-seed")?;
+
+    let readonly_nested_deny_policy = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_access: false,
+        path_permissions: vec![
+            SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
+            SandboxPathPermission::read_write(fixture.rw_dir.clone()),
+            SandboxPathPermission::deny(nested_deny_dir.clone()),
+        ],
+    };
+
+    let write_nested_parent_target = fixture.rw_dir.join("probe-readonly-nested-parent.txt");
+    let write_nested_parent = manager.execute(
+        &sandbox_request(
+            write_command(&write_nested_parent_target, "parent-ok"),
+            &fixture.runtime_cwd,
+        ),
+        &readonly_nested_deny_policy,
+    )?;
+    assert_success(
+        &write_nested_parent,
+        "linux readonly+readwrite+nested-deny parent write",
+    )?;
+
+    let read_nested_deny = manager.execute(
+        &sandbox_request(read_command(&nested_deny_seed), &fixture.runtime_cwd),
+        &readonly_nested_deny_policy,
+    )?;
+    assert_failure(
+        &read_nested_deny,
+        "linux readonly+readwrite+nested-deny denied read",
+    )?;
+
+    let write_nested_deny_target = nested_deny_dir.join("probe-readonly-nested-deny.txt");
+    let write_nested_deny = manager.execute(
+        &sandbox_request(
+            write_command(&write_nested_deny_target, "blocked"),
+            &fixture.runtime_cwd,
+        ),
+        &readonly_nested_deny_policy,
+    )?;
+    assert_failure(
+        &write_nested_deny,
+        "linux readonly+readwrite+nested-deny denied write",
+    )?;
+    println!("linux.enforcement.readonly_readwrite_deny=ok");
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -649,9 +896,34 @@ fn render_windows_matrix_result(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn sanitize_probe_message(message: &str) -> String {
     message.replace(['\n', '\r'], " ")
+}
+
+#[cfg(target_os = "linux")]
+fn render_linux_matrix_result(
+    result: &Result<procwarden::SandboxExecOutput, SandboxError>,
+) -> String {
+    match result {
+        Ok(output) if output.exit_code == 0 => "runnable".to_string(),
+        Ok(output) => format!("command_failed(exit={})", output.exit_code),
+        Err(SandboxError::InvalidRequest(message)) => {
+            format!("invalid_request({})", sanitize_probe_message(message))
+        }
+        Err(SandboxError::Denied(message)) => {
+            format!("denied({})", sanitize_probe_message(message))
+        }
+        Err(SandboxError::Unavailable(message)) => {
+            format!("unavailable({})", sanitize_probe_message(message))
+        }
+        Err(SandboxError::Io(error)) => {
+            format!("io_error({})", sanitize_probe_message(&error.to_string()))
+        }
+        Err(other) => format!(
+            "unexpected({})",
+            sanitize_probe_message(&format!("{other:?}"))
+        ),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -896,6 +1168,53 @@ struct WindowsMatrixCase {
     include_deny: bool,
 }
 
+#[cfg(target_os = "linux")]
+struct LinuxMatrixCase {
+    name: &'static str,
+    default_access: SandboxDefaultAccess,
+    include_read_only: bool,
+    include_read_write: bool,
+    include_deny: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxMatrixCase {
+    const fn new(
+        name: &'static str,
+        default_access: SandboxDefaultAccess,
+        include_read_only: bool,
+        include_read_write: bool,
+        include_deny: bool,
+    ) -> Self {
+        Self {
+            name,
+            default_access,
+            include_read_only,
+            include_read_write,
+            include_deny,
+        }
+    }
+
+    fn policy(&self, fixture: &Fixture) -> SandboxPolicy {
+        let mut path_permissions = Vec::new();
+        if self.include_read_only {
+            path_permissions.push(SandboxPathPermission::read_only(fixture.ro_dir.clone()));
+        }
+        if self.include_read_write {
+            path_permissions.push(SandboxPathPermission::read_write(fixture.rw_dir.clone()));
+        }
+        if self.include_deny {
+            path_permissions.push(SandboxPathPermission::deny(fixture.deny_dir.clone()));
+        }
+
+        SandboxPolicy {
+            default_access: self.default_access,
+            network_access: false,
+            path_permissions,
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 impl WindowsMatrixCase {
     const fn new(
@@ -1137,6 +1456,7 @@ struct Fixture {
     deny_dir: PathBuf,
     deny_seed: PathBuf,
     ro_dir: PathBuf,
+    ro_seed: PathBuf,
     rw_dir: PathBuf,
     #[cfg(target_os = "macos")]
     alias_rw_dir: PathBuf,
@@ -1174,6 +1494,7 @@ impl Fixture {
             deny_dir,
             deny_seed,
             ro_dir,
+            ro_seed,
             rw_dir,
             #[cfg(target_os = "macos")]
             alias_rw_dir,

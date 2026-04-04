@@ -326,6 +326,7 @@ fn install_deny_mount_overlays_on_current_process(
 ) -> io::Result<()> {
     for overlay in overlays {
         bind_mount(&overlay.placeholder, &overlay.target, overlay.recursive)?;
+        remount_bind_readonly(&overlay.target, overlay.recursive)?;
     }
 
     Ok(())

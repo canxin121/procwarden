@@ -299,6 +299,36 @@ Linux 额外前提：
 
 - 任何需要 read-only 或 deny overlay 的 Linux 策略形状，在宿主不支持所需 user/mount namespace（`CLONE_NEWUSER`/`CLONE_NEWNS`，或等价 `CAP_SYS_ADMIN`）时，都会返回 `SandboxError::Unavailable`。
 - 依赖 overlay 的减法规则目前只适用于“已经存在的路径对象”。这不仅是当前后端契约，也来自所用内核原语的边界：bind mount 需要已有 mount point，而如果只在私有 mount namespace 里临时创建这个目标，那个文件或目录仍然会真实出现在共享的宿主文件系统上。
+- 对具备能力的宿主，目录级 `deny` overlay 现在会先 bind mount，再 remount 成只读。这样可以堵住 2026-04-04 本地复测时暴露出来的那个缺口：旧实现会让“已有条目被隐藏了，但 denied 目录里仍然能新建文件”。
+
+### Linux 真机矩阵（本机，2026-04-04 重新复测）
+
+下面这些行记录的是 2026-04-04 在当前这台 Linux 机器上重新复测得到的真实结果
+（`Linux 6.17.0-19-generic`、非 root `uid=1000`、`kernel.unprivileged_userns_clone=1`、
+`user.max_user_namespaces=479289`）。它们比上面的 contract 表更窄，只描述当前 `main`
+分支在这台宿主上的实际行为。
+
+| `default_access` | `path_permissions` 形状 | probe 行 | enforcement 跟进 | 这台机器上的实际状态 | 说明 |
+|---|---|---|---|---|---|
+| `ReadWrite` | 无 | `linux.matrix.readwrite_none=runnable` | N/A | 可用 | 不需要任何 overlay |
+| `ReadWrite` | 仅 `read_write` | `linux.matrix.readwrite_readwrite=runnable` | N/A | 可用但冗余 | manager 会在分发到后端前把这个冗余 `read_write` 条目归一化掉 |
+| `ReadWrite` | 仅 `read_only` | `linux.matrix.readwrite_readonly=runnable` | `linux.enforcement.readwrite_readonly=ok` | 可用 | 已在本机复测“非 readonly 路径可写”以及“readonly 路径内写入被阻断” |
+| `ReadWrite` | 仅 `deny` | `linux.matrix.readwrite_deny=runnable` | `linux.enforcement.readwrite_deny=ok` | 可用 | 已在本机复测“已有文件读取被阻断”以及“denied 目录内新建文件被阻断” |
+| `ReadWrite` | `read_only + read_write` | `linux.matrix.readwrite_readonly_readwrite=runnable` | `linux.enforcement.readwrite_readonly=ok` | 可用但冗余 | 生效行为与 `ReadWrite` + `read_only` 相同，因为 `read_write` 会被归一化掉 |
+| `ReadWrite` | `read_only + deny` | `linux.matrix.readwrite_readonly_deny=runnable` | `linux.enforcement.readwrite_readonly=ok`; `linux.enforcement.readwrite_deny=ok` | 可用 | 已在本机复测两类减法 overlay 同时处于可用状态 |
+| `ReadOnly` | 无 | `linux.matrix.readonly_none=runnable` | N/A | 可用 | 全局只读模式 |
+| `ReadOnly` | 仅 `read_only` | `linux.matrix.readonly_readonly=runnable` | N/A | 可用但冗余 | manager 会在分发到后端前把这个冗余 `read_only` 条目归一化掉 |
+| `ReadOnly` | 仅 `read_write` | `linux.matrix.readonly_readwrite=runnable` | `linux.enforcement.readonly_readwrite=ok` | 可用 | 已在本机复测“carve-out 内可写”和“carve-out 外仍不可写” |
+| `ReadOnly` | 仅 `deny` | `linux.matrix.readonly_deny=runnable` | `linux.enforcement.readonly_deny=ok` | 可用 | 已在本机复测 denied 路径下已有文件的读取会被阻断 |
+| `ReadOnly` | `read_only + read_write` | `linux.matrix.readonly_readonly_readwrite=runnable` | `linux.enforcement.readonly_readwrite=ok` | 可用 | 生效行为与 `ReadOnly` + `read_write` 相同，因为 `read_only` 会被归一化掉 |
+| `ReadOnly` | `read_write + deny` | `linux.matrix.readonly_readwrite_deny=runnable` | `linux.enforcement.readonly_readwrite_deny=ok` | 可用 | 已在本机复测“可写 carve-out 下的 nested deny 仍能收紧读写” |
+
+这次宿主级复测的直接依据是：
+
+- `cargo run --quiet --bin ci_matrix_probe`
+- `cargo test --test policy_combination_matrix -- --nocapture`
+- `cargo test --test policy_access_consistency -- --nocapture`
+- `cargo test -- --nocapture`
 
 ### Windows
 
@@ -440,7 +470,7 @@ run [`23893105166`](https://github.com/canxin121/procwarden/actions/runs/2389310
 当前覆盖重点：
 
 - `tests/policy_combination_matrix.rs`：覆盖 `default_access` / `path_permissions` 组合矩阵，包括 Linux 中由 overlay 支撑的 `ReadWrite + read_only`、Linux/macOS 的 `deny` 形状，以及 Linux 对“overlay target 必须已存在”的 fail-closed 覆盖。
-- `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为，包括显式 `deny` 路径的 enforcement。
+- `tests/policy_access_consistency.rs`：覆盖主要默认策略模式的运行时行为，包括显式 `deny` 路径的 enforcement，以及一个 `ReadOnly + read_write + deny` 下“deny 祖先继续压过写 carve-out 子树”的 nested case。
 - `tests/network_access_control.rs`：覆盖 Windows 真机下 `network_access == true` 时的私网 TCP 放行、对通用 host listener 的当前 loopback 限制，以及 `network_access == false` 时对 loopback / 私网 TCP 的阻断。
 - `src/platform/macos.rs` 单元测试：覆盖 `ReadWrite` 与 `ReadOnly` 两类 SBPL 生成顺序。
 
