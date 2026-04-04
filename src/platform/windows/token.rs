@@ -176,7 +176,10 @@ pub(super) fn create_appcontainer_context_with_network(
         loopback_exemption: None,
     };
 
-    if matches!(network_mode, SandboxNetworkMode::Bidirectional) {
+    if matches!(
+        network_mode,
+        SandboxNetworkMode::OutboundOnly | SandboxNetworkMode::Bidirectional
+    ) {
         appcontainer.loopback_exemption =
             Some(LoopbackExemptionGuard::install(appcontainer.sid.raw())?);
     }

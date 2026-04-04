@@ -126,6 +126,19 @@ pub(super) fn execute(
         env_map,
         request.timeout_ms,
         policy.network_mode,
+        || {
+            elevated_ops_guard.as_ref().and_then(|guard| {
+                if !matches!(policy.network_mode, SandboxNetworkMode::Bidirectional) {
+                    return None;
+                }
+
+                guard.enable_loopback_server().err().map(|error| {
+                    format!(
+                        "windows sandbox degraded mode: bidirectional loopback-server activation failed ({error})"
+                    )
+                })
+            })
+        },
     )?;
 
     drop(elevated_ops_guard);

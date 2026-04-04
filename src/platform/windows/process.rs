@@ -189,6 +189,7 @@ pub(super) fn run_process_in_appcontainer(
     env_map: &HashMap<String, String>,
     timeout_ms: Option<u64>,
     network_mode: SandboxNetworkMode,
+    post_spawn: impl FnOnce() -> Option<String>,
 ) -> Result<CaptureResult, SandboxError> {
     unsafe {
         let (stdin_pair, stdout_pair, stderr_pair) = setup_stdio_pipes()?;
@@ -255,6 +256,8 @@ pub(super) fn run_process_in_appcontainer(
 
         close_many(&[in_r, in_w, out_w, err_w]);
 
+        let runtime_degraded_reason = post_spawn();
+
         let stdout_thread = spawn_pipe_reader_thread(out_r);
         let stderr_thread = spawn_pipe_reader_thread(err_r);
 
@@ -280,8 +283,20 @@ pub(super) fn run_process_in_appcontainer(
             stdout,
             stderr,
             timed_out,
-            degraded_mode_reason: prepared.degraded_mode_reason.take(),
+            degraded_mode_reason: combine_degraded_reasons(
+                prepared.degraded_mode_reason.take(),
+                runtime_degraded_reason,
+            ),
         })
+    }
+}
+
+fn combine_degraded_reasons(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(format!("{left} | {right}")),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 

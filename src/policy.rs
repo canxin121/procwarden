@@ -18,13 +18,20 @@ pub enum SandboxNetworkMode {
     /// Deny IP networking.
     #[default]
     Disabled,
-    /// Allow outbound IP traffic while denying inbound IP traffic.
+    /// Request an outbound-oriented IP policy.
     ///
-    /// Linux and macOS also deny listener setup. Windows enforces this through
-    /// AppContainer and firewall controls, so loopback and listener behavior
-    /// remain host-dependent there.
+    /// Linux and macOS enforce this as outbound-only networking and also deny
+    /// listener setup. Windows maps it through AppContainer and firewall
+    /// controls; on the current backend the main verified contract is
+    /// private-network outbound access, while loopback and listener behavior
+    /// remain host- and executable-dependent there.
     OutboundOnly,
-    /// Do not impose a procwarden network direction restriction.
+    /// Request that procwarden not add its own network direction restriction.
+    ///
+    /// This does not imply a blanket loopback guarantee on every backend.
+    /// Windows still relies on AppContainer and firewall controls, so consult
+    /// the README support matrix before depending on specific loopback or
+    /// listener behavior there.
     Bidirectional,
 }
 

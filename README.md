@@ -31,8 +31,10 @@ Path override meanings:
 Network mode meanings:
 
 - `SandboxNetworkMode::Disabled`: deny IP networking
-- `SandboxNetworkMode::OutboundOnly`: allow outbound IP traffic and deny inbound IP traffic
-- `SandboxNetworkMode::Bidirectional`: do not impose a procwarden network direction limit
+- `SandboxNetworkMode::OutboundOnly`: request an outbound-oriented IP policy. Linux and macOS enforce this as outbound-only networking without listener setup. Windows maps it through AppContainer and firewall controls, where private-network outbound is the main verified path and loopback or listener behavior remains host- and executable-dependent.
+- `SandboxNetworkMode::Bidirectional`: request that procwarden not add its own network direction restriction. Linux and macOS treat this as ordinary sandboxed networking. Windows still relies on backend-specific AppContainer and firewall controls, so this is not a blanket loopback guarantee there.
+
+These names are intent-level APIs. On Windows, check the support matrix below before treating them as hard direction guarantees.
 
 Example:
 
@@ -107,7 +109,19 @@ Shared note:
 |---|---|---|---|---|
 | Linux | Usable | Usable | Usable | Rechecked locally on 2026-04-04. `Disabled` blocks loopback, private-network, and external IP networking. `OutboundOnly` allows outbound connect and blocks listener setup. Restricted modes depend on seccomp support for `x86_64` or `aarch64`; if unavailable, procwarden fails closed. |
 | macOS | Usable with condition | Usable with condition | Usable with condition | Requires `/usr/bin/sandbox-exec`, or `PROCWARDEN_MACOS_SANDBOX_EXEC` pointing to a working replacement. `Disabled` maps to `(deny network*)`. `OutboundOnly` maps to `(deny network-bind)` plus `(deny network-inbound)`. |
-| Windows | Usable with condition | Usable with condition | Usable with condition | Implemented with AppContainer and network filters. `Disabled` fails closed if the WFP or elevated-helper path is unavailable. `OutboundOnly` and `Bidirectional` depend on the elevated firewall-helper path. Private-network outbound access is the main verified path. Loopback is still host-dependent on the current backend, so treat Windows network control as conditional, especially for loopback and listener behavior. |
+| Windows | Usable with condition | Usable with condition | Usable with condition | Implemented with AppContainer and network filters. `Disabled` fails closed if the WFP or elevated-helper path is unavailable. `OutboundOnly` and `Bidirectional` depend on the elevated firewall-helper path. Private-network outbound access is the main verified path. Procwarden now requests client loopback exemption for both `OutboundOnly` and `Bidirectional`, and starts the `Bidirectional` server-side loopback helper with stale-process cleanup so repeated runs do not self-poison. Loopback is still host-dependent on the current backend, so treat Windows network control as conditional, especially for loopback and listener behavior. |
+
+#### Current Windows Host Recheck
+
+Rechecked locally on 2026-04-04 on `Windows NT 10.0.19044.0` with a non-elevated parent process. The exact private-network probe target is host-dependent and can vary between runs; the latest focused matrix recheck on this host used `198.18.0.2:53`, and earlier targeted probes also reached `192.168.0.1:80`.
+
+`cargo test --test windows_network_mode_control -- --nocapture`, `cargo test --test windows_network_mode_control debug_current_host_windows_network_matrix -- --ignored --nocapture`, and the focused ignored diagnostics for `windows_net_diag.exe`, PowerShell `TcpClient`, active listener visibility, bind-address comparison, and repeated `Bidirectional` runs all ran on this host. After fixing the Windows-only `CheckNetIsolation -is` stale-process leak in the elevated helper path, the remaining Windows loopback behavior is still executable-specific rather than a stable contract.
+
+| Mode | Runnable | Private-network connect (`windows_net_diag.exe`) | Loopback connect (`windows_net_diag.exe`) | Loopback connect (PowerShell `TcpClient`) | Host -> sandbox loopback connect | Listener setup (`TcpListener`) | `ci_matrix_probe.exe` same-binary loopback connect | Current-host conclusion |
+|---|---|---|---|---|---|---|---|---|
+| `Disabled` | Yes | Blocked | Blocked | Blocked | Blocked | Allowed | Blocked | Effective deny path worked for connect/accept. Bare `bind/listen` still succeeds. |
+| `OutboundOnly` | Yes | Allowed | Blocked | Blocked | Blocked | Allowed | Allowed | Final behavior on this host is "private-network outbound plus a same-binary loopback exception", not generic loopback outbound. |
+| `Bidirectional` | Yes | Allowed | Blocked | Blocked | Blocked | Allowed | Allowed | Repeated runs no longer self-poison with stale `CheckNetIsolation -is` processes. On this host generic Win32 loopback still does not work, but the same-binary `ci_matrix_probe.exe` path does. |
 
 ## Recheck On Your Host
 
@@ -122,4 +136,5 @@ On Windows, also run:
 
 ```bash
 cargo test --test windows_network_mode_control -- --nocapture
+cargo test --test windows_network_mode_control debug_current_host_windows_network_matrix -- --ignored --nocapture
 ```

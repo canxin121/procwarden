@@ -15,6 +15,7 @@ use super::elevation::{self, ElevatedProcess};
 const ELEVATED_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const ELEVATED_HELPER_STOP_TIMEOUT_MS: u32 = 5_000;
 const ELEVATED_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LOOPBACK_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_RULE_PREFIX: &str = "procwarden-elevated-all";
 
 const ELEVATED_OPS_HELPER_SCRIPT: &str = r#"
@@ -25,6 +26,8 @@ param(
     [Parameter(Mandatory=$true)][string]$StopFile,
     [Parameter(Mandatory=$true)][string]$ReadyFile,
     [Parameter(Mandatory=$true)][string]$ProgressFile,
+    [Parameter(Mandatory=$true)][string]$LoopbackServerStartFile,
+    [Parameter(Mandatory=$true)][string]$LoopbackServerReadyFile,
     [Parameter(Mandatory=$true)][int]$ParentPid,
     [Parameter(Mandatory=$true)][string]$Executable,
     [Parameter(Mandatory=$true)][string]$OutRule,
@@ -52,10 +55,70 @@ function Apply-FirewallRule([string]$Direction, [string]$Action) {
     Invoke-Netsh @("advfirewall", "firewall", "add", "rule", "name=$(if ($Direction -eq 'out') { $OutRule } else { $InRule })", "dir=$Direction", "action=$Action", "program=$Executable", "enable=yes", "profile=any")
 }
 
-function Set-LoopbackExemption([string]$Operation, [string]$AppContainer) {
-    & CheckNetIsolation.exe LoopbackExempt $Operation "-n=$AppContainer" | Out-Null
+function Set-LoopbackExemption([string]$Operation, [string]$SidValue) {
+    & CheckNetIsolation.exe LoopbackExempt $Operation "-p=$SidValue" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "CheckNetIsolation LoopbackExempt $Operation failed with exit code ${LASTEXITCODE}"
+    }
+}
+
+function Start-LoopbackServerExemption([string]$SidValue) {
+    $process = Start-Process -FilePath "CheckNetIsolation.exe" -ArgumentList @("LoopbackExempt", "-is", "-p=$SidValue") -WindowStyle Hidden -PassThru
+    if ($null -eq $process) {
+        throw "CheckNetIsolation LoopbackExempt -is did not return a process handle"
+    }
+
+    Start-Sleep -Milliseconds 200
+    if ($process.HasExited) {
+        throw "CheckNetIsolation LoopbackExempt -is exited early with code $($process.ExitCode)"
+    }
+
+    return $process
+}
+
+function Remove-Stale-LoopbackServerProcesses {
+    try {
+        $staleProcesses = Get-CimInstance Win32_Process -Filter "Name = 'CheckNetIsolation.exe'" -ErrorAction Stop |
+            Where-Object {
+                $_.CommandLine -match 'LoopbackExempt\s+-is'
+            }
+
+        foreach ($stale in $staleProcesses) {
+            try {
+                Stop-Process -Id $stale.ProcessId -Force -ErrorAction Stop
+                Log-Progress ("removed_stale_loopback_server|" + $stale.ProcessId)
+            }
+            catch {
+                Log-Progress ("skip_stale_loopback_server_cleanup|" + $stale.ProcessId + "|" + $_.Exception.Message)
+            }
+        }
+    }
+    catch {
+        Log-Progress ("skip_stale_loopback_server_enumeration|" + $_.Exception.Message)
+    }
+}
+
+function Stop-LoopbackServerProcess($Process) {
+    if ($null -eq $Process) {
+        return
+    }
+
+    try {
+        Stop-Process -Id $Process.Id -Force -ErrorAction Stop
+        Wait-Process -Id $Process.Id -Timeout 2 -ErrorAction SilentlyContinue
+        Log-Progress ("stopped_loopback_server|" + $Process.Id)
+        return
+    }
+    catch {
+        Log-Progress ("stop_loopback_server_fallback|" + $Process.Id + "|" + $_.Exception.Message)
+    }
+
+    try {
+        & taskkill.exe /PID $Process.Id /T /F | Out-Null
+        Log-Progress ("taskkill_loopback_server|" + $Process.Id)
+    }
+    catch {
+        Log-Progress ("taskkill_loopback_server_failed|" + $Process.Id + "|" + $_.Exception.Message)
     }
 }
 
@@ -141,10 +204,14 @@ if (Test-Path -LiteralPath $SpecFile) {
 
 $appliedPaths = New-Object System.Collections.Generic.List[string]
 $firewallEnabled = $false
-$loopbackEnabled = $false
+$loopbackClientEnabled = $false
+$loopbackServerProcess = $null
+$loopbackServerRequested = $NetworkRuleMode -eq 3
+$loopbackServerStarted = $false
 
 try {
     Set-Content -LiteralPath $ProgressFile -Value "" -NoNewline -Encoding utf8
+    $null = Remove-Item -LiteralPath $LoopbackServerReadyFile -Force -ErrorAction SilentlyContinue
     Log-Progress ("sid=" + $Sid)
     Log-Progress ("appcontainer_name=" + $AppContainerName)
     Log-Progress ("parent_pid=" + $ParentPid)
@@ -208,17 +275,32 @@ try {
         Log-Progress "end|network"
     }
 
-    if ($NetworkRuleMode -eq 3) {
-        Log-Progress "begin|loopback"
-        Set-LoopbackExemption -Operation "-a" -AppContainer $AppContainerName
-        $loopbackEnabled = $true
-        Log-Progress "end|loopback"
+    if ($NetworkRuleMode -eq 2 -or $NetworkRuleMode -eq 3) {
+        Log-Progress "begin|loopback_client"
+        Set-LoopbackExemption -Operation "-a" -SidValue $Sid
+        $loopbackClientEnabled = $true
+        Log-Progress "end|loopback_client"
     }
 
     Set-Content -LiteralPath $ReadyFile -Value "ok" -NoNewline -Encoding ascii
     Log-Progress "ready"
 
     while (-not (Test-Path -LiteralPath $StopFile)) {
+        if ($loopbackServerRequested -and -not $loopbackServerStarted -and (Test-Path -LiteralPath $LoopbackServerStartFile)) {
+            Log-Progress "begin|loopback_server"
+            try {
+                Remove-Stale-LoopbackServerProcesses
+                $loopbackServerProcess = Start-LoopbackServerExemption -SidValue $Sid
+                Set-Content -LiteralPath $LoopbackServerReadyFile -Value "ok" -NoNewline -Encoding ascii
+                Log-Progress ("end|loopback_server|pid=" + $loopbackServerProcess.Id)
+            }
+            catch {
+                Set-Content -LiteralPath $LoopbackServerReadyFile -Value ("error:" + $_.Exception.Message) -NoNewline -Encoding utf8
+                Log-Progress ("skip_loopback_server|" + $_.Exception.Message)
+            }
+            $loopbackServerStarted = $true
+        }
+
         if (-not (Test-ParentProcessAlive -ProcessId $ParentPid)) {
             Log-Progress "parent_exited"
             break
@@ -241,8 +323,9 @@ finally {
         & netsh advfirewall firewall delete rule name="$OutRule" | Out-Null
         & netsh advfirewall firewall delete rule name="$InRule" | Out-Null
     }
-    if ($loopbackEnabled) {
-        & CheckNetIsolation.exe LoopbackExempt -d "-n=$AppContainerName" | Out-Null
+    Stop-LoopbackServerProcess $loopbackServerProcess
+    if ($loopbackClientEnabled) {
+        & CheckNetIsolation.exe LoopbackExempt -d "-p=$Sid" | Out-Null
     }
     Log-Progress "cleanup_end"
 }
@@ -286,6 +369,9 @@ pub(super) struct ElevatedOpsGuard {
     stop_file: PathBuf,
     ready_file: PathBuf,
     progress_file: PathBuf,
+    loopback_server_start_file: PathBuf,
+    loopback_server_ready_file: PathBuf,
+    network_rule_mode: NetworkRuleMode,
 }
 
 impl ElevatedOpsGuard {
@@ -296,6 +382,8 @@ impl ElevatedOpsGuard {
         let stop_file = workspace_dir.join("stop.signal");
         let ready_file = workspace_dir.join("ready.signal");
         let progress_file = workspace_dir.join("progress.log");
+        let loopback_server_start_file = workspace_dir.join("loopback-server.start.signal");
+        let loopback_server_ready_file = workspace_dir.join("loopback-server.ready.signal");
         let rule_prefix = format!(
             "{FIREWALL_RULE_PREFIX}-{}-{}",
             std::process::id(),
@@ -323,6 +411,8 @@ impl ElevatedOpsGuard {
             &stop_file,
             &ready_file,
             &progress_file,
+            &loopback_server_start_file,
+            &loopback_server_ready_file,
             std::process::id(),
             &spec.appcontainer_name,
             &spec.executable,
@@ -346,9 +436,53 @@ impl ElevatedOpsGuard {
             stop_file,
             ready_file,
             progress_file,
+            loopback_server_start_file,
+            loopback_server_ready_file,
+            network_rule_mode: spec.network_rule_mode,
         };
         guard.wait_until_initialized()?;
         Ok(guard)
+    }
+
+    pub(super) fn enable_loopback_server(&self) -> Result<(), SandboxError> {
+        if !matches!(self.network_rule_mode, NetworkRuleMode::Bidirectional) {
+            return Ok(());
+        }
+
+        let _ = fs::remove_file(&self.loopback_server_ready_file);
+        fs::write(&self.loopback_server_start_file, b"start").map_err(SandboxError::Io)?;
+
+        let started = Instant::now();
+        loop {
+            match read_ready_signal(&self.loopback_server_ready_file)? {
+                ReadySignal::Pending => {}
+                ReadySignal::Ok => return Ok(()),
+                ReadySignal::Error(message) => {
+                    let progress_tail = read_progress_tail(&self.progress_file, 20);
+                    return Err(SandboxError::Denied(format!(
+                        "automatic administrator loopback-server initialization failed: {message}; last progress: {progress_tail}"
+                    )));
+                }
+            }
+
+            if let Some(exit_code) = self.process.try_wait_exit_code(0)? {
+                let progress_tail = read_progress_tail(&self.progress_file, 20);
+                return Err(SandboxError::Denied(format!(
+                    "automatic administrator elevated-ops helper exited before loopback-server readiness (exit code {exit_code}, workspace: {}, last progress: {progress_tail})",
+                    self.workspace_dir.display(),
+                )));
+            }
+
+            if started.elapsed() >= LOOPBACK_SERVER_READY_TIMEOUT {
+                let progress_tail = read_progress_tail(&self.progress_file, 20);
+                return Err(SandboxError::Denied(format!(
+                    "automatic administrator loopback-server helper timed out before readiness (workspace: {}, last progress: {progress_tail})",
+                    self.workspace_dir.display(),
+                )));
+            }
+
+            sleep(ELEVATED_HELPER_POLL_INTERVAL);
+        }
     }
 
     fn wait_until_initialized(&self) -> Result<(), SandboxError> {
@@ -417,6 +551,8 @@ fn elevated_powershell_parameters(
     stop_file: &Path,
     ready_file: &Path,
     progress_file: &Path,
+    loopback_server_start_file: &Path,
+    loopback_server_ready_file: &Path,
     parent_pid: u32,
     appcontainer_name: &str,
     executable: &Path,
@@ -426,7 +562,7 @@ fn elevated_powershell_parameters(
     network_rule_mode: NetworkRuleMode,
 ) -> String {
     format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -AppContainerName {} -SpecFile {} -StopFile {} -ReadyFile {} -ProgressFile {} -ParentPid {} -Executable {} -OutRule {} -InRule {} -NetworkRuleMode {}",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {} -Sid {} -AppContainerName {} -SpecFile {} -StopFile {} -ReadyFile {} -ProgressFile {} -LoopbackServerStartFile {} -LoopbackServerReadyFile {} -ParentPid {} -Executable {} -OutRule {} -InRule {} -NetworkRuleMode {}",
         elevation::quote_windows_arg(&script_path.to_string_lossy()),
         elevation::quote_windows_arg(sid_string),
         elevation::quote_windows_arg(appcontainer_name),
@@ -434,6 +570,8 @@ fn elevated_powershell_parameters(
         elevation::quote_windows_arg(&stop_file.to_string_lossy()),
         elevation::quote_windows_arg(&ready_file.to_string_lossy()),
         elevation::quote_windows_arg(&progress_file.to_string_lossy()),
+        elevation::quote_windows_arg(&loopback_server_start_file.to_string_lossy()),
+        elevation::quote_windows_arg(&loopback_server_ready_file.to_string_lossy()),
         parent_pid,
         elevation::quote_windows_arg(&executable.to_string_lossy()),
         elevation::quote_windows_arg(out_rule_name),
