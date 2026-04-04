@@ -1457,6 +1457,7 @@ struct Fixture {
     deny_dir: PathBuf,
     deny_seed: PathBuf,
     ro_dir: PathBuf,
+    #[cfg(target_os = "linux")]
     ro_seed: PathBuf,
     rw_dir: PathBuf,
     #[cfg(target_os = "macos")]
@@ -1478,8 +1479,10 @@ impl Fixture {
             fs::create_dir_all(dir).expect("probe directory should be created");
         }
         let deny_seed = deny_dir.join("seed-deny.txt");
-        let ro_seed = ro_dir.join("seed-ro.txt");
         fs::write(&deny_seed, "deny-seed").expect("deny seed should be created");
+        #[cfg(target_os = "linux")]
+        let ro_seed = ro_dir.join("seed-ro.txt");
+        #[cfg(target_os = "linux")]
         fs::write(&ro_seed, "readonly-seed").expect("readonly seed should be created");
 
         #[cfg(target_os = "macos")]
@@ -1495,6 +1498,7 @@ impl Fixture {
             deny_dir,
             deny_seed,
             ro_dir,
+            #[cfg(target_os = "linux")]
             ro_seed,
             rw_dir,
             #[cfg(target_os = "macos")]
