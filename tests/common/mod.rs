@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use procwarden::{
     SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput, SandboxManager,
-    SandboxNetworkMode, SandboxPathPermission, SandboxPolicy,
+    SandboxNetworkPolicy, SandboxPathPermission, SandboxPolicy,
 };
 
 pub struct TempDir {
@@ -108,13 +108,13 @@ impl Fixture {
 
 pub fn policy(
     default_access: SandboxDefaultAccess,
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxNetworkPolicy,
     path_permissions: Vec<SandboxPathPermission>,
 ) -> SandboxPolicy {
     SandboxPolicy {
         path_permissions,
         default_access,
-        network_mode,
+        network_policy,
     }
 }
 
@@ -238,6 +238,89 @@ finally:
     }
 }
 
+pub fn socket_family_command(family: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let family_expr = match family {
+            "unix" => "[System.Net.Sockets.AddressFamily]::Unix",
+            "ipv4" => "[System.Net.Sockets.AddressFamily]::InterNetwork",
+            "ipv6" => "[System.Net.Sockets.AddressFamily]::InterNetworkV6",
+            other => panic!("unsupported socket family for test helper: {other}"),
+        };
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ $sock = [System.Net.Sockets.Socket]::new({family_expr}, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp); $sock.Dispose(); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script = r#"import socket
+import sys
+
+families = {
+    "unix": socket.AF_UNIX,
+    "ipv4": socket.AF_INET,
+    "ipv6": socket.AF_INET6,
+}
+
+sock = socket.socket(families[sys.argv[1]], socket.SOCK_STREAM)
+sock.close()
+"#;
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            family.to_string(),
+        ]
+    }
+}
+
+pub fn bind_command(host: &str, port: u16) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let escaped_host = host.replace('\'', "''");
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('{escaped_host}'), {port}); $listener.Server.ExclusiveAddressUse = $false; $listener.Server.Bind($listener.LocalEndpoint); $listener.Stop(); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script = r#"import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind((sys.argv[1], int(sys.argv[2])))
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    sock.close()
+"#;
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            host.to_string(),
+            port.to_string(),
+        ]
+    }
+}
+
 pub fn listen_command(host: &str) -> Vec<String> {
     #[cfg(windows)]
     {
@@ -274,6 +357,51 @@ finally:
             "-c".to_string(),
             script.to_string(),
             host.to_string(),
+        ]
+    }
+}
+
+pub fn accept_command(host: &str, port: u16, timeout_ms: u64) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let escaped_host = host.replace('\'', "''");
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "try {{ $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('{escaped_host}'), {port}); $listener.Start(); $async = $listener.BeginAcceptTcpClient($null, $null); if (-not $async.AsyncWaitHandle.WaitOne({timeout_ms}, $false)) {{ $listener.Stop(); exit 1 }}; $client = $listener.EndAcceptTcpClient($async); $client.Close(); $listener.Stop(); exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }}"
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        let script = r#"import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.settimeout(float(sys.argv[3]) / 1000.0)
+try:
+    sock.bind((sys.argv[1], int(sys.argv[2])))
+    sock.listen(1)
+    conn, _ = sock.accept()
+    conn.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    sock.close()
+"#;
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            host.to_string(),
+            port.to_string(),
+            timeout_ms.to_string(),
         ]
     }
 }

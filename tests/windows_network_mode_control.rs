@@ -8,7 +8,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxNetworkMode, SandboxPathPermission};
+use procwarden::{
+    SandboxDefaultAccess, SandboxManager, SandboxNetworkPolicy, SandboxPathPermission,
+};
 
 use common::{
     Fixture, assert_failure, assert_success, connect_command, execute_case, listen_command, policy,
@@ -124,11 +126,15 @@ fn render_probe_result(
     }
 }
 
-fn mode_key(mode: SandboxNetworkMode) -> &'static str {
-    match mode {
-        SandboxNetworkMode::Disabled => "disabled",
-        SandboxNetworkMode::OutboundOnly => "outbound_only",
-        SandboxNetworkMode::Bidirectional => "bidirectional",
+fn mode_key(network_policy: SandboxNetworkPolicy) -> &'static str {
+    if network_policy == SandboxNetworkPolicy::disabled() {
+        "disabled"
+    } else if network_policy == SandboxNetworkPolicy::outbound_only() {
+        "outbound_only"
+    } else if network_policy == SandboxNetworkPolicy::bidirectional() {
+        "bidirectional"
+    } else {
+        panic!("unsupported helper policy for mode_key: {network_policy:?}");
     }
 }
 
@@ -213,7 +219,7 @@ fn network_bidirectional_allows_private_network_tcp_connect() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Bidirectional,
+        SandboxNetworkPolicy::bidirectional(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -247,7 +253,7 @@ fn network_outbound_only_allows_private_network_tcp_connect() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::OutboundOnly,
+        SandboxNetworkPolicy::outbound_only(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -276,7 +282,7 @@ fn network_bidirectional_still_blocks_loopback_tcp_connect() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Bidirectional,
+        SandboxNetworkPolicy::bidirectional(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -321,7 +327,7 @@ fn network_disabled_blocks_loopback_and_private_tcp_connect() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -403,7 +409,7 @@ fn debug_network_bidirectional_diagnose_connect_failure() {
         ),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            SandboxNetworkMode::Bidirectional,
+            SandboxNetworkPolicy::bidirectional(),
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -432,19 +438,19 @@ fn debug_current_host_windows_network_matrix() {
         println!("current_host.windows.network.private_target=unavailable");
     }
 
-    for mode in [
-        SandboxNetworkMode::Disabled,
-        SandboxNetworkMode::OutboundOnly,
-        SandboxNetworkMode::Bidirectional,
+    for network_policy in [
+        SandboxNetworkPolicy::disabled(),
+        SandboxNetworkPolicy::outbound_only(),
+        SandboxNetworkPolicy::bidirectional(),
     ] {
         let policy = policy(
             SandboxDefaultAccess::ReadOnly,
-            mode,
+            network_policy,
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
         );
-        let key = mode_key(mode);
+        let key = mode_key(network_policy);
 
         let runnable_result = manager.execute(
             &sandbox_request(
@@ -531,7 +537,7 @@ fn debug_bidirectional_loopback_server_activation_reason() {
     let manager = SandboxManager::new();
     let policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Bidirectional,
+        SandboxNetworkPolicy::bidirectional(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -577,7 +583,7 @@ fn debug_bidirectional_listener_visibility() {
     let fixture = Fixture::new("network-bidirectional-listener-visibility");
     let policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Bidirectional,
+        SandboxNetworkPolicy::bidirectional(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -648,7 +654,7 @@ fn debug_bidirectional_bind_address_comparison() {
     let fixture = Fixture::new("network-bidirectional-bind-compare");
     let policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Bidirectional,
+        SandboxNetworkPolicy::bidirectional(),
         vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -710,14 +716,14 @@ fn debug_powershell_loopback_connect_matrix() {
     let fixture = Fixture::new("network-powershell-loopback-connect");
     let manager = SandboxManager::new();
 
-    for mode in [
-        SandboxNetworkMode::Disabled,
-        SandboxNetworkMode::OutboundOnly,
-        SandboxNetworkMode::Bidirectional,
+    for network_policy in [
+        SandboxNetworkPolicy::disabled(),
+        SandboxNetworkPolicy::outbound_only(),
+        SandboxNetworkPolicy::bidirectional(),
     ] {
         let policy = policy(
             SandboxDefaultAccess::ReadOnly,
-            mode,
+            network_policy,
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -745,7 +751,7 @@ fn debug_powershell_loopback_connect_matrix() {
 
         println!(
             "mode={} powershell_loopback_connect={} accepted={accepted}",
-            mode_key(mode),
+            mode_key(network_policy),
             render_probe_result(Ok(output))
         );
     }

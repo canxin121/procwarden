@@ -11,8 +11,8 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procwarden::{
-    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxManager, SandboxNetworkMode,
-    SandboxPathPermission, SandboxPolicy,
+    SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxManager,
+    SandboxNetworkPolicy, SandboxPathPermission, SandboxPolicy,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -50,7 +50,7 @@ fn probe_frontloaded_missing_path_validation() -> Result<(), Box<dyn Error>> {
 
     let policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![SandboxPathPermission::read_only(missing_path.clone())],
     };
 
@@ -197,7 +197,7 @@ fn probe_linux_policy_shape_matrix() -> Result<(), Box<dyn Error>> {
         println!(
             "linux.matrix.{}={}",
             case.name,
-            render_linux_matrix_result(&result)
+            render_unix_matrix_result(&result)
         );
     }
 
@@ -211,7 +211,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_readwrite_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -286,7 +286,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readwrite_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
     };
     let read_deny = manager.execute(
@@ -308,7 +308,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![SandboxPathPermission::deny(fixture.deny_dir.clone())],
     };
     let readonly_deny = manager.execute(
@@ -325,7 +325,7 @@ fn probe_linux_enforcement_cases() -> Result<(), Box<dyn Error>> {
 
     let readonly_nested_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -378,7 +378,7 @@ fn probe_macos_matrix_contract() -> Result<(), Box<dyn Error>> {
     let manager = SandboxManager::new();
     let policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.alias_rw_dir.clone()),
@@ -413,6 +413,72 @@ fn probe_macos_matrix_contract() -> Result<(), Box<dyn Error>> {
     )?;
     assert_failure(&deny_output, "macos deny enforcement")?;
 
+    let network_disabled = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_policy: SandboxNetworkPolicy::disabled(),
+        path_permissions: vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    };
+    let network_outbound_only = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_policy: SandboxNetworkPolicy::outbound_only(),
+        path_permissions: vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    };
+    let network_bidirectional = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_policy: SandboxNetworkPolicy::bidirectional(),
+        path_permissions: vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    };
+    let network_custom = SandboxPolicy {
+        default_access: SandboxDefaultAccess::ReadOnly,
+        network_policy: SandboxNetworkPolicy {
+            allow_unix: true,
+            allow_ipv4: true,
+            allow_ipv6: false,
+            allow_connect: false,
+            allow_bind: false,
+            allow_listen: false,
+            allow_accept: false,
+        },
+        path_permissions: vec![SandboxPathPermission::read_write(
+            fixture.runtime_cwd.clone(),
+        )],
+    };
+
+    println!(
+        "macos.network.disabled.runnable={}",
+        render_unix_matrix_result(&manager.execute(
+            &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+            &network_disabled,
+        ))
+    );
+    println!(
+        "macos.network.outbound_only.runnable={}",
+        render_unix_matrix_result(&manager.execute(
+            &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+            &network_outbound_only,
+        ))
+    );
+    println!(
+        "macos.network.bidirectional.runnable={}",
+        render_unix_matrix_result(&manager.execute(
+            &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+            &network_bidirectional,
+        ))
+    );
+    println!(
+        "macos.network.custom_ipv4_only={}",
+        render_unix_matrix_result(&manager.execute(
+            &sandbox_request(exit_zero_command(), &fixture.runtime_cwd),
+            &network_custom,
+        ))
+    );
+
     println!("macos.readonly_plus_readwrite=usable");
     println!("macos.path_deny=usable");
     println!("macos.alias_path_canonicalization=ok");
@@ -429,7 +495,7 @@ fn probe_windows_matrix_and_timings() -> Result<(), Box<dyn Error>> {
         windows_host_process_is_elevated()?
     );
 
-    probe_windows_network_mode_shape(&manager, &fixture)?;
+    probe_windows_network_policy_shape(&manager, &fixture)?;
     probe_windows_policy_shape_matrix(&manager, &fixture)?;
     probe_windows_enforcement_cases(&manager, &fixture)?;
     probe_windows_timing_samples(&manager, &fixture)?;
@@ -438,27 +504,27 @@ fn probe_windows_matrix_and_timings() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "windows")]
-fn probe_windows_network_mode_shape(
+fn probe_windows_network_policy_shape(
     manager: &SandboxManager,
     fixture: &Fixture,
 ) -> Result<(), Box<dyn Error>> {
     let network_bidirectional_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Bidirectional,
+        network_policy: SandboxNetworkPolicy::bidirectional(),
         path_permissions: vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
     };
     let network_outbound_only_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::OutboundOnly,
+        network_policy: SandboxNetworkPolicy::outbound_only(),
         path_permissions: vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
     };
     let network_disabled_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![SandboxPathPermission::read_write(
             fixture.runtime_cwd.clone(),
         )],
@@ -706,7 +772,7 @@ fn probe_windows_enforcement_cases(
 ) -> Result<(), Box<dyn Error>> {
     let read_only_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -745,7 +811,7 @@ fn probe_windows_enforcement_cases(
 
     let read_write_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_only(fixture.ro_dir.clone()),
@@ -779,7 +845,7 @@ fn probe_windows_enforcement_cases(
 
     let read_only_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadOnly,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -795,7 +861,7 @@ fn probe_windows_enforcement_cases(
 
     let read_write_deny_policy = SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::deny(fixture.deny_dir.clone()),
@@ -897,7 +963,7 @@ fn benchmark_windows_policy_case(
     let mut samples = Vec::with_capacity(ITERATIONS);
     let policy = SandboxPolicy {
         default_access: case.default_access,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: case.path_permissions.clone(),
     };
 
@@ -948,13 +1014,13 @@ fn render_windows_matrix_result(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn sanitize_probe_message(message: &str) -> String {
     message.replace(['\n', '\r'], " ")
 }
 
-#[cfg(target_os = "linux")]
-fn render_linux_matrix_result(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn render_unix_matrix_result(
     result: &Result<procwarden::SandboxExecOutput, SandboxError>,
 ) -> String {
     match result {
@@ -1262,7 +1328,7 @@ impl LinuxMatrixCase {
 
         SandboxPolicy {
             default_access: self.default_access,
-            network_mode: SandboxNetworkMode::Disabled,
+            network_policy: SandboxNetworkPolicy::disabled(),
             path_permissions,
         }
     }
@@ -1300,7 +1366,7 @@ impl WindowsMatrixCase {
 
         SandboxPolicy {
             default_access: self.default_access,
-            network_mode: SandboxNetworkMode::Disabled,
+            network_policy: SandboxNetworkPolicy::disabled(),
             path_permissions,
         }
     }
@@ -1332,7 +1398,7 @@ impl WindowsTimingCase {
 fn readwrite_with_readonly_policy(fixture: &Fixture) -> SandboxPolicy {
     SandboxPolicy {
         default_access: SandboxDefaultAccess::ReadWrite,
-        network_mode: SandboxNetworkMode::Disabled,
+        network_policy: SandboxNetworkPolicy::disabled(),
         path_permissions: vec![SandboxPathPermission::read_only(fixture.ro_dir.clone())],
     }
 }

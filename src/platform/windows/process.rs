@@ -45,7 +45,8 @@ use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-use crate::{SandboxError, SandboxNetworkMode, cap_fs};
+use crate::policy::SandboxCoarseNetworkPolicy;
+use crate::{SandboxError, cap_fs};
 
 use super::util::{format_last_error, to_wide};
 
@@ -188,7 +189,7 @@ pub(super) fn run_process_in_appcontainer(
     cwd: &Path,
     env_map: &HashMap<String, String>,
     timeout_ms: Option<u64>,
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
     post_spawn: impl FnOnce() -> Option<String>,
 ) -> Result<CaptureResult, SandboxError> {
     unsafe {
@@ -199,7 +200,7 @@ pub(super) fn run_process_in_appcontainer(
         let mut prepared = match prepare_appcontainer_child_job_attributes(
             appcontainer_sid,
             job_handle,
-            network_mode,
+            network_policy,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -329,7 +330,7 @@ unsafe fn read_pipe_to_end(handle: HANDLE) -> Vec<u8> {
 unsafe fn prepare_appcontainer_child_job_attributes(
     appcontainer_sid: *mut c_void,
     job_handle: HANDLE,
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
 ) -> Result<PreparedAttributes, SandboxError> {
     let mut prepared = new_prepared_attributes(
         3,
@@ -337,7 +338,7 @@ unsafe fn prepare_appcontainer_child_job_attributes(
         job_handle,
         Some(Box::new(0x0000_0001_u32)),
         None,
-        network_mode,
+        network_policy,
     )?;
     set_security_capabilities_attr(&mut prepared)?;
 
@@ -353,7 +354,7 @@ unsafe fn prepare_appcontainer_child_job_attributes(
                 job_handle,
                 None,
                 Some(child_policy_degraded_reason(code)),
-                network_mode,
+                network_policy,
             )?;
             set_security_capabilities_attr(&mut fallback)?;
             set_job_list_attr(&mut fallback)?;
@@ -372,9 +373,9 @@ unsafe fn new_prepared_attributes(
     job_handle: HANDLE,
     child_policy: Option<Box<u32>>,
     degraded_mode_reason: Option<String>,
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
 ) -> Result<PreparedAttributes, SandboxError> {
-    let (capability_sids, mut capability_entries) = network_capability_entries(network_mode)?;
+    let (capability_sids, mut capability_entries) = network_capability_entries(network_policy)?;
 
     Ok(PreparedAttributes {
         attrs: ProcThreadAttributes::new(attr_count)?,
@@ -392,9 +393,9 @@ unsafe fn new_prepared_attributes(
 }
 
 fn network_capability_entries(
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
 ) -> Result<(Vec<OwnedCapabilitySid>, Vec<SID_AND_ATTRIBUTES>), SandboxError> {
-    if !network_mode.allows_ip_network() {
+    if !network_policy.allows_ip_network() {
         return Ok((Vec::new(), Vec::new()));
     }
 

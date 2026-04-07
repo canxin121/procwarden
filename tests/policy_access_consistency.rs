@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 
 use procwarden::{
-    SandboxDefaultAccess, SandboxError, SandboxManager, SandboxNetworkMode, SandboxPathPermission,
+    SandboxDefaultAccess, SandboxError, SandboxManager, SandboxNetworkPolicy, SandboxPathPermission,
 };
 
 use common::{
@@ -19,7 +19,7 @@ fn default_read_only_enforces_readwrite_carveout() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -106,7 +106,7 @@ fn default_read_write_enforces_readonly_overrides() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadWrite,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_only(fixture.ro_dir.clone()),
@@ -176,7 +176,7 @@ fn default_read_write_enforces_deny_overrides() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadWrite,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::deny(fixture.deny_dir.clone()),
@@ -251,7 +251,7 @@ fn default_read_only_enforces_deny_overrides() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),
@@ -333,7 +333,7 @@ fn default_read_only_readwrite_with_nested_deny_blocks_denied_descendant() {
 
     let test_policy = policy(
         SandboxDefaultAccess::ReadOnly,
-        SandboxNetworkMode::Disabled,
+        SandboxNetworkPolicy::disabled(),
         vec![
             SandboxPathPermission::read_write(fixture.runtime_cwd.clone()),
             SandboxPathPermission::read_write(fixture.rw_dir.clone()),

@@ -7,48 +7,111 @@ pub enum SandboxDefaultAccess {
     ReadWrite,
 }
 
-/// IP-network policy for the sandboxed process.
+/// Socket-network policy for the sandboxed process.
 ///
-/// The variants intentionally stay coarse so each backend can map them to a
-/// real enforcement strategy without pretending to support rules it cannot
-/// actually guarantee. Host-specific caveats still exist on some platforms;
-/// see the README support matrix before depending on a mode in production.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
-pub enum SandboxNetworkMode {
-    /// Deny IP networking.
-    #[default]
+/// The public model only exposes knobs that can be enforced honestly. On
+/// Linux, the current implementation applies these controls at socket-family
+/// creation time and for the key connection-management syscalls. On macOS and
+/// Windows, only the coarse helper shapes are currently supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxNetworkPolicy {
+    pub allow_unix: bool,
+    pub allow_ipv4: bool,
+    pub allow_ipv6: bool,
+    pub allow_connect: bool,
+    pub allow_bind: bool,
+    pub allow_listen: bool,
+    pub allow_accept: bool,
+}
+
+impl Default for SandboxNetworkPolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxCoarseNetworkPolicy {
     Disabled,
-    /// Request an outbound-oriented IP policy.
-    ///
-    /// Linux and macOS enforce this as outbound-only networking and also deny
-    /// listener setup. Windows maps it through AppContainer and firewall
-    /// controls; on the current backend the main verified contract is
-    /// private-network outbound access, while loopback and listener behavior
-    /// remain host- and executable-dependent there.
     OutboundOnly,
-    /// Request that procwarden not add its own network direction restriction.
-    ///
-    /// This does not imply a blanket loopback guarantee on every backend.
-    /// Windows still relies on AppContainer and firewall controls, so consult
-    /// the README support matrix before depending on specific loopback or
-    /// listener behavior there.
     Bidirectional,
 }
 
-impl SandboxNetworkMode {
-    pub fn allows_ip_network(self) -> bool {
-        !matches!(self, SandboxNetworkMode::Disabled)
+#[cfg(target_os = "windows")]
+impl SandboxCoarseNetworkPolicy {
+    pub(crate) fn allows_ip_network(self) -> bool {
+        !matches!(self, SandboxCoarseNetworkPolicy::Disabled)
     }
 
-    pub fn allows_inbound_ip(self) -> bool {
-        matches!(self, SandboxNetworkMode::Bidirectional)
-    }
-
-    pub fn allows_outbound_ip(self) -> bool {
+    pub(crate) fn allows_loopback_exemption(self) -> bool {
         matches!(
             self,
-            SandboxNetworkMode::OutboundOnly | SandboxNetworkMode::Bidirectional
+            SandboxCoarseNetworkPolicy::OutboundOnly | SandboxCoarseNetworkPolicy::Bidirectional
         )
+    }
+}
+
+impl SandboxNetworkPolicy {
+    pub const fn disabled() -> Self {
+        Self {
+            allow_unix: true,
+            allow_ipv4: false,
+            allow_ipv6: false,
+            allow_connect: false,
+            allow_bind: false,
+            allow_listen: false,
+            allow_accept: false,
+        }
+    }
+
+    pub const fn outbound_only() -> Self {
+        Self {
+            allow_unix: true,
+            allow_ipv4: true,
+            allow_ipv6: true,
+            allow_connect: true,
+            allow_bind: false,
+            allow_listen: false,
+            allow_accept: false,
+        }
+    }
+
+    pub const fn bidirectional() -> Self {
+        Self {
+            allow_unix: true,
+            allow_ipv4: true,
+            allow_ipv6: true,
+            allow_connect: true,
+            allow_bind: true,
+            allow_listen: true,
+            allow_accept: true,
+        }
+    }
+
+    pub const fn allows_ip_network(self) -> bool {
+        self.allow_ipv4 || self.allow_ipv6
+    }
+
+    pub const fn allows_inbound_ip(self) -> bool {
+        self.allows_ip_network() && self.allow_bind && self.allow_listen && self.allow_accept
+    }
+
+    pub const fn allows_outbound_ip(self) -> bool {
+        self.allows_ip_network() && self.allow_connect
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn coarse_policy(self) -> Option<SandboxCoarseNetworkPolicy> {
+        if self == Self::disabled() {
+            Some(SandboxCoarseNetworkPolicy::Disabled)
+        } else if self == Self::outbound_only() {
+            Some(SandboxCoarseNetworkPolicy::OutboundOnly)
+        } else if self == Self::bidirectional() {
+            Some(SandboxCoarseNetworkPolicy::Bidirectional)
+        } else {
+            None
+        }
     }
 }
 
@@ -92,7 +155,7 @@ impl SandboxPathPermission {
 pub struct SandboxPolicy {
     pub path_permissions: Vec<SandboxPathPermission>,
     pub default_access: SandboxDefaultAccess,
-    pub network_mode: SandboxNetworkMode,
+    pub network_policy: SandboxNetworkPolicy,
 }
 
 impl SandboxPolicy {

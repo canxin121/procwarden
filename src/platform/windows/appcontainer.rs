@@ -5,10 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::{
-    SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxNetworkMode, SandboxPolicy,
-    cap_fs,
-};
+use crate::policy::SandboxCoarseNetworkPolicy;
+use crate::{SandboxCommandRequest, SandboxError, SandboxExecOutput, SandboxPolicy, cap_fs};
 
 use super::{acl, elevated_ops, elevation, process, token, util, wfp};
 
@@ -21,7 +19,7 @@ pub(super) fn execute(
 ) -> Result<SandboxExecOutput, SandboxError> {
     let start = Instant::now();
 
-    validate_policy_shape(policy)?;
+    let network_policy = validate_policy_shape(policy)?;
 
     let executable = process::resolve_executable(&request.command[0], &request.cwd, env_map)
         .ok_or_else(|| {
@@ -49,16 +47,16 @@ pub(super) fn execute(
         deny_write_paths,
     });
 
-    let appcontainer = token::create_appcontainer_context_with_network(policy.network_mode)?;
+    let appcontainer = token::create_appcontainer_context_with_network(network_policy)?;
     let sid = appcontainer.sid();
-    if policy.network_mode.allows_ip_network() {
+    if network_policy.allows_ip_network() {
         appcontainer.register_network_binary(&executable)?;
     }
 
     let optional_bootstrap_paths =
         sanitize_optional_existing_paths(runtime_bootstrap_readonly_paths(request, &executable))?;
     let use_elevated_ops = !elevation::current_process_is_elevated()?
-        || !matches!(policy.network_mode, SandboxNetworkMode::Disabled);
+        || network_policy != SandboxCoarseNetworkPolicy::Disabled;
     let _elevated_ops_lock = if use_elevated_ops {
         Some(lock_elevated_ops_execution())
     } else {
@@ -82,10 +80,12 @@ pub(super) fn execute(
                 sid_string: util::sid_to_string(sid)?,
                 appcontainer_name: appcontainer.profile_name().to_string(),
                 executable: executable.clone(),
-                network_rule_mode: match policy.network_mode {
-                    SandboxNetworkMode::Disabled => elevated_ops::NetworkRuleMode::BlockAll,
-                    SandboxNetworkMode::OutboundOnly => elevated_ops::NetworkRuleMode::OutboundOnly,
-                    SandboxNetworkMode::Bidirectional => {
+                network_rule_mode: match network_policy {
+                    SandboxCoarseNetworkPolicy::Disabled => elevated_ops::NetworkRuleMode::BlockAll,
+                    SandboxCoarseNetworkPolicy::OutboundOnly => {
+                        elevated_ops::NetworkRuleMode::OutboundOnly
+                    }
+                    SandboxCoarseNetworkPolicy::Bidirectional => {
                         elevated_ops::NetworkRuleMode::Bidirectional
                     }
                 },
@@ -96,7 +96,7 @@ pub(super) fn execute(
             },
         )?);
     } else {
-        network_guard = if policy.network_mode.allows_ip_network() {
+        network_guard = if network_policy.allows_ip_network() {
             None
         } else {
             Some(wfp::install_block_all_network_filters(&executable, sid)?)
@@ -125,10 +125,10 @@ pub(super) fn execute(
         &request.cwd,
         env_map,
         request.timeout_ms,
-        policy.network_mode,
+        network_policy,
         || {
             elevated_ops_guard.as_ref().and_then(|guard| {
-                if !matches!(policy.network_mode, SandboxNetworkMode::Bidirectional) {
+                if !matches!(network_policy, SandboxCoarseNetworkPolicy::Bidirectional) {
                     return None;
                 }
 
@@ -157,9 +157,15 @@ pub(super) fn execute(
     .with_degraded_mode_reason(capture.degraded_mode_reason))
 }
 
-fn validate_policy_shape(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-    let _ = policy;
-    Ok(())
+fn validate_policy_shape(
+    policy: &SandboxPolicy,
+) -> Result<SandboxCoarseNetworkPolicy, SandboxError> {
+    policy.network_policy.coarse_policy().ok_or_else(|| {
+        SandboxError::Unavailable(
+            "windows backend currently only supports SandboxNetworkPolicy::disabled(), ::outbound_only(), or ::bidirectional()"
+                .to_string(),
+        )
+    })
 }
 
 fn lock_elevated_ops_execution() -> std::sync::MutexGuard<'static, ()> {
@@ -418,7 +424,7 @@ fn component_eq_case_insensitive(left: &Component<'_>, right: &Component<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::{collect_acl_plan, filter_paths_not_under_roots};
-    use crate::{SandboxDefaultAccess, SandboxNetworkMode, SandboxPathPermission, SandboxPolicy};
+    use crate::{SandboxDefaultAccess, SandboxNetworkPolicy, SandboxPathPermission, SandboxPolicy};
     use std::path::PathBuf;
 
     #[test]
@@ -431,7 +437,7 @@ mod tests {
             &SandboxPolicy {
                 path_permissions: vec![SandboxPathPermission::read_only(readonly_root.clone())],
                 default_access: SandboxDefaultAccess::ReadWrite,
-                network_mode: SandboxNetworkMode::Disabled,
+                network_policy: SandboxNetworkPolicy::disabled(),
             },
             vec![outside.clone(), readonly_root.clone(), readonly_child],
         );
@@ -456,7 +462,7 @@ mod tests {
                     SandboxPathPermission::read_write(writable_root.clone()),
                 ],
                 default_access: SandboxDefaultAccess::ReadOnly,
-                network_mode: SandboxNetworkMode::Disabled,
+                network_policy: SandboxNetworkPolicy::disabled(),
             },
             vec![outside.clone(), denied_root.clone(), denied_child],
         );

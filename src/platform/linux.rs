@@ -30,7 +30,7 @@ use seccompiler::apply_filter;
 
 use crate::{
     SandboxCommandRequest, SandboxDefaultAccess, SandboxError, SandboxExecOutput,
-    SandboxNetworkMode, SandboxPolicy,
+    SandboxNetworkPolicy, SandboxPolicy,
 };
 
 use super::command_runner::{configure_piped_stdio, run_command_with_timeout};
@@ -56,7 +56,7 @@ pub(super) fn execute(
     let read_only_paths = policy.read_only_paths();
     let deny_paths = policy.denied_paths();
     let writable_roots = policy.writable_paths();
-    let network_mode = policy.network_mode;
+    let network_policy = policy.network_policy;
     let host_uid = unsafe { libc::geteuid() };
     let host_gid = unsafe { libc::getegid() };
 
@@ -93,8 +93,8 @@ pub(super) fn execute(
             if !default_write_access {
                 install_filesystem_landlock_rules_on_current_thread(&writable_roots)?;
             }
-            if !matches!(network_mode, SandboxNetworkMode::Bidirectional) {
-                install_network_seccomp_filter_on_current_thread(network_mode)?;
+            if network_policy != SandboxNetworkPolicy::bidirectional() {
+                install_network_seccomp_filter_on_current_thread(network_policy)?;
             }
             close_non_stdio_fds_on_current_process()?;
             Ok(())
@@ -566,54 +566,31 @@ fn install_filesystem_landlock_rules_on_current_thread(
 }
 
 fn install_network_seccomp_filter_on_current_thread(
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxNetworkPolicy,
 ) -> io::Result<()> {
+    if network_policy == SandboxNetworkPolicy::bidirectional() {
+        return Ok(());
+    }
+
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    let mut deny_syscall = |number: i64| {
-        rules.insert(number, vec![]);
-    };
+    rules.insert(libc::SYS_ptrace, vec![]);
 
-    deny_syscall(libc::SYS_ptrace);
+    install_socket_family_rule(&mut rules, libc::SYS_socket, network_policy)?;
+    install_socketpair_rule(&mut rules, network_policy)?;
 
-    match network_mode {
-        SandboxNetworkMode::Disabled => {
-            deny_syscall(libc::SYS_connect);
-            deny_syscall(libc::SYS_accept);
-            deny_syscall(libc::SYS_accept4);
-            deny_syscall(libc::SYS_bind);
-            deny_syscall(libc::SYS_listen);
-            deny_syscall(libc::SYS_getpeername);
-            deny_syscall(libc::SYS_getsockname);
-            deny_syscall(libc::SYS_shutdown);
-            deny_syscall(libc::SYS_sendto);
-            deny_syscall(libc::SYS_sendmsg);
-            deny_syscall(libc::SYS_sendmmsg);
-            deny_syscall(libc::SYS_recvmsg);
-            deny_syscall(libc::SYS_recvmmsg);
-            deny_syscall(libc::SYS_getsockopt);
-            deny_syscall(libc::SYS_setsockopt);
-
-            let unix_only = SeccompRule::new(vec![
-                SeccompCondition::new(
-                    0,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::Ne,
-                    libc::AF_UNIX as u64,
-                )
-                .map_err(to_io_error)?,
-            ])
-            .map_err(to_io_error)?;
-            rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
-            rules.insert(libc::SYS_socketpair, vec![unix_only]);
-        }
-        SandboxNetworkMode::OutboundOnly => {
-            deny_syscall(libc::SYS_accept);
-            deny_syscall(libc::SYS_accept4);
-            deny_syscall(libc::SYS_bind);
-            deny_syscall(libc::SYS_listen);
-        }
-        SandboxNetworkMode::Bidirectional => return Ok(()),
+    if !network_policy.allow_connect {
+        rules.insert(libc::SYS_connect, vec![]);
+    }
+    if !network_policy.allow_bind {
+        rules.insert(libc::SYS_bind, vec![]);
+    }
+    if !network_policy.allow_listen {
+        rules.insert(libc::SYS_listen, vec![]);
+    }
+    if !network_policy.allow_accept {
+        rules.insert(libc::SYS_accept, vec![]);
+        rules.insert(libc::SYS_accept4, vec![]);
     }
 
     let arch = if cfg!(target_arch = "x86_64") {
@@ -637,6 +614,80 @@ fn install_network_seccomp_filter_on_current_thread(
 
     let program: BpfProgram = filter.try_into().map_err(to_io_error)?;
     apply_filter(&program).map_err(to_io_error)?;
+    Ok(())
+}
+
+fn install_socket_family_rule(
+    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
+    syscall_number: i64,
+    network_policy: SandboxNetworkPolicy,
+) -> io::Result<()> {
+    let mut conditions = Vec::new();
+
+    if network_policy.allow_unix {
+        conditions.push(
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(to_io_error)?,
+        );
+    }
+    if network_policy.allow_ipv4 {
+        conditions.push(
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                libc::AF_INET as u64,
+            )
+            .map_err(to_io_error)?,
+        );
+    }
+    if network_policy.allow_ipv6 {
+        conditions.push(
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                libc::AF_INET6 as u64,
+            )
+            .map_err(to_io_error)?,
+        );
+    }
+
+    if conditions.is_empty() {
+        rules.insert(syscall_number, vec![]);
+        return Ok(());
+    }
+
+    let rule = SeccompRule::new(conditions).map_err(to_io_error)?;
+    rules.insert(syscall_number, vec![rule]);
+    Ok(())
+}
+
+fn install_socketpair_rule(
+    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
+    network_policy: SandboxNetworkPolicy,
+) -> io::Result<()> {
+    if !network_policy.allow_unix {
+        rules.insert(libc::SYS_socketpair, vec![]);
+        return Ok(());
+    }
+
+    let unix_only = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )
+        .map_err(to_io_error)?,
+    ])
+    .map_err(to_io_error)?;
+    rules.insert(libc::SYS_socketpair, vec![unix_only]);
     Ok(())
 }
 

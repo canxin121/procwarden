@@ -19,7 +19,8 @@ use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 
-use crate::{SandboxError, SandboxNetworkMode};
+use crate::SandboxError;
+use crate::policy::SandboxCoarseNetworkPolicy;
 
 use super::util::{format_last_error, to_wide};
 
@@ -127,7 +128,7 @@ impl Drop for AppContainerContext {
 }
 
 pub(super) fn create_appcontainer_context_with_network(
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
 ) -> Result<AppContainerContext, SandboxError> {
     let profile_name = format!(
         "procwarden_{}_{}",
@@ -136,7 +137,7 @@ pub(super) fn create_appcontainer_context_with_network(
     );
     let wide_name = to_wide(&profile_name);
 
-    let (_capability_sids, capability_entries) = network_capabilities(network_mode)?;
+    let (_capability_sids, capability_entries) = network_capabilities(network_policy)?;
 
     let mut sid_ptr: PSID = std::ptr::null_mut();
     let create_hr = unsafe {
@@ -176,10 +177,7 @@ pub(super) fn create_appcontainer_context_with_network(
         loopback_exemption: None,
     };
 
-    if matches!(
-        network_mode,
-        SandboxNetworkMode::OutboundOnly | SandboxNetworkMode::Bidirectional
-    ) {
+    if network_policy.allows_loopback_exemption() {
         appcontainer.loopback_exemption =
             Some(LoopbackExemptionGuard::install(appcontainer.sid.raw())?);
     }
@@ -202,9 +200,9 @@ impl Drop for OwnedCapabilitySid {
 }
 
 fn network_capabilities(
-    network_mode: SandboxNetworkMode,
+    network_policy: SandboxCoarseNetworkPolicy,
 ) -> Result<(Vec<OwnedCapabilitySid>, Vec<SID_AND_ATTRIBUTES>), SandboxError> {
-    if !network_mode.allows_ip_network() {
+    if !network_policy.allows_ip_network() {
         return Ok((Vec::new(), Vec::new()));
     }
 
@@ -445,13 +443,18 @@ fn public_appcontainers_contain_sid(sid: PSID) -> Result<bool, SandboxError> {
 #[cfg(test)]
 mod tests {
     use super::{create_appcontainer_context_with_network, public_appcontainers_contain_sid};
+    use crate::SandboxNetworkPolicy;
 
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "diagnostic helper for Windows AppContainer loopback investigation"]
     fn debug_network_appcontainer_public_registration_state() {
-        let appcontainer =
-            create_appcontainer_context_with_network(true).expect("appcontainer should be created");
+        let appcontainer = create_appcontainer_context_with_network(
+            SandboxNetworkPolicy::bidirectional()
+                .coarse_policy()
+                .expect("bidirectional policy should be coarse-supported"),
+        )
+        .expect("appcontainer should be created");
 
         let is_public = public_appcontainers_contain_sid(appcontainer.sid())
             .expect("public appcontainer enumeration should succeed");

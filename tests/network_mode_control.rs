@@ -5,7 +5,11 @@ mod common;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use procwarden::{SandboxDefaultAccess, SandboxManager, SandboxNetworkMode, SandboxPathPermission};
+#[cfg(target_os = "macos")]
+use procwarden::SandboxError;
+use procwarden::{
+    SandboxDefaultAccess, SandboxManager, SandboxNetworkPolicy, SandboxPathPermission,
+};
 
 use common::{
     Fixture, assert_failure, assert_success, connect_command, execute_case, listen_command, policy,
@@ -33,7 +37,7 @@ fn network_disabled_blocks_loopback_tcp_connect() {
         ),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            SandboxNetworkMode::Disabled,
+            SandboxNetworkPolicy::disabled(),
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -70,7 +74,7 @@ fn network_outbound_only_allows_loopback_tcp_connect() {
         ),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            SandboxNetworkMode::OutboundOnly,
+            SandboxNetworkPolicy::outbound_only(),
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -96,7 +100,7 @@ fn network_outbound_only_blocks_tcp_listen() {
         &sandbox_request(listen_command("127.0.0.1"), &fixture.runtime_cwd, 2_500),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            SandboxNetworkMode::OutboundOnly,
+            SandboxNetworkPolicy::outbound_only(),
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -116,7 +120,7 @@ fn network_bidirectional_allows_tcp_listen() {
         &sandbox_request(listen_command("127.0.0.1"), &fixture.runtime_cwd, 2_500),
         &policy(
             SandboxDefaultAccess::ReadOnly,
-            SandboxNetworkMode::Bidirectional,
+            SandboxNetworkPolicy::bidirectional(),
             vec![SandboxPathPermission::read_write(
                 fixture.runtime_cwd.clone(),
             )],
@@ -124,4 +128,44 @@ fn network_bidirectional_allows_tcp_listen() {
         "network_bidirectional listen",
     );
     assert_success(&output, "network_bidirectional listen");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn custom_network_policy_is_rejected_on_macos() {
+    let fixture = Fixture::new("network-custom-policy-macos");
+    let manager = SandboxManager::new();
+
+    let result = manager.execute(
+        &sandbox_request(
+            vec!["/usr/bin/true".to_string()],
+            &fixture.runtime_cwd,
+            2_500,
+        ),
+        &policy(
+            SandboxDefaultAccess::ReadOnly,
+            SandboxNetworkPolicy {
+                allow_unix: true,
+                allow_ipv4: true,
+                allow_ipv6: false,
+                allow_connect: false,
+                allow_bind: false,
+                allow_listen: false,
+                allow_accept: false,
+            },
+            vec![SandboxPathPermission::read_write(
+                fixture.runtime_cwd.clone(),
+            )],
+        ),
+    );
+
+    match result {
+        Err(SandboxError::Unavailable(message)) => {
+            assert!(
+                message.contains("only supports SandboxNetworkPolicy::disabled(), ::outbound_only(), or ::bidirectional()"),
+                "unexpected macOS unavailable message: {message}"
+            );
+        }
+        other => panic!("expected macOS custom policy to fail closed, got {other:?}"),
+    }
 }
